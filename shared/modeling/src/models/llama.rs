@@ -14,6 +14,8 @@ use tch::{
 pub struct LlamaConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[serde(default)]
+    pub matformer_tier: u8,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -38,6 +40,7 @@ impl LlamaConfig {
         Self {
             hidden_size: 1,
             intermediate_size: 1,
+            matformer_tier: 0,
             vocab_size: 1,
             num_hidden_layers: 1,
             num_attention_heads: 1,
@@ -59,16 +62,40 @@ struct Mlp {
     gate_proj: ColumnParallelLinear,
     up_proj: ColumnParallelLinear,
     down_proj: RowParallelLinear,
+    matformer_hidden_size: Option<i64>,
+    is_tensor_parallel: bool,
 }
 
 impl Mlp {
-    fn new(vs: nn::Path, n_embd: i64, n_hidden: i64, comm: Option<Arc<Communicator>>) -> Self {
+    fn new(
+        vs: nn::Path,
+        n_embd: i64,
+        n_hidden: i64,
+        matformer_hidden_size: Option<i64>,
+        comm: Option<Arc<Communicator>>,
+    ) -> Self {
+        let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
         let tp_size = comm.as_ref().map(|x| x.size()).unwrap_or(1);
         assert_eq!(
             n_hidden % tp_size,
             0,
             "n_hidden must be divisible by tp_size"
         );
+        if let Some(matformer_hidden_size) = matformer_hidden_size {
+            assert!(
+                matformer_hidden_size > 0,
+                "matformer_hidden_size must be > 0"
+            );
+            assert!(
+                matformer_hidden_size <= n_hidden,
+                "matformer_hidden_size must be <= n_hidden"
+            );
+            assert_eq!(
+                matformer_hidden_size % tp_size,
+                0,
+                "matformer_hidden_size must be divisible by tp_size"
+            );
+        }
 
         let gate_proj = ColumnParallelLinear::new(
             &vs / "gate_proj",
@@ -92,14 +119,47 @@ impl Mlp {
             gate_proj,
             up_proj,
             down_proj,
+            matformer_hidden_size,
+            is_tensor_parallel,
         }
     }
 }
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        self.down_proj
-            .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)))
+        let Some(matformer_hidden_size) = self.matformer_hidden_size else {
+            return self.down_proj.forward(
+                &(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)),
+            );
+        };
+        assert!(
+            !self.is_tensor_parallel,
+            "matformer_tier is not yet supported with tensor parallelism"
+        );
+
+        // Weight shapes:
+        // - gate_proj/up_proj: [n_hidden, n_embd]
+        // - down_proj: [n_embd, n_hidden]
+        let gate_w = self
+            .gate_proj
+            .linear
+            .ws
+            .narrow(0, 0, matformer_hidden_size);
+        let up_w = self
+            .up_proj
+            .linear
+            .ws
+            .narrow(0, 0, matformer_hidden_size);
+        let down_w = self
+            .down_proj
+            .linear
+            .ws
+            .narrow(1, 0, matformer_hidden_size);
+
+        let gate = xs.matmul(&gate_w.transpose(0, 1));
+        let up = xs.matmul(&up_w.transpose(0, 1));
+        let hidden = gate.silu() * up;
+        hidden.matmul(&down_w.transpose(0, 1))
     }
 }
 
@@ -143,6 +203,15 @@ impl Block {
             &vs / "mlp",
             config.hidden_size as i64,
             config.intermediate_size as i64,
+            match config.matformer_tier {
+                0 => None,
+                tier => {
+                    let divisor = 1_i64
+                        .checked_shl(tier as u32)
+                        .expect("matformer_tier too large");
+                    Some((config.intermediate_size as i64) / divisor)
+                }
+            },
             comm,
         );
         Self {
@@ -297,6 +366,27 @@ impl LlamaForCausalLM {
             override_max_position_embeddings,
         )
     }
+
+    pub fn from_pretrained_with_matformer_tier(
+        source: &PretrainedSource<LlamaConfig>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+        matformer_tier: u8,
+    ) -> Result<Self, ModelLoadError> {
+        Self::from_builder_with_config_overrides(
+            Self::builder,
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            |config| config.matformer_tier = matformer_tier,
+        )
+    }
 }
 
 impl ModelConfig for LlamaConfig {
@@ -396,5 +486,52 @@ impl LanguageModelConfig for LlamaConfig {
 
     fn eos_token_ids(&self) -> Option<EosToks> {
         self.eos_token_id.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mlp;
+    use tch::{Device, Kind, Tensor, nn};
+    use tch::nn::Module;
+
+    #[test]
+    fn matformer_mlp_has_zero_tail_grads() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let n_embd = 4;
+        let n_hidden = 8;
+        let matformer_hidden = 4;
+
+        let mlp = Mlp::new(
+            vs.root(),
+            n_embd,
+            n_hidden,
+            Some(matformer_hidden),
+            None,
+        );
+
+        let xs = Tensor::randn([2, 3, n_embd], (Kind::Float, Device::Cpu));
+        let out = mlp.forward(&xs);
+        let loss = out.sum(Kind::Float);
+        loss.backward();
+
+        let gate_grad = mlp.gate_proj.linear.ws.grad();
+        let up_grad = mlp.up_proj.linear.ws.grad();
+        let down_grad = mlp.down_proj.linear.ws.grad();
+
+        // gate/up: [n_hidden, n_embd] => tail rows must have zero grad
+        let gate_tail = gate_grad.narrow(0, matformer_hidden, n_hidden - matformer_hidden);
+        let up_tail = up_grad.narrow(0, matformer_hidden, n_hidden - matformer_hidden);
+
+        // down: [n_embd, n_hidden] => tail cols must have zero grad
+        let down_tail = down_grad.narrow(1, matformer_hidden, n_hidden - matformer_hidden);
+
+        let gate_tail_max = gate_tail.abs().max().double_value(&[]);
+        let up_tail_max = up_tail.abs().max().double_value(&[]);
+        let down_tail_max = down_tail.abs().max().double_value(&[]);
+
+        assert_eq!(gate_tail_max, 0.0);
+        assert_eq!(up_tail_max, 0.0);
+        assert_eq!(down_tail_max, 0.0);
     }
 }

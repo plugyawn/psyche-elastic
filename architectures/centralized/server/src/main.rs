@@ -66,6 +66,18 @@ struct RunArgs {
     )]
     tui: bool,
 
+    /// Sets server logs interface (overrides `--tui` if set).
+    ///
+    /// - `tui`: Enables a terminal-based graphical interface.
+    /// - `console`: standard logs.
+    /// - `json`: standard logs with json format.
+    #[clap(long, env, value_enum, ignore_case = true)]
+    logs: Option<LogOutput>,
+
+    /// If present, write logs to this file.
+    #[clap(long, env)]
+    write_log: Option<PathBuf>,
+
     /// Path to TOML of data server config
     #[clap(long)]
     data_config: Option<PathBuf>,
@@ -162,12 +174,19 @@ async fn main() -> Result<()> {
         }
         Commands::Run { run_args } => {
             let config = load_config_state(run_args.state, run_args.data_config);
+            let log_output = run_args.logs.unwrap_or(if run_args.tui {
+                LogOutput::TUI
+            } else {
+                LogOutput::Console
+            });
+            let tui = match run_args.logs {
+                Some(LogOutput::TUI) => true,
+                Some(_) => false,
+                None => run_args.tui,
+            };
             let logger = psyche_tui::logging::logging()
-                .with_output(if run_args.tui {
-                    LogOutput::TUI
-                } else {
-                    LogOutput::Console
-                })
+                .with_output(log_output)
+                .with_log_file(run_args.write_log.clone())
                 .with_metrics_destination(run_args.oltp_metrics_url.clone().map(|endpoint| {
                     MetricsDestination::OpenTelemetry(OpenTelemetry {
                         endpoint,
@@ -201,7 +220,7 @@ async fn main() -> Result<()> {
             match config {
                 Ok(config) => {
                     App::new(
-                        run_args.tui,
+                        tui,
                         config.0,
                         config.1,
                         run_args.server_port,

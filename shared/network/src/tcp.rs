@@ -143,12 +143,15 @@ where
         debug!("New client joined - sent challenge {:?}", challenge);
 
         // Receive and verify challenge response
-        let response = ClientToServerMessage::<ToClient>::from_bytes(
-            &framed
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("No response received"))??,
-        )?;
+        let response_bytes = match framed.next().await {
+            Some(Ok(bytes)) => bytes,
+            Some(Err(err)) => return Err(err.into()),
+            None => {
+                debug!("Client disconnected before responding to challenge");
+                return Ok(());
+            }
+        };
+        let response = ClientToServerMessage::<ToClient>::from_bytes(&response_bytes)?;
         let challenge_response = if let ClientToServerMessage::ChallengeResponse(res) = response {
             res
         } else {

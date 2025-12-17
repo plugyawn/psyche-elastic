@@ -37,6 +37,7 @@ use super::{
     round_state::RoundState,
     types::DistroBroadcastAndPayload,
 };
+use sysinfo::{Pid, ProcessesToUpdate, System, get_current_pid};
 
 #[derive(Debug)]
 pub struct FinishedTrainers {
@@ -75,6 +76,9 @@ pub enum TrainError {
     #[error("Failed to train on batch: {0}")]
     TrainOnBatch(#[from] TrainerThreadCommunicationError),
 
+    #[error("Model parameter count mismatch: got {got} DisTrO results, expected {expected}")]
+    ParameterCountMismatch { expected: usize, got: usize },
+
     #[error("Failed to serialize distro result: {0}")]
     SerializeDistroResult(SerializeDistroResultError),
 
@@ -97,9 +101,13 @@ pub struct TrainingStepMetadata<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub tx_health_check: mpsc::UnboundedSender<HealthChecks<T>>,
     pub tx_distro_result: mpsc::UnboundedSender<DistroBroadcastAndPayload>,
 
+    pub parameter_names: Arc<Vec<String>>,
+    pub matformer_tier: u8,
+
     pub write_gradients_dir: Option<PathBuf>,
 
     pub model_task_runner: ModelTaskRunner,
+    pub log_memory_usage: bool,
 }
 
 #[derive(Debug)]
@@ -137,6 +145,30 @@ impl TrainingStep {
     }
 }
 
+fn log_memory_snapshot_once(enable: bool) {
+    static DID_LOG: AtomicBool = AtomicBool::new(false);
+    if !enable || DID_LOG.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let mut sys = System::new_all();
+    let pid = get_current_pid().unwrap_or_else(|_| Pid::from_u32(0));
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+    if let Some(proc_info) = sys.process(pid) {
+        let rss_kb = proc_info.memory();
+        let virt_kb = proc_info.virtual_memory();
+        let cuda_mem_bytes: Option<u64> = None;
+
+        info!(
+            memory_rss_mb = (rss_kb as f64) / 1024.0,
+            memory_virtual_mb = (virt_kb as f64) / 1024.0,
+            cuda_mem_bytes,
+            "memory_snapshot"
+        );
+    }
+}
+
 impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata<T, A> {
     pub fn start(
         &mut self,
@@ -150,12 +182,15 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
             return Err(TrainError::NoTrainers);
         }
 
+        let parameter_names = self.parameter_names.clone();
+
         let applying = self.apply_results(trainers, state, previous_round, current_round)?;
 
         let sending_health_checks =
             start_sending_health_checks(current_round, state, self.tx_health_check.clone())?;
 
         debug!("Transitioning to train step {}", state.progress.step);
+        log_memory_snapshot_once(self.log_memory_usage);
 
         let cancel_training = CancellationToken::new();
         let round_start = Instant::now();
@@ -242,6 +277,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
             committee = %committee_proof.committee,
             witness_position = witness_proof.position,
             witness = %witness_proof.witness,
+            matformer_tier = self.matformer_tier,
             warmup_lr_between = ?warmup_lr_between,
             assigned_batches = ?get_batch_ids_for_node(&data_assignments, &self.identity),
             "Got training assignment for step {} (round {}/epoch {}): index={} committee position={} committee={} witness position={} witness={} warmup_lr_between={:?}",
@@ -396,6 +432,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 }
                                 let write_gradients_dir = write_gradients_dir.clone();
                                 let tx_distro_result = tx_distro_result.clone();
+                                let parameter_names = parameter_names.clone();
                                 let res: Result<(), TrainError> = tokio::task::spawn_blocking(move || {
                                     if cancelled {
                                         trace!("However, we were cancelled, so we're throwing away this result.");
@@ -405,12 +442,20 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
 
                                     let to_transmit = if quantize { Trainer::quantize_results(&distro_results) } else { distro_results.clone()};
 
+                                    if !to_transmit.is_empty() && to_transmit.len() != parameter_names.len() {
+                                        return Err(TrainError::ParameterCountMismatch {
+                                            expected: parameter_names.len(),
+                                            got: to_transmit.len(),
+                                        });
+                                    }
+
                                     let transmittable_distro_result = TransmittableDistroResult {
                                         step,
                                         batch_id,
                                         distro_results: to_transmit
                                             .into_iter()
-                                            .map(|x| SerializedDistroResult::try_from(&x))
+                                            .zip(parameter_names.iter())
+                                            .map(|(x, name)| SerializedDistroResult::try_from((name.as_str(), &x)))
                                             .collect::<std::result::Result<Vec<_>, _>>()
                                             .map_err(TrainError::SerializeDistroResult)?,
                                         trainer_nonce: nonce,

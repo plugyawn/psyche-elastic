@@ -15,6 +15,7 @@ use crate::serializable_tensor::SerializableTensor;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SerializedDistroResult {
+    pub parameter_name: String,
     pub sparse_idx: SerializableTensor,
     pub sparse_val: SerializableTensor,
     pub xshape: Vec<u16>,
@@ -33,11 +34,19 @@ impl TransmittableDistroResult {
     pub fn comptue_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.step.to_be_bytes());
+        hasher.update(self.trainer_nonce.to_be_bytes());
         hasher.update(self.batch_id.0.start.to_be_bytes());
         hasher.update(self.batch_id.0.end.to_be_bytes());
         for result in &self.distro_results {
-            hasher.update(result.sparse_idx.raw_tensor_data());
-            hasher.update(result.sparse_val.raw_tensor_data());
+            hasher.update((result.parameter_name.len() as u32).to_be_bytes());
+            hasher.update(result.parameter_name.as_bytes());
+            hasher.update((result.xshape.len() as u32).to_be_bytes());
+            for dim in &result.xshape {
+                hasher.update(dim.to_be_bytes());
+            }
+            hasher.update(result.totalk.to_be_bytes());
+            result.sparse_idx.update_hash(&mut hasher);
+            result.sparse_val.update_hash(&mut hasher);
         }
         hasher.finalize().into()
     }
@@ -55,6 +64,24 @@ impl TryFrom<&DistroResult> for SerializedDistroResult {
     type Error = SerializeDistroResultError;
     fn try_from(value: &DistroResult) -> std::result::Result<Self, Self::Error> {
         Ok(Self {
+            parameter_name: String::new(),
+            sparse_idx: (&value.sparse_idx).try_into()?,
+            sparse_val: (&value.sparse_val).try_into()?,
+            xshape: value
+                .xshape
+                .iter()
+                .map(|&x| u16::try_from(x))
+                .collect::<Result<Vec<u16>, _>>()?,
+            totalk: value.totalk as u32,
+        })
+    }
+}
+
+impl TryFrom<(&str, &DistroResult)> for SerializedDistroResult {
+    type Error = SerializeDistroResultError;
+    fn try_from((parameter_name, value): (&str, &DistroResult)) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            parameter_name: parameter_name.to_owned(),
             sparse_idx: (&value.sparse_idx).try_into()?,
             sparse_val: (&value.sparse_val).try_into()?,
             xshape: value

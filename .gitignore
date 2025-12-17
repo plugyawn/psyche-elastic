@@ -36,6 +36,11 @@ perf.data.*
 .zed/
 .idea/
 .venv/
+.cargo-home/
+.cargo-target/
+.cargo-target-tests/
+.claude/
+external/
 libtorch*
 slurm*
 *.key
@@ -48,6 +53,8 @@ bindings
 /distro-data
 checkpoints/
 logs/
+dist/
+psyche-transfer.tar.gz
 txt/
 config/testing/dolma/
 **/devnet_funded_accounts

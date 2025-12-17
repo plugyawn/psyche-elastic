@@ -12,11 +12,11 @@ use psyche_network::{
 };
 use psyche_watcher::OpportunisticData;
 use std::{
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tch::TchError;
 use thiserror::Error;
 use tokio::{
     sync::mpsc::{self},
@@ -41,6 +41,9 @@ pub struct StepStateMachine<T: NodeIdentity, A: AuthenticatableIdentity + 'stati
     identity: T,
 
     stats_logger: Arc<Mutex<StatsLogger>>,
+
+    parameter_names: Arc<Vec<String>>,
+    parameter_index_by_name: Arc<HashMap<String, usize>>,
 
     warmup: WarmupStepMetadata,
     training: TrainingStepMetadata<T, A>,
@@ -139,6 +142,14 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
         let mut previous_round = RoundState::default();
         let mut current_round = RoundState::default();
 
+        let parameter_names = training.parameter_names.clone();
+        let parameter_index_by_name: HashMap<String, usize> = parameter_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let parameter_index_by_name = Arc::new(parameter_index_by_name);
+
         let active_step =
             ActiveStep::Warmup(warmup.start(trainers, &mut previous_round, &mut current_round));
 
@@ -146,6 +157,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
             identity,
 
             stats_logger: Arc::new(Mutex::new(stats_logger)),
+
+            parameter_names,
+            parameter_index_by_name,
 
             warmup,
             training,
@@ -604,6 +618,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
         let blooms = round_state.blooms.clone();
         let downloads = round_state.downloads.clone();
         let stats_logger = self.stats_logger.clone();
+        let parameter_names = self.parameter_names.clone();
+        let parameter_index_by_name = self.parameter_index_by_name.clone();
         tokio::spawn(async move {
             // verify that the result matches the commitment
             let (distro_hash, distro_result) =
@@ -660,12 +676,49 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
             // we unconditionally store every seen payload, since we're not yet sure what consensus will be on whether it's included.
             let deserializing = tokio::task::spawn(async move {
                 let maybe_results = tokio::task::spawn_blocking(move || {
-                    let r = distro_result
-                        .distro_results
-                        .iter()
-                        .map(|x| x.try_into())
-                        .collect::<Result<Vec<DistroResult>, TchError>>()
-                        .map(|x| (x, distro_result.trainer_nonce));
+                    if distro_result.distro_results.is_empty() {
+                        return Ok((Vec::new(), distro_result.trainer_nonce));
+                    }
+
+                    let mut results: Vec<Option<DistroResult>> =
+                        vec![None; parameter_names.len()];
+
+                    for serialized in &distro_result.distro_results {
+                        let Some(&index) =
+                            parameter_index_by_name.get(&serialized.parameter_name)
+                        else {
+                            return Err(DeserializeError::UnknownParameter(
+                                serialized.parameter_name.clone(),
+                            ));
+                        };
+                        if results[index].is_some() {
+                            return Err(DeserializeError::DuplicateParameter(
+                                serialized.parameter_name.clone(),
+                            ));
+                        }
+
+                        let result: DistroResult = serialized.try_into()?;
+                        results[index] = Some(result);
+                    }
+
+                    if let Some((missing_index, _)) =
+                        results.iter().enumerate().find(|(_, v)| v.is_none())
+                    {
+                        let missing = results.iter().filter(|v| v.is_none()).count();
+                        let example = parameter_names
+                            .get(missing_index)
+                            .cloned()
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        return Err(DeserializeError::MissingParameters { missing, example });
+                    }
+
+                    let results = results
+                        .into_iter()
+                        .map(|v| v.expect("checked above"))
+                        .collect::<Vec<_>>();
+
+                    let r: Result<(Vec<DistroResult>, u32), DeserializeError> =
+                        Ok((results, distro_result.trainer_nonce));
                     trace!(
                         hash = %hash,
                         batch_id = %batch_id,
@@ -795,14 +848,31 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                     .lock()
                     .map_err(|_| StepError::StatsLoggerMutex)?
                     .push_round_stats(&round_losses, round_duration, step_duration, optim_stats);
-                info!(
-                    integration_test_log_marker = %IntegrationTestLogMarker::Loss,
-                    client_id = %self.identity,
-                    epoch = state.progress.epoch,
-                    step = state.progress.step,
-                    loss = loss.unwrap_or(f32::NAN),
-                    "client_loss",
-                );
+                match loss {
+                    Some(loss) => {
+                        info!(
+                            integration_test_log_marker = %IntegrationTestLogMarker::Loss,
+                            client_id = %self.identity,
+                            epoch = state.progress.epoch,
+                            step = state.progress.step,
+                            matformer_tier = self.training.matformer_tier,
+                            trained_batches = round_losses.len(),
+                            loss = loss,
+                            "client_loss",
+                        );
+                    }
+                    None => {
+                        info!(
+                            integration_test_log_marker = %IntegrationTestLogMarker::Loss,
+                            client_id = %self.identity,
+                            epoch = state.progress.epoch,
+                            step = state.progress.step,
+                            matformer_tier = self.training.matformer_tier,
+                            trained_batches = round_losses.len(),
+                            "client_loss",
+                        );
+                    }
+                }
                 self.stats_logger
                     .lock()
                     .map_err(|_| StepError::StatsLoggerMutex)?

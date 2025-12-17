@@ -40,6 +40,7 @@ Your `.env` file should contain at least these configuration options:
 - `DATA_PARALLELISM`: The number of GPUs the training data will be distributed across. This speeds up computation if you have the resources.
 - `TENSOR_PARALLELISM`: The number of GPUs the loaded model will be distributed across. This lets you train a model you can't fit on one single GPU.
 - `MICRO_BATCH_SIZE`: Number of samples processed per GPU per step (affects memory usage, set it as high as VRAM allows)
+- `MATFORMER_TIER` (optional): The [MatFormer](../explain/matformer.md) tier for this client (0 = full model, 1 = half FFN width, 2 = quarter, etc.). Use higher tiers if your GPU doesn't have enough VRAM for the full model. Default is 0.
 - `AUTHORIZER`: The Solana address that delegated authorization to the Solana public key you will use to join the run. You can read more about [authorization here](./authentication.md).
 
 ### Testing authorization

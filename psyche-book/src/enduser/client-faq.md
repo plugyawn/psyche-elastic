@@ -6,6 +6,8 @@
   - Linux: You need a CUDA-compatible GPU. As for the exact specs this will depend on the size of the model being trained.
   - macOS (development only): Apple Silicon Macs can use Metal Performance Shaders for GPU acceleration.
   - Support for AMD ROCm is planned for the future.
+- What if my GPU doesn't have enough VRAM for the full model?
+  - Psyche supports [MatFormer](../explain/matformer.md) tiers, which allow clients with less VRAM to participate by training a smaller subset of the model. Use the `--matformer-tier` flag (1, 2, 3, etc.) to reduce memory requirements at the cost of training fewer parameters. Tier 1 uses ~50% of FFN parameters, tier 2 uses ~25%, and so on.
 - Can I join a run at any moment?
   - Yes! You will remain as a pending client and start training in the next epoch.
 - Can I leave a run at any moment? How do I leave a run?

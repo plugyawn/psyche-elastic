@@ -32,6 +32,10 @@ impl SerializableKind {
         self.0
     }
 
+    pub fn as_u8(&self) -> u8 {
+        kind_to_u8(&self.0)
+    }
+
     pub fn new(kind: Kind) -> Self {
         SerializableKind(kind)
     }

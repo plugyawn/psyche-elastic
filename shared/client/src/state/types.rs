@@ -35,6 +35,15 @@ pub enum DeserializeError {
 
     #[error("Deserialize error: {0}")]
     Deserialize(#[from] TchError),
+
+    #[error("Distro result referenced unknown parameter: {0}")]
+    UnknownParameter(String),
+
+    #[error("Distro result contained duplicate parameter: {0}")]
+    DuplicateParameter(String),
+
+    #[error("Distro result missing {missing} parameters (e.g. {example})")]
+    MissingParameters { missing: usize, example: String },
 }
 
 pub struct DistroBroadcastAndPayload {

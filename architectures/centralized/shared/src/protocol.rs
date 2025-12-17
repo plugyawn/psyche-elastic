@@ -10,9 +10,26 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use ts_rs::TS;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ClientCapabilities {
+    /// What device this node is running on (e.g. "CPU", "MPS", "CUDA(0)").
+    pub device: String,
+    /// MatFormer tier requested/capable: `0` = largest, higher = smaller.
+    pub matformer_tier: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TrainingAssignment {
+    /// Assigned MatFormer tier: `0` = largest, higher = smaller.
+    pub matformer_tier: u8,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientToServerMessage {
-    Join { run_id: String },
+    Join {
+        run_id: String,
+        capabilities: ClientCapabilities,
+    },
     Witness(Box<OpportunisticData>),
     HealthCheck(HealthChecks<ClientId>),
     Checkpoint(model::HubRepo),
@@ -21,6 +38,7 @@ pub enum ClientToServerMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ServerToClientMessage {
     Coordinator(Box<Coordinator<ClientId>>),
+    TrainingAssignment { assignment: TrainingAssignment },
 }
 
 #[derive(Serialize, Deserialize, Clone, Hash, PartialEq, Eq, Debug, Copy, TS)]

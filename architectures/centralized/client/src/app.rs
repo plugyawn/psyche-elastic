@@ -1,7 +1,9 @@
 use anyhow::{Error, Result};
 use bytemuck::Zeroable;
 use hf_hub::Repo;
-use psyche_centralized_shared::{ClientId, ClientToServerMessage, ServerToClientMessage};
+use psyche_centralized_shared::{
+    ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage, TrainingAssignment,
+};
 use psyche_client::{
     Client, ClientTUI, ClientTUIState, NC, RunInitConfig, TrainArgs, read_identity_secret_key,
 };
@@ -20,7 +22,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::interval;
 use tokio::{select, sync::mpsc, time::Interval};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub(super) type Tabs = TabbedWidget<(ClientTUI, CoordinatorTui, NetworkTui, LoggerWidget)>;
 pub const TAB_NAMES: [&str; 4] = ["Client", "Coordinator", "Network", "Logger"];
@@ -80,6 +82,8 @@ pub struct App {
     tx_tui_state: Option<Sender<TabsData>>,
     coordinator_state: Coordinator<ClientId>,
     server_conn: TcpClient<ClientId, ClientToServerMessage, ServerToClientMessage>,
+    capabilities: ClientCapabilities,
+    training_assignment: Option<TrainingAssignment>,
 
     metrics: Arc<ClientMetrics>,
 }
@@ -149,7 +153,10 @@ pub async fn build_app(
         grad_accum_in_fp32: p.grad_accum_in_fp32,
         dummy_training_delay_secs: p.dummy_training_delay_secs,
         max_concurrent_parameter_requests: p.max_concurrent_parameter_requests,
-        device: p.device,
+        device: p.device.clone(),
+        matformer_tier: p.matformer_tier,
+        matformer_load_strategy: p.matformer_load_strategy,
+        log_memory_usage: p.log_memory_usage,
         sidecar_port: p.sidecar_port,
     };
     let app = App {
@@ -159,6 +166,11 @@ pub async fn build_app(
         coordinator_state: Coordinator::zeroed(),
         server_conn,
         run_id: p.run_id,
+        capabilities: ClientCapabilities {
+            device: p.device.to_string(),
+            matformer_tier: p.matformer_tier,
+        },
+        training_assignment: None,
         metrics,
     };
     Ok((app, allowlist, p2p, state_options))
@@ -193,6 +205,7 @@ impl App {
         self.server_conn
             .send(ClientToServerMessage::Join {
                 run_id: self.run_id.clone(),
+                capabilities: self.capabilities.clone(),
             })
             .await?;
 
@@ -264,6 +277,13 @@ impl App {
             ServerToClientMessage::Coordinator(state) => {
                 self.coordinator_state = *state;
                 let _ = tx.send(*state);
+            }
+            ServerToClientMessage::TrainingAssignment { assignment } => {
+                info!(
+                    matformer_tier = assignment.matformer_tier,
+                    "Received training assignment"
+                );
+                self.training_assignment = Some(assignment);
             }
         }
     }

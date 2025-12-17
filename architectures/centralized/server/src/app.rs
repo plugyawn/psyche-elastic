@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use psyche_centralized_shared::{ClientId, ClientToServerMessage, ServerToClientMessage};
+use psyche_centralized_shared::{
+    ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage, TrainingAssignment,
+};
 use psyche_coordinator::model::{self, Checkpoint, LLM, LLMTrainingDataLocation, Model};
 use psyche_coordinator::{
     Client, ClientState, Coordinator, CoordinatorError, HealthChecks, Round, RunState,
@@ -18,7 +20,7 @@ use psyche_tui::{
 use psyche_watcher::{CoordinatorTui, OpportunisticData};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -47,6 +49,7 @@ type TabsData = <Tabs as CustomWidget>::Data;
 struct Backend {
     net_server: TcpServer<ClientId, ClientToServerMessage, ServerToClientMessage>,
     pending_clients: HashSet<ClientId>,
+    client_capabilities: HashMap<ClientId, ClientCapabilities>,
 }
 
 impl Backend {
@@ -280,6 +283,7 @@ impl App {
                 backend: Backend {
                     net_server,
                     pending_clients: HashSet::new(),
+                    client_capabilities: HashMap::new(),
                 },
                 save_state_dir,
                 original_warmup_time,
@@ -350,6 +354,7 @@ impl App {
 
     fn on_disconnect(&mut self, from: ClientId) -> Result<()> {
         self.backend.pending_clients.remove(&from);
+        self.backend.client_capabilities.remove(&from);
 
         if self.withdraw_on_disconnect {
             let position = self
@@ -372,12 +377,32 @@ impl App {
 
     async fn on_client_message(&mut self, from: ClientId, event: ClientToServerMessage) {
         let broadcast = match event {
-            ClientToServerMessage::Join { run_id } => {
+            ClientToServerMessage::Join {
+                run_id,
+                capabilities,
+            } => {
                 // TODO: check whitelist
                 let coord_run_id = String::from(&self.coordinator.run_id);
                 if coord_run_id == run_id {
-                    info!("added pending client {from}");
+                    info!(
+                        client_id = %from,
+                        device = %capabilities.device,
+                        matformer_tier = capabilities.matformer_tier,
+                        "added pending client"
+                    );
                     self.backend.pending_clients.insert(from);
+                    self.backend.client_capabilities.insert(from, capabilities.clone());
+                    let assignment = TrainingAssignment {
+                        matformer_tier: capabilities.matformer_tier,
+                    };
+                    if let Err(err) = self
+                        .backend
+                        .net_server
+                        .send_to(from, ServerToClientMessage::TrainingAssignment { assignment })
+                        .await
+                    {
+                        warn!("Failed to send training assignment to {from}: {err}");
+                    }
                 } else {
                     info!("{from:?} tried to join unknown run {run_id}");
                 }
@@ -386,9 +411,28 @@ impl App {
             ClientToServerMessage::Witness(witness) => {
                 let state_before = self.coordinator.run_state;
                 if let Err(error) = match *witness {
-                    OpportunisticData::WitnessStep(witness, _witness_metadata) => self
-                        .coordinator
-                        .witness(&from, witness, Self::get_timestamp()),
+                    OpportunisticData::WitnessStep(witness, witness_metadata) => {
+                        let (device, matformer_tier, capabilities_known) = self
+                            .backend
+                            .client_capabilities
+                            .get(&from)
+                            .map(|c| (c.device.clone(), c.matformer_tier, true))
+                            .unwrap_or_else(|| ("unknown".to_string(), 0, false));
+                        info!(
+                            client_id = %from,
+                            capabilities_known,
+                            device = %device,
+                            matformer_tier,
+                            step = witness_metadata.step,
+                            loss = witness_metadata.loss,
+                            tokens_per_sec = witness_metadata.tokens_per_sec,
+                            bandwidth_per_sec = witness_metadata.bandwidth_per_sec,
+                            efficency = witness_metadata.efficency,
+                            "received_witness_metadata"
+                        );
+                        self.coordinator
+                            .witness(&from, witness, Self::get_timestamp())
+                    }
                     OpportunisticData::WarmupStep(witness) => self.coordinator.warmup_witness(
                         &from,
                         witness,

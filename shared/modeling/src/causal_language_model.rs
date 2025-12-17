@@ -44,6 +44,22 @@ pub trait CausalLM: Send {
     fn prepare_for_training(&self);
     fn clip_grad_norm(&self, max_grad_norm: f64);
     fn shutdown(&self) {}
+    /// Optional MatFormer debug hook: returns gradient stats for FFN tails (if applicable).
+    ///
+    /// Implementations that do not support MatFormer can return `None`.
+    fn matformer_tail_grad_stats(&self) -> Option<MatformerTailGradSummary> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MatformerTailGradSummary {
+    pub gate_tail_max: f64,
+    pub up_tail_max: f64,
+    pub down_tail_max: f64,
+    pub gate_prefix_max: f64,
+    pub up_prefix_max: f64,
+    pub down_prefix_max: f64,
 }
 
 pub trait LanguageModelForward: Send + Debug {
@@ -92,7 +108,7 @@ pub type LanguageModelBuilder<M, C> = fn(
 ) -> Result<M, ModelLoadError>;
 
 impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLanguageModel<M, C> {
-    pub fn from_builder(
+    pub fn from_builder_with_config_overrides<F: FnOnce(&mut C)>(
         builder: LanguageModelBuilder<M, C>,
         source: &PretrainedSource<C>,
         kind: Option<Kind>,
@@ -100,8 +116,11 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLanguageModel<M, C> 
         device: Option<Device>,
         tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
         override_max_position_embeddings: Option<usize>,
+        config_overrides: F,
     ) -> Result<Self, ModelLoadError> {
         let mut config = source.get_config()?;
+
+        config_overrides(&mut config);
 
         if config.tie_word_embeddings() {
             return Err(ModelLoadError::ModelHasTiedEmbeddings);
@@ -170,6 +189,27 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLanguageModel<M, C> 
             comm,
             training: AtomicBool::new(false),
         })
+    }
+
+    pub fn from_builder(
+        builder: LanguageModelBuilder<M, C>,
+        source: &PretrainedSource<C>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+    ) -> Result<Self, ModelLoadError> {
+        Self::from_builder_with_config_overrides(
+            builder,
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            |_| {},
+        )
     }
 }
 

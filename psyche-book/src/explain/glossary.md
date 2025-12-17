@@ -33,6 +33,9 @@ Designated, trusted participants responsible for saving the model `Checkpoint` d
 **Client**
 The software participants run on their own hardware (typically with a GPU) to contribute to the distributed training process. Clients perform computations, submit results (`Commitments`), and participate in `Witnessing`.
 
+**ClientCapabilities**
+Information a client sends when joining a training run, including its compute device (CUDA, MPS, CPU) and MatFormer tier. Used by the server to assign appropriate training parameters.
+
 **ClientState**
 The status of a `Client` as tracked by the `Coordinator`. Key states include `Healthy`, `Dropped`, `Withdrawn`, and `Ejected`.
 
@@ -75,6 +78,9 @@ A major cycle in the training process, composed of multiple `Rounds`. A `Checkpo
 **Exited Clients**
 A buffer on the `Coordinator` holding records of clients that have recently left the run (`Dropped`, `Withdrawn`, `Ejected`).
 
+**FFN (Feed-Forward Network)**
+The feed-forward sublayer in a transformer block, typically consisting of two linear projections with a nonlinearity between them. FFNs account for approximately 2/3 of transformer parameters and are the primary target of MatFormer's elastic width mechanism.
+
 **Finished**
 A `RunState` indicating that the training run has completed its configured `total_steps`.
 
@@ -95,6 +101,12 @@ A `P2P` library that `Psyche` uses for data-sharing between the clients.
 
 **Lightweight Hashing**
 Using efficient hashing algorithms like SHA-256 for `Commitments` to allow for fast verification by the `Coordinator` and `Witnesses`.
+
+**MatFormer**
+Matryoshka Transformer - a technique for training nested transformer models where smaller submodels are strict prefixes of larger ones. Enables heterogeneous training where clients with different hardware capabilities can participate in the same run at different capacity tiers. See [MatFormer documentation](./matformer.md).
+
+**MatFormer Tier**
+A configuration value (0, 1, 2, 3, ...) specifying which nested submodel a client trains. Tier 0 uses the full model, tier 1 uses half the FFN width, tier 2 uses quarter width, etc. Higher tiers require less VRAM but train on fewer parameters.
 
 **Metal**
 Apple's graphics and compute API. A future backend target for running the Psyche client on Mac hardware.

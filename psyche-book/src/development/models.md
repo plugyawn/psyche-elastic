@@ -4,6 +4,8 @@ This codebase includes a set of sample programs that let you design, implement, 
 
 We currently only implement Llama and Deepseek (see `shared/modeling/src/models/`), but PRs are very welcome to add more architectures and model types.
 
+Both architectures support [MatFormer](../explain/matformer.md) for elastic inference, allowing clients with different hardware capabilities to participate in training at different capacity tiers.
+
 The `train` example, documented below, is useful to test how your model trains using AdamW vs DisTrO.
 
 ## Running
@@ -42,3 +44,70 @@ Since you're implementing the forward pass yourself, you can serve and interpret
 The data provider currently only supports reading fixed-size batches from input files, so data batches with different sizes will require some additional work.
 
 > PRs welcome for any new kinds of dataset loading!
+
+## MatFormer Support
+
+Models can implement MatFormer (Matryoshka Transformer) support to enable elastic inference. This allows the same model weights to be used at different capacity levels.
+
+### Loading a Model with MatFormer Tier
+
+```rust
+use psyche_modeling::LlamaForCausalLM;
+
+// Load at tier 1 (half FFN width)
+let model = LlamaForCausalLM::from_pretrained_with_matformer_tier(
+    &vs,
+    repo_id,
+    revision,
+    device,
+    1,  // matformer_tier
+)?;
+```
+
+### Implementing MatFormer in a New Model
+
+To add MatFormer support to a new model architecture:
+
+1. **Store the tier configuration** in your model config struct:
+   ```rust
+   pub struct MyModelConfig {
+       pub matformer_tier: u8,
+       // ... other fields
+   }
+   ```
+
+2. **Calculate the effective hidden size** based on tier:
+   ```rust
+   let matformer_hidden_size = match config.matformer_tier {
+       0 => None,  // Full model
+       tier => {
+           let divisor = 1_i64.checked_shl(tier as u32)?;
+           Some(config.intermediate_size / divisor)
+       }
+   };
+   ```
+
+3. **Use prefix slicing in forward pass**:
+   ```rust
+   fn forward(&self, xs: &Tensor) -> Tensor {
+       if let Some(h) = self.matformer_hidden_size {
+           // Use .narrow() to slice weight prefixes
+           let w_up = self.up_proj.ws.narrow(0, 0, h);
+           let w_down = self.down_proj.ws.narrow(1, 0, h);
+           // ... rest of forward
+       } else {
+           // Full model path
+       }
+   }
+   ```
+
+4. **Add gradient isolation test**:
+   ```rust
+   #[test]
+   fn matformer_has_zero_tail_grads() {
+       // Verify exclusive weights have zero gradients
+       // when training at smaller tiers
+   }
+   ```
+
+See `shared/modeling/src/models/llama.rs` for a complete implementation example.

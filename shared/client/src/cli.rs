@@ -7,6 +7,7 @@ use psyche_modeling::Devices;
 use psyche_network::{DiscoveryMode, RelayKind, SecretKey};
 use psyche_tui::LogOutput;
 use std::{path::PathBuf, time::Duration};
+use clap::ValueEnum;
 
 pub fn read_identity_secret_key(
     identity_secret_key_path: Option<&PathBuf>,
@@ -186,6 +187,23 @@ pub struct TrainArgs {
     )]
     pub device: Devices,
 
+    /// MatFormer tier this client can train at (`0` = largest, higher = smaller).
+    ///
+    /// Currently used for capability handshakes / heterogeneous assignment in centralized testnets.
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_tier: u8,
+
+    /// How to load MatFormer weights:
+    /// - auto (default): load a tier-sliced checkpoint if present, otherwise load the universal checkpoint and slice at runtime.
+    /// - universal: always load the universal checkpoint and slice at runtime (current behavior).
+    /// - sliced: require a tier-sliced checkpoint for tiers > 0 (errors if missing); tier 0 loads universal.
+    #[clap(long, env, value_enum, default_value_t = MatformerLoadStrategy::Auto)]
+    pub matformer_load_strategy: MatformerLoadStrategy,
+
+    /// Log a one-time memory snapshot (RSS and, if available, GPU memory) when training starts.
+    #[clap(long, env, default_value_t = false)]
+    pub log_memory_usage: bool,
+
     #[clap(long, env)]
     pub sidecar_port: Option<u16>,
 
@@ -194,6 +212,13 @@ pub struct TrainArgs {
 
     #[clap(long, default_value_t = 3, env)]
     pub keep_steps: u32,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MatformerLoadStrategy {
+    Auto,
+    Universal,
+    Sliced,
 }
 
 impl TrainArgs {

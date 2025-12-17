@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::convert::TryFrom;
 use tch::{Device, Kind, TchError, Tensor};
 
@@ -23,6 +24,28 @@ impl SerializableTensor {
         match &self.data {
             SerializableTensorData::Full(items) => items,
             SerializableTensorData::OneBit(items) => items,
+        }
+    }
+
+    pub fn update_hash<D: Digest>(&self, digest: &mut D) {
+        digest.update((self.dims.len() as u32).to_be_bytes());
+        for dim in &self.dims {
+            digest.update(dim.to_be_bytes());
+        }
+        digest.update([self.kind.as_u8()]);
+        digest.update([self.requires_grad as u8]);
+
+        match &self.data {
+            SerializableTensorData::Full(bytes) => {
+                digest.update([0u8]);
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+            }
+            SerializableTensorData::OneBit(bytes) => {
+                digest.update([1u8]);
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+            }
         }
     }
 }

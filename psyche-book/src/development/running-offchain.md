@@ -28,6 +28,37 @@ just local-testnet \
     --config-path ./config/consilience-match-llama2-20m-fineweb-pretrain-dev/
 ```
 
+### Heterogeneous Training with MatFormer
+
+You can run clients at different [MatFormer](../explain/matformer.md) tiers to simulate heterogeneous hardware:
+
+```bash
+just local-testnet \
+    --num-clients 3 \
+    --config-path ./config/my-config/ \
+    --client-matformer-tiers 0,1,2
+```
+
+This assigns:
+- Client 1: tier 0 (full FFN width)
+- Client 2: tier 1 (half FFN width)
+- Client 3: tier 2 (quarter FFN width)
+
+The tiers cycle if you have more clients than tier values specified.
+
+### Headless Mode
+
+For CI/automated testing, use headless mode which doesn't require tmux:
+
+```bash
+cargo run -p psyche-centralized-local-testnet -- start \
+    --headless \
+    --headless-exit-after-secs 60 \
+    --num-clients 2 \
+    --config-path ./config/test \
+    --tui false
+```
+
 There's a _lot_ of options to configure the local testnet. Check em out below!
 
 <details>

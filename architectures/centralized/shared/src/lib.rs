@@ -1,3 +1,6 @@
 mod protocol;
 
-pub use protocol::{ClientId, ClientToServerMessage, ServerToClientMessage};
+pub use protocol::{
+    ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage,
+    TrainingAssignment,
+};

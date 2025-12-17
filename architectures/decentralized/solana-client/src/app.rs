@@ -134,6 +134,9 @@ pub async fn build_app(
             dummy_training_delay_secs: p.dummy_training_delay_secs,
             max_concurrent_parameter_requests: p.max_concurrent_parameter_requests,
             device: p.device,
+            matformer_tier: p.matformer_tier,
+            matformer_load_strategy: p.matformer_load_strategy,
+            log_memory_usage: p.log_memory_usage,
             sidecar_port: p.sidecar_port,
         };
     let app = App {

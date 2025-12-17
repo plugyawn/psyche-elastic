@@ -3,9 +3,8 @@ use clap::{ArgAction, Parser};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use std::ffi::OsString;
-use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::macros::format_description;
@@ -62,6 +61,18 @@ struct StartArgs {
     )]
     tui: bool,
 
+    /// Run without tmux (spawns server/clients as subprocesses in this terminal).
+    #[clap(long, default_value_t = false)]
+    headless: bool,
+
+    /// If set, automatically stop a headless testnet after N seconds.
+    #[clap(long)]
+    headless_exit_after_secs: Option<u64>,
+
+    /// Skip running `nvtop` in the tmux monitor pane (useful on non-Linux).
+    #[clap(long, default_value_t = false)]
+    no_nvtop: bool,
+
     /// Kill N clients randomly every <RANDOM_KILL_INTERVAL> seconds
     #[clap(long)]
     random_kill_num: Option<usize>,
@@ -77,6 +88,26 @@ struct StartArgs {
     /// Sets the level of the logging for more granular information
     #[clap(long, default_value = "warn,psyche=debug")]
     log: String,
+
+    /// Device(s) to use for clients (passed through to `psyche-centralized-client --device`).
+    #[clap(long, default_value = "auto")]
+    client_device: String,
+
+    /// MatFormer tier(s) to pass to clients (comma-separated).
+    ///
+    /// If multiple tiers are provided, they are assigned to clients in a repeating cycle.
+    ///
+    /// Tier `0` = largest, higher = smaller.
+    #[clap(long, value_delimiter = ',')]
+    client_matformer_tiers: Vec<u8>,
+
+    /// What discovery mode to use for spawned clients (`local` or `n0`).
+    #[clap(long, default_value = "local")]
+    client_iroh_discovery: String,
+
+    /// What relay kind to use for spawned clients (`disabled`, `psyche`, or `n0`).
+    #[clap(long, default_value = "disabled")]
+    client_iroh_relay: String,
 
     /// HF repo where the first client could get the model and the configuration to use.
     #[clap(long)]
@@ -135,6 +166,21 @@ fn extract_run_id(state_path: &PathBuf) -> Result<String> {
     Ok(toml.run_id)
 }
 
+struct ChildProcesses {
+    children: Vec<Child>,
+}
+
+impl Drop for ChildProcesses {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+        }
+        for child in &mut self.children {
+            let _ = child.wait();
+        }
+    }
+}
+
 fn main() -> Result<()> {
     #[cfg(feature = "python")]
     psyche_python_extension_impl::init_embedded_python()?;
@@ -143,7 +189,7 @@ fn main() -> Result<()> {
     let command = args.command;
 
     match command {
-        Commands::Start { start_args } => {
+        Commands::Start { mut start_args } => {
             if let Some(n_kill) = start_args.random_kill_num {
                 if n_kill > start_args.num_clients {
                     bail!(
@@ -156,6 +202,11 @@ fn main() -> Result<()> {
             let data_path = start_args.config_path.join("data.toml");
 
             println!("{start_args:?}");
+
+            if start_args.headless_exit_after_secs.is_some() && !start_args.headless {
+                eprintln!("Note: --headless-exit-after-secs implies --headless");
+                start_args.headless = true;
+            }
 
             // Pre-build packages
             Command::new("cargo")
@@ -202,6 +253,17 @@ fn main() -> Result<()> {
                 .expect("Failed to validate config");
 
             let run_id = extract_run_id(&state_path)?;
+
+            if start_args.headless {
+                if start_args.random_kill_num.is_some() {
+                    bail!("--random-kill-num is not supported with --headless yet");
+                }
+                run_headless(&start_args, &state_path, &data_path, &run_id)?;
+                return Ok(());
+            }
+
+            ensure_tmux_available()?;
+            ensure_port_available(start_args.server_port)?;
 
             // Create tmux session
             Command::new("tmux")
@@ -263,6 +325,18 @@ fn main() -> Result<()> {
             if data_path.exists() {
                 server_cmd.push_str(&format!(" --data-config {}", data_path.display()));
             }
+            if start_args.write_log {
+                let log_dir = format!(
+                    "./logs/{}",
+                    start_time
+                        .format(format_description!(
+                            "[year]-[month]-[day]_[hour]:[minute]:[second]"
+                        ))
+                        .unwrap()
+                );
+                std::fs::create_dir_all(&log_dir).unwrap();
+                server_cmd.push_str(&format!(" --write-log {log_dir}/server.txt"));
+            }
 
             println!("starting server: {server_cmd:?}");
 
@@ -281,27 +355,31 @@ fn main() -> Result<()> {
                 .expect("Failed to send server command");
 
             println!("Waiting for server startup...");
-            loop {
-                if TcpStream::connect(format!("127.0.0.1:{}", start_args.server_port)).is_ok() {
-                    println!("Server started!");
-                    break;
-                }
-            }
+            wait_for_port_bind(start_args.server_port)?;
+            println!("Server started!");
 
             // Start nvtop
-            Command::new("tmux")
-                .args(["select-pane", "-t", "1"])
-                .status()
-                .ok()
-                .and_then(|s| s.success().then_some(()))
-                .expect("Failed to select nvtop pane");
-
-            Command::new("tmux")
-                .args(["send-keys", "nvtop", "C-m"])
-                .status()
-                .ok()
-                .and_then(|s| s.success().then_some(()))
-                .expect("Failed to start nvtop");
+            if !start_args.no_nvtop {
+                if Command::new("tmux")
+                    .args(["select-pane", "-t", "1"])
+                    .status()
+                    .ok()
+                    .and_then(|s| s.success().then_some(()))
+                    .is_some()
+                {
+                    let started = Command::new("tmux")
+                        .args(["send-keys", "nvtop", "C-m"])
+                        .status()
+                        .ok()
+                        .and_then(|s| s.success().then_some(()))
+                        .is_some();
+                    if !started {
+                        eprintln!("Warning: failed to start `nvtop`; continuing");
+                    }
+                } else {
+                    eprintln!("Warning: failed to select monitor pane; continuing");
+                }
+            }
 
             // Start clients
             for i in 2..=start_args.num_clients + 1 {
@@ -384,6 +462,273 @@ fn main() -> Result<()> {
     }
 }
 
+fn ensure_tmux_available() -> Result<()> {
+    match Command::new("tmux")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => bail!(
+            "`tmux` is required for non-headless mode (exit {}). Install `tmux` or pass `--headless`.",
+            status
+        ),
+        Err(err) => bail!(
+            "`tmux` is required for non-headless mode, but it could not be executed: {err}. Install `tmux` or pass `--headless`."
+        ),
+    }
+}
+
+fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run_id: &str) -> Result<()> {
+    if let Some(exit_after) = args.headless_exit_after_secs {
+        if exit_after == 0 {
+            bail!("--headless-exit-after-secs must be > 0");
+        }
+    }
+    ensure_port_available(args.server_port)?;
+
+    let workspace_root = workspace_root()?;
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root.join("target"));
+
+    let server_bin = target_dir.join("debug").join("psyche-centralized-server");
+    let client_bin = target_dir.join("debug").join("psyche-centralized-client");
+    if !server_bin.exists() {
+        bail!(
+            "Server binary not found at {} (did `cargo build -p psyche-centralized-server` succeed?)",
+            server_bin.display()
+        );
+    }
+    if !client_bin.exists() {
+        bail!(
+            "Client binary not found at {} (did `cargo build -p psyche-centralized-client` succeed?)",
+            client_bin.display()
+        );
+    }
+
+    let start_time = OffsetDateTime::now_utc();
+    let mut processes = ChildProcesses { children: Vec::new() };
+
+    // Start server
+    let mut server_cmd = Command::new(&server_bin);
+    server_cmd
+        .env("RUST_LOG", &args.log)
+        .args([
+            "run",
+            "--state",
+            state_path.to_str().unwrap(),
+            "--server-port",
+            &args.server_port.to_string(),
+            "--tui",
+            &args.tui.to_string(),
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if data_path.exists() {
+        server_cmd.args(["--data-config", data_path.to_str().unwrap()]);
+    }
+    if args.write_log {
+        let log_dir = format!(
+            "./logs/{}",
+            start_time
+                .format(format_description!(
+                    "[year]-[month]-[day]_[hour]:[minute]:[second]"
+                ))
+                .unwrap()
+        );
+        std::fs::create_dir_all(&log_dir)?;
+        server_cmd.args(["--write-log", &format!("{log_dir}/server.txt")]);
+    }
+
+    println!("starting server: {server_cmd:?}");
+    let server_child = server_cmd.spawn().context("Failed to start server")?;
+    processes.children.push(server_child);
+
+    println!("Waiting for server startup...");
+    wait_for_server_startup(args.server_port, processes.children.first_mut().unwrap())?;
+    println!("Server started!");
+
+    // Start clients
+    for i in 2..=args.num_clients + 1 {
+        let client_child = spawn_client_headless(args, &client_bin, i, run_id, start_time)?;
+        processes.children.push(client_child);
+    }
+
+    // Wait until the server exits.
+    if let Some(exit_after) = args.headless_exit_after_secs {
+        let deadline = Instant::now() + Duration::from_secs(exit_after);
+        loop {
+            if let Some(status) = processes.children.first_mut().unwrap().try_wait()? {
+                println!("server exited with {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                println!("headless duration elapsed, shutting down testnet...");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        let status = processes.children.first_mut().unwrap().wait()?;
+        println!("server exited with {status}");
+    }
+
+    Ok(())
+}
+
+fn wait_for_server_startup(port: u16, server_child: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if port_is_bound(port)? {
+            return Ok(());
+        }
+        if let Some(status) = server_child.try_wait()? {
+            bail!("Server exited before binding port {port}: {status}");
+        }
+        if Instant::now() > deadline {
+            bail!("Timed out waiting for server to bind port {port}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_port_bind(port: u16) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if port_is_bound(port)? {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("Timed out waiting for server to bind port {port}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn port_is_bound(port: u16) -> Result<bool> {
+    let addr = format!("0.0.0.0:{port}");
+    match std::net::TcpListener::bind(&addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => Ok(true),
+        Err(err) => bail!("Failed checking port {port}: {err}"),
+    }
+}
+
+fn spawn_client_headless(
+    args: &StartArgs,
+    client_bin: &PathBuf,
+    i: usize,
+    run_id: &str,
+    start_time: OffsetDateTime,
+) -> Result<Child> {
+    let raw_key = format!("{:0>64x}", i - 1);
+    let metrics_local_port = 6269 + i - 1;
+    let matformer_tier = client_matformer_tier(args, i.saturating_sub(2));
+
+    let logs_mode = if args.tui { "tui" } else { "console" };
+    let mut cmd = Command::new(client_bin);
+    cmd.env("METRICS_LOCAL_PORT", metrics_local_port.to_string())
+        .env("RUST_LOG", &args.log)
+        .env("RUST_BACKTRACE", "1")
+        .env("RAW_IDENTITY_SECRET_KEY", raw_key)
+        .args([
+            "train",
+            "--run-id",
+            run_id,
+            "--server-addr",
+            &format!("localhost:{}", args.server_port),
+            "--logs",
+            logs_mode,
+            "--device",
+            &args.client_device,
+            "--matformer-tier",
+            &matformer_tier.to_string(),
+            "--iroh-discovery",
+            &args.client_iroh_discovery,
+            "--iroh-relay",
+            &args.client_iroh_relay,
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if let Some(token) = &args.hf_token {
+        cmd.env("HF_TOKEN", token);
+    }
+
+    if let Some(dir) = &args.write_distro_data {
+        cmd.args(["--write-gradients-dir", dir.to_str().unwrap()]);
+    }
+
+    if let Some(repo) = &args.first_client_checkpoint {
+        if i == 2 {
+            cmd.args(["--checkpoint-dir", "./checkpoints", "--hub-repo", repo]);
+        }
+    }
+
+    if let Some(entity) = &args.wandb_entity {
+        cmd.args(["--wandb-entity", entity]);
+    }
+    if let Some(group) = &args.wandb_group {
+        cmd.args(["--wandb-group", group]);
+    }
+    if let Some(project) = &args.wandb_project {
+        cmd.args(["--wandb-project", project]);
+    }
+
+    if args.write_log {
+        let log_dir = format!(
+            "./logs/{}",
+            start_time
+                .format(format_description!(
+                    "[year]-[month]-[day]_[hour]:[minute]:[second]"
+                ))
+                .unwrap()
+        );
+        std::fs::create_dir_all(&log_dir)?;
+        cmd.args(["--write-log", &format!("{log_dir}/client-{}.txt", i - 1)]);
+    }
+
+    if let Some(s) = args.optim_stats {
+        cmd.args(["--optim-stats", &s.to_string()]);
+    }
+
+    if let Some(evals) = &args.eval_tasks {
+        cmd.args(["--eval-tasks", evals]);
+    }
+
+    println!("starting client {i}: {cmd:?}");
+    let child = cmd.spawn().with_context(|| format!("Failed to start client {i}"))?;
+    Ok(child)
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if dir.join("Cargo.lock").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            bail!("Failed to locate workspace root (Cargo.lock not found)");
+        }
+    }
+}
+
+fn ensure_port_available(port: u16) -> Result<()> {
+    let addr = format!("0.0.0.0:{port}");
+    match std::net::TcpListener::bind(&addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) => bail!("Server port {port} is not available: {err}"),
+    }
+}
+
 fn start_client(
     args: &StartArgs,
     i: usize,
@@ -393,6 +738,7 @@ fn start_client(
 ) {
     // hex 1, 2, 3, etc.
     let raw_key = format!("{:0>64x}", i - 1);
+    let matformer_tier = client_matformer_tier(args, i.saturating_sub(2));
 
     Command::new("tmux")
         .args(["select-pane", "-t", &i.to_string()])
@@ -410,7 +756,7 @@ fn start_client(
     let metrics_local_port = 6269 + i - 1;
 
     cmd.push(format!(
-        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {}",
+        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {} --device {} --matformer-tier {} --iroh-discovery {} --iroh-relay {}",
         args.log,
         raw_key,
         run_id,
@@ -419,7 +765,11 @@ fn start_client(
             "tui"
         } else {
             "console"
-        }
+        },
+        args.client_device,
+        matformer_tier,
+        args.client_iroh_discovery,
+        args.client_iroh_relay,
     ));
 
     if let Some(dir) = &args.write_distro_data {
@@ -474,4 +824,12 @@ fn start_client(
         .ok()
         .and_then(|s| s.success().then_some(()))
         .expect("Failed to send server command");
+}
+
+fn client_matformer_tier(args: &StartArgs, client_zero_based_index: usize) -> u8 {
+    match args.client_matformer_tiers.as_slice() {
+        [] => 0,
+        [tier] => *tier,
+        tiers => tiers[client_zero_based_index % tiers.len()],
+    }
 }

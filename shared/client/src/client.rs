@@ -137,6 +137,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                 let mut check_connection_interval = interval(CHECK_CONNECTION_INTERVAL);
                 let mut wait_for_checkpoint = false;
                 let mut last_gossip_connection_time = SystemTime::now();
+                let mut no_gossip_peers_since: Option<SystemTime> = None;
                 debug!("Starting client loop");
 
                 loop {
@@ -179,7 +180,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
 
                             let run_participating_endpoint_ids = participating_endpoint_ids(new_state);
                             allowlist.set(run_participating_endpoint_ids);
-                            ensure_gossip_connected(new_state, &mut p2p, &mut last_gossip_connection_time);
+                            ensure_gossip_connected(
+                                new_state,
+                                &mut p2p,
+                                &mut last_gossip_connection_time,
+                                &mut no_gossip_peers_since,
+                            );
 
                             if old_state.map(|s| s.run_state) != Some(new_state.run_state) && new_state.run_state == RunState::RoundTrain {
                                 trace!("Updating p2p");
@@ -668,7 +674,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                     .collect();
                                 metrics.update_peer_connections(&remote_infos);
                             }
-                            ensure_gossip_connected(run_state, &mut p2p, &mut last_gossip_connection_time);
+                            ensure_gossip_connected(
+                                run_state,
+                                &mut p2p,
+                                &mut last_gossip_connection_time,
+                                &mut no_gossip_peers_since,
+                            );
                         }
                         else => break
                     }
@@ -735,6 +746,7 @@ fn ensure_gossip_connected<T: NodeIdentity>(
     run_state: &Coordinator<T>,
     p2p: &mut NC,
     last_connection_attempt: &mut SystemTime,
+    no_gossip_peers_since: &mut Option<SystemTime>,
 ) {
     // don't try to connect to anyone if we're paused
     if run_state.halted() {
@@ -765,7 +777,31 @@ fn ensure_gossip_connected<T: NodeIdentity>(
     // see https://github.com/PsycheFoundation/psyche/issues/78
     let gossip_neighbors: BTreeSet<_> = p2p.neighbors().collect();
     if gossip_neighbors.is_empty() {
-        warn!("Not connected to any gossip peers! Trying to connect to some...");
+        if run_participating_endpoint_ids.len() > 1 {
+            let now = SystemTime::now();
+            match no_gossip_peers_since {
+                None => {
+                    *no_gossip_peers_since = Some(now);
+                    debug!("Not connected to any gossip peers yet; attempting to connect...");
+                }
+                Some(since) => {
+                    let elapsed = now.duration_since(*since).unwrap_or(Duration::ZERO);
+                    if elapsed >= Duration::from_secs(30) {
+                        warn!(
+                            elapsed_secs = elapsed.as_secs(),
+                            "Not connected to any gossip peers (still trying)"
+                        );
+                    } else {
+                        debug!(
+                            elapsed_secs = elapsed.as_secs(),
+                            "Not connected to any gossip peers yet; attempting to connect..."
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        *no_gossip_peers_since = None;
     }
 
     const MAX_NUM_BOOTSTRAP_PEERS: usize = 3;
