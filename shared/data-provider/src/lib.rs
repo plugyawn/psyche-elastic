@@ -18,7 +18,7 @@ pub use hub::{
     UploadModelError, download_dataset_repo_async, download_dataset_repo_sync,
     download_model_repo_async, download_model_repo_sync, upload_model_repo_async,
 };
-pub use local::LocalDataProvider;
+pub use local::{DataFormat, LocalDataProvider};
 pub use parquet::record::{ListAccessor, MapAccessor, RowAccessor};
 pub use preprocessed::PreprocessedDataProvider;
 pub use remote::{DataProviderTcpClient, DataProviderTcpServer, DataServerTui};
