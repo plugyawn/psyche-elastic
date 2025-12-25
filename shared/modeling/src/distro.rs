@@ -2,6 +2,75 @@ use crate::{CausalLM, StableVariableIterator, Variable};
 
 use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 use tch::{COptimizer, Device, Kind, Tensor};
+use tracing::warn;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrefixAlignError {
+    UnsupportedParameter(String),
+    RankMismatch { expected: usize, got: usize },
+    ShapeMismatch { full: Vec<i64>, grad: Vec<i64> },
+}
+
+fn matformer_prefix_dim(name: &str) -> Option<usize> {
+    if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") {
+        Some(0)
+    } else if name.ends_with("down_proj.weight") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn align_matformer_prefix_grad(
+    name: &str,
+    full_shape: &[i64],
+    grad: Tensor,
+) -> Result<Tensor, PrefixAlignError> {
+    let grad_shape = grad.size();
+    if grad_shape == full_shape {
+        return Ok(grad);
+    }
+
+    let Some(prefix_dim) = matformer_prefix_dim(name) else {
+        return Err(PrefixAlignError::UnsupportedParameter(name.to_string()));
+    };
+
+    if full_shape.len() != grad_shape.len() {
+        return Err(PrefixAlignError::RankMismatch {
+            expected: full_shape.len(),
+            got: grad_shape.len(),
+        });
+    }
+    if full_shape.len() != 2 {
+        return Err(PrefixAlignError::ShapeMismatch {
+            full: full_shape.to_vec(),
+            grad: grad_shape,
+        });
+    }
+
+    let other_dim = if prefix_dim == 0 { 1 } else { 0 };
+    if grad_shape[other_dim] != full_shape[other_dim] {
+        return Err(PrefixAlignError::ShapeMismatch {
+            full: full_shape.to_vec(),
+            grad: grad_shape,
+        });
+    }
+
+    let prefix_len = full_shape[prefix_dim];
+    let grad_len = grad_shape[prefix_dim];
+    if grad_len == prefix_len {
+        return Ok(grad);
+    }
+
+    if grad_len > prefix_len {
+        Ok(grad.narrow(prefix_dim as i64, 0, prefix_len))
+    } else {
+        let expanded = Tensor::zeros(full_shape, (grad.kind(), grad.device()));
+        let mut prefix_view = expanded.narrow(prefix_dim as i64, 0, grad_len);
+        prefix_view.copy_(&grad);
+        Ok(expanded)
+    }
+}
 
 pub struct TransformDCT {
     shape_dict: HashMap<i64, i64>,
@@ -283,6 +352,14 @@ impl TransformDCT {
             let n2 = x_shape[3];
             let device = x.device();
 
+            if !self.b_dict.contains_key(&n1) {
+                let i = Tensor::eye(n1, (Kind::Float, device));
+                self.b_dict.insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+            }
+            if !self.b_dict.contains_key(&n2) {
+                let i = Tensor::eye(n2, (Kind::Float, device));
+                self.b_dict.insert(n2, Self::idct(&i, true).to_kind(x.kind()));
+            }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             let n2w = self.b_dict.get(&n2).unwrap().to_device(device);
 
@@ -300,6 +377,10 @@ impl TransformDCT {
             let n1 = x_shape[1];
             let device = x.device();
 
+            if !self.b_dict.contains_key(&n1) {
+                let i = Tensor::eye(n1, (Kind::Float, device));
+                self.b_dict.insert(n1, Self::idct(&i, true).to_kind(x.kind()));
+            }
             let n1w = self.b_dict.get(&n1).unwrap().to_device(device);
             self.b_dict.insert(n1, n1w.copy());
 
@@ -627,6 +708,7 @@ impl Distro {
         for (index, var) in vars.variables().enumerate() {
             let variable = var.logical_tensor();
             let device = variable.device();
+            let full_shape = var.full_tensor_shape();
             let indicies = results
                 .iter()
                 .map(|x| x[index].sparse_idx.to_device(device))
@@ -645,18 +727,87 @@ impl Distro {
                 })
                 .collect::<Vec<_>>();
 
-            // Decode grad from all nodes
-            let decompressed = CompressDCT::batch_decompress(
-                &indicies,
-                &values,
-                &results[0][index].xshape,
-                results[0][index].totalk,
-                val_kind,
-                device,
-            );
+            let same_shape = results.iter().all(|x| {
+                x[index].xshape == results[0][index].xshape
+                    && x[index].totalk == results[0][index].totalk
+            });
 
-            // Set the gradients!!!
-            var.set_grad(self.transform.decode(&decompressed));
+            if same_shape {
+                // Decode grad from all nodes (fast path)
+                let decompressed = CompressDCT::batch_decompress(
+                    &indicies,
+                    &values,
+                    &results[0][index].xshape,
+                    results[0][index].totalk,
+                    val_kind,
+                    device,
+                );
+
+                let decoded = self.transform.decode(&decompressed);
+                let aligned = match align_matformer_prefix_grad(
+                    var.name(),
+                    &full_shape,
+                    decoded,
+                ) {
+                    Ok(tensor) => tensor,
+                    Err(err) => {
+                        warn!(
+                            parameter = var.name(),
+                            full_shape = ?full_shape,
+                            "Skipping incompatible grad shape in DisTrO apply: {err:?}"
+                        );
+                        continue;
+                    }
+                };
+
+                // Set the gradients!!!
+                var.set_grad(aligned);
+            } else {
+                // Heterogeneous shapes: decode individually, then align to local shape.
+                let mut combined: Option<Tensor> = None;
+                for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+                    let res = &peer_results[index];
+                    let sparse_idx = res.sparse_idx.to_device(device);
+                    let decompressed = CompressDCT::decompress(
+                        &sparse_idx,
+                        sparse_val,
+                        &res.xshape,
+                        res.totalk,
+                        val_kind,
+                        device,
+                    );
+                    let decoded = self.transform.decode(&decompressed);
+                    let aligned = match align_matformer_prefix_grad(
+                        var.name(),
+                        &full_shape,
+                        decoded,
+                    ) {
+                        Ok(tensor) => tensor,
+                        Err(err) => {
+                            warn!(
+                                parameter = var.name(),
+                                full_shape = ?full_shape,
+                                "Skipping incompatible grad shape in DisTrO apply: {err:?}"
+                            );
+                            continue;
+                        }
+                    };
+                    combined = Some(match combined {
+                        Some(acc) => acc + aligned,
+                        None => aligned,
+                    });
+                }
+
+                if let Some(combined) = combined {
+                    var.set_grad(combined);
+                } else {
+                    warn!(
+                        parameter = var.name(),
+                        "Skipping DisTrO apply: no compatible grads found"
+                    );
+                    continue;
+                }
+            }
 
             // Sign-SGD
             let _t = variable.grad().sign_();
@@ -1007,6 +1158,58 @@ mod tests {
         ]);
         let ret = TransformDCT::new(vars(vec![b]), 64).decode(&b_);
         assert!(truth.allclose(&ret, 1e-4, 1e-4, false));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_expand_gate() {
+        let grad = _2d_float(&[[1.0, 2.0], [3.0, 4.0]]);
+        let full_shape = vec![4i64, 2i64];
+        let aligned = align_matformer_prefix_grad(
+            "model.layers.0.mlp.gate_proj.weight",
+            &full_shape,
+            grad,
+        )
+        .unwrap();
+        assert_eq!(aligned.size(), full_shape);
+        let prefix = aligned.narrow(0, 0, 2);
+        let tail = aligned.narrow(0, 2, 2);
+        assert!(prefix.allclose(&_2d_float(&[[1.0, 2.0], [3.0, 4.0]]), 1e-6, 1e-6, false));
+        assert!(tail.allclose(&_2d_float(&[[0.0, 0.0], [0.0, 0.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_slice_down() {
+        let grad = _2d_float(&[
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+        ]);
+        let full_shape = vec![2i64, 2i64];
+        let aligned = align_matformer_prefix_grad(
+            "model.layers.0.mlp.down_proj.weight",
+            &full_shape,
+            grad,
+        )
+        .unwrap();
+        assert_eq!(aligned.size(), full_shape);
+        assert!(aligned.allclose(&_2d_float(&[[1.0, 2.0], [5.0, 6.0]]), 1e-6, 1e-6, false));
+    }
+
+    #[test]
+    fn test_align_matformer_prefix_grad_rejects_non_mlp() {
+        let grad = _2d_float(&[[1.0, 2.0]]);
+        let full_shape = vec![2i64, 2i64];
+        let err = align_matformer_prefix_grad(
+            "model.layers.0.self_attn.q_proj.weight",
+            &full_shape,
+            grad,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PrefixAlignError::UnsupportedParameter(
+                "model.layers.0.self_attn.q_proj.weight".to_string()
+            )
+        );
     }
 
     #[test]
