@@ -12,6 +12,7 @@ pub mod kernels;
 pub mod metrics;
 mod models;
 pub mod muon;
+pub mod muon_distro;
 mod optimizer;
 mod parallelism;
 #[cfg(feature = "python")]
