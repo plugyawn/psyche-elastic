@@ -1,0 +1,58 @@
+# NanoGPT 124M Training Configuration
+# Matches modded-nanogpt architecture: 768 hidden, 11 layers, 6 heads
+# Uses GPT-2 tokenized FineWeb data from kjj0/fineweb10B-gpt2
+
+run_id = "nanogpt-124m-fineweb"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 10
+cooldown_time = 10
+rounds_per_epoch = 100
+max_round_train_time = 30
+round_witness_time = 5
+epoch_time = 120
+min_clients = 1
+init_min_clients = 1
+global_batch_size_start = 64
+global_batch_size_end = 64
+global_batch_size_warmup_tokens = 0
+verification_percent = 0
+witness_nodes = 1
+total_steps = 1840  # modded-nanogpt default
+waiting_for_members_extra_time = 5
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 2048
+optimizer = "AdamW"
+cold_start_warmup_steps = 0
+
+# Local data - point to downloaded fineweb10B directory
+[model.LLM.data_location.Local]
+path = "data/fineweb10B"
+
+# Or use HTTP if hosting the data remotely:
+# [model.LLM.data_location.Http]
+# location = { SingleUrl = "https://your-server/fineweb10B/" }
+# token_size_in_bytes = "TwoBytes"
+# shuffle = { Seeded = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42] }
+
+# Model checkpoint - start from scratch (Ephemeral) or from HuggingFace
+[model.LLM.checkpoint]
+Ephemeral = true
+
+# Learning rate schedule matching modded-nanogpt
+[model.LLM.lr_schedule.Cosine]
+base_lr = 0.008
+warmup_steps = 100
+warmup_init_lr = 0.0
+total_steps = 1840
+final_lr = 0.0008
+
+# AdamW optimizer config
+[model.LLM.optimizer_config.AdamW]
+beta1 = 0.9
+beta2 = 0.95
+weight_decay = 0.1

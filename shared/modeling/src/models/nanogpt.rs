@@ -2150,4 +2150,219 @@ mod tests {
             improvement * 100.0
         );
     }
+
+    /// Test: Load real FineWeb GPT-2 tokenized data if available
+    /// This test is skipped if data/fineweb10B doesn't exist.
+    /// Run `python scripts/download_fineweb10B.py --val-only` to download test data.
+    #[test]
+    fn test_nanogpt_fineweb_data_loading() {
+        use std::path::{Path, PathBuf};
+
+        // Navigate from crate directory to workspace root
+        let workspace_root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent() // shared
+            .unwrap()
+            .parent() // workspace root
+            .unwrap()
+            .into();
+        let data_dir = workspace_root.join("data/fineweb10B");
+        if !data_dir.exists() {
+            eprintln!(
+                "Skipping fineweb test: {} not found. Run: python scripts/download_fineweb10B.py --val-only",
+                data_dir.display()
+            );
+            return;
+        }
+
+        // Check for validation file
+        let val_file = data_dir.join("fineweb_val_000000.bin");
+        if !val_file.exists() {
+            eprintln!("Skipping fineweb test: validation file not found");
+            return;
+        }
+
+        // Load raw binary data
+        let data = std::fs::read(&val_file).expect("Failed to read validation file");
+        assert!(data.len() >= 1024, "Validation file too small");
+
+        // Detect modded-nanogpt format by checking magic number
+        const MODDED_NANOGPT_MAGIC: u32 = 20240520;
+        const HEADER_SIZE: usize = 1024;
+
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let data_start = if magic == MODDED_NANOGPT_MAGIC {
+            eprintln!("Detected modded-nanogpt format, skipping {} byte header", HEADER_SIZE);
+            HEADER_SIZE
+        } else {
+            0
+        };
+
+        // Parse as uint16 tokens (skip header if present)
+        let tokens: Vec<u16> = data[data_start..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        eprintln!("Loaded {} tokens from {}", tokens.len(), val_file.display());
+
+        // Verify tokens are in valid GPT-2 range (0-50256)
+        let max_token = *tokens.iter().max().unwrap();
+        let min_token = *tokens.iter().min().unwrap();
+        eprintln!("Token range: {} - {}", min_token, max_token);
+
+        assert!(
+            max_token <= 50256,
+            "Token {} exceeds GPT-2 vocab size 50257",
+            max_token
+        );
+
+        // Create a small batch from the data
+        let seq_len = 64;
+        let batch_size = 4;
+        let required_tokens = batch_size * (seq_len + 1);
+
+        if tokens.len() < required_tokens {
+            eprintln!(
+                "Skipping forward pass: need {} tokens, have {}",
+                required_tokens,
+                tokens.len()
+            );
+            return;
+        }
+
+        // Convert to tensor
+        let device = Device::Cpu;
+        let batch_tokens: Vec<i64> = tokens[..required_tokens]
+            .iter()
+            .map(|&t| t as i64)
+            .collect();
+        let input = Tensor::from_slice(&batch_tokens)
+            .reshape([batch_size as i64, (seq_len + 1) as i64])
+            .to_device(device);
+
+        // Create 124M config matching modded-nanogpt
+        let config = NanoGPTConfig {
+            hidden_size: 768,
+            intermediate_size: 3072,
+            vocab_size: 50257,
+            num_hidden_layers: 11,
+            num_attention_heads: 6,
+            num_key_value_heads: Some(6),
+            max_position_embeddings: 2048,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            tie_word_embeddings: false,
+            // Enable core NanoGPT features
+            use_fused_qkvo: false,
+            use_relu_squared_mlp: true,
+            mlp_bias: false,
+            use_qk_norm: true,
+            use_sa_lambdas: false,
+            use_x0_residual: false,
+            use_x0_lambdas: false,
+            use_resid_lambdas: false,
+            num_value_embeddings: 0,
+            use_block_skip: false,
+            block_skip_from: None,
+            block_skip_to: None,
+            use_smear_gate: false,
+            use_logit_softcap: false,
+            softcap_scale: None,
+            use_backout: false,
+            backout_layer: None,
+            use_half_truncate_rope: false,
+            use_key_offset: false,
+            key_offset: None,
+            use_learnable_attn_scale: false,
+            use_attention_gate: false,
+        };
+
+        let vs = nn::VarStore::new(device);
+        let model = NanoGPT::new(vs.root(), &config, AttentionImplementation::Eager, None);
+
+        // Create lm_head
+        let lm_head = nn::linear(
+            vs.root() / "lm_head",
+            config.hidden_size as i64,
+            config.vocab_size as i64,
+            Default::default(),
+        );
+
+        // Forward pass with real data
+        let input_ids = input.narrow(1, 0, seq_len as i64);
+        let labels = input.narrow(1, 1, seq_len as i64);
+
+        let hidden = model.forward(&input_ids, None, None, false);
+        let logits = lm_head.forward(&hidden);
+
+        // Compute loss
+        let flat_logits = logits.reshape([batch_size as i64 * seq_len as i64, config.vocab_size as i64]);
+        let flat_labels = labels.reshape([batch_size as i64 * seq_len as i64]);
+        let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
+        let loss_val = loss.double_value(&[]);
+
+        eprintln!(
+            "NanoGPT 124M on FineWeb data: batch_size={}, seq_len={}, loss={:.4}",
+            batch_size, seq_len, loss_val
+        );
+
+        // Verify loss is reasonable (untrained model should be ~ln(vocab_size) ≈ 10.8)
+        assert!(
+            loss_val > 5.0 && loss_val < 15.0,
+            "Initial loss {} is outside expected range for untrained model",
+            loss_val
+        );
+
+        // Verify no NaN/Inf
+        assert!(!loss_val.is_nan(), "Loss is NaN");
+        assert!(!loss_val.is_infinite(), "Loss is infinite");
+
+        eprintln!("FineWeb data loading test passed!");
+    }
+
+    /// Test: Verify NanoGPT 124M config loads from JSON
+    #[test]
+    fn test_nanogpt_124m_config_from_json() {
+        use std::path::{Path, PathBuf};
+
+        // Navigate from crate directory to workspace root
+        let workspace_root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent() // shared
+            .unwrap()
+            .parent() // workspace root
+            .unwrap()
+            .into();
+        let config_path = workspace_root.join("config/nanogpt-124m/config.json");
+        if !config_path.exists() {
+            eprintln!("Skipping config test: {} not found", config_path.display());
+            return;
+        }
+
+        let config_str = std::fs::read_to_string(&config_path).expect("Failed to read config");
+        let config: NanoGPTConfig =
+            serde_json::from_str(&config_str).expect("Failed to parse config");
+
+        // Verify 124M model dimensions
+        assert_eq!(config.hidden_size, 768);
+        assert_eq!(config.intermediate_size, 3072);
+        assert_eq!(config.vocab_size, 50257);
+        assert_eq!(config.num_hidden_layers, 11);
+        assert_eq!(config.num_attention_heads, 6);
+
+        // Verify head_dim = hidden_size / num_heads = 128
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        assert_eq!(head_dim, 128);
+
+        eprintln!("NanoGPT 124M config loaded successfully:");
+        eprintln!("  hidden_size: {}", config.hidden_size);
+        eprintln!("  num_layers: {}", config.num_hidden_layers);
+        eprintln!("  num_heads: {}", config.num_attention_heads);
+        eprintln!("  head_dim: {}", head_dim);
+        eprintln!("  vocab_size: {}", config.vocab_size);
+        eprintln!("  use_relu_squared_mlp: {}", config.use_relu_squared_mlp);
+        eprintln!("  use_qk_norm: {}", config.use_qk_norm);
+    }
 }
