@@ -15,8 +15,8 @@ use psyche_metrics::ClientMetrics;
 use psyche_modeling::{
     AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM, CommunicatorId,
     DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices, DummyModel, LlamaConfig,
-    LlamaForCausalLM, LocalTrainer, ModelConfig, ModelLoadError, ParallelModels, PretrainedSource,
-    Trainer,
+    LlamaForCausalLM, NanoGPTConfig, NanoGPTForCausalLM, LocalTrainer, ModelConfig, ModelLoadError,
+    ParallelModels, PretrainedSource, Trainer,
     auto_tokenizer,
 };
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
@@ -411,6 +411,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
         {
             model::LLMArchitecture::HfLlama
             | model::LLMArchitecture::HfDeepseek
+            | model::LLMArchitecture::HfNanoGPT
             | model::LLMArchitecture::HfAuto => match &llm.checkpoint {
                 model::Checkpoint::Dummy(_) => tokio::spawn(async move {
                     let tokenizer = Arc::new(Tokenizer::new(ModelWrapper::WordLevel(
@@ -556,6 +557,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 model::LLMArchitecture::HfDeepseek => {
                                     AutoConfig::Deepseek(serde_json::from_str(&model_config)?)
                                 }
+                                model::LLMArchitecture::HfNanoGPT => {
+                                    AutoConfig::NanoGPT(serde_json::from_str(&model_config)?)
+                                }
                                 model::LLMArchitecture::HfAuto => {
                                     #[cfg(feature = "python")]
                                     {
@@ -634,6 +638,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         }
                         model::LLMArchitecture::HfDeepseek => {
                             let config: DeepseekConfig =
+                                serde_json::from_str(&serialized_config)?;
+                            config.get_parameter_names()
+                        }
+                        model::LLMArchitecture::HfNanoGPT => {
+                            let config: NanoGPTConfig =
                                 serde_json::from_str(&serialized_config)?;
                             config.get_parameter_names()
                         }
@@ -771,6 +780,17 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                             }
                                             model::LLMArchitecture::HfDeepseek => {
                                                 DeepseekForCausalLM::from_pretrained(
+                                                    &source.try_into()?,
+                                                    Some(kind),
+                                                    attn_implementation,
+                                                    Some(device),
+                                                    tensor_parallelism_world,
+                                                    Some(llm.max_seq_len as usize),
+                                                )
+                                                .map(|x| Box::new(x) as Box<dyn CausalLM>)
+                                            }
+                                            model::LLMArchitecture::HfNanoGPT => {
+                                                NanoGPTForCausalLM::from_pretrained(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,

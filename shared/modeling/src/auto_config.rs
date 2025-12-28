@@ -1,5 +1,5 @@
 use crate::{
-    DeepseekConfig, Devices, LlamaConfig, LoadSafetensorsError, parallelism::tensor_shard,
+    DeepseekConfig, Devices, LlamaConfig, NanoGPTConfig, LoadSafetensorsError, parallelism::tensor_shard,
     safetensor_utils::load_safetensors_into_variables,
 };
 use std::{
@@ -173,6 +173,7 @@ impl AttentionImplementation {
 pub enum AutoConfig {
     Llama(LlamaConfig),
     Deepseek(DeepseekConfig),
+    NanoGPT(NanoGPTConfig),
     #[cfg(feature = "python")]
     Auto(crate::PythonModelConfig),
 }
@@ -185,6 +186,7 @@ impl serde::Serialize for AutoConfig {
         match self {
             AutoConfig::Llama(config) => config.serialize(serializer),
             AutoConfig::Deepseek(config) => config.serialize(serializer),
+            AutoConfig::NanoGPT(config) => config.serialize(serializer),
             #[cfg(feature = "python")]
             AutoConfig::Auto(config) => config.serialize(serializer),
         }
@@ -196,6 +198,7 @@ impl ModelConfig for AutoConfig {
         match self {
             AutoConfig::Llama(config) => config.get_parameter_names(),
             AutoConfig::Deepseek(config) => config.get_parameter_names(),
+            AutoConfig::NanoGPT(config) => config.get_parameter_names(),
             #[cfg(feature = "python")]
             AutoConfig::Auto(config) => config.get_parameter_names(),
         }

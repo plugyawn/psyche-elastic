@@ -39,6 +39,7 @@ unsafe impl ZeroableInOption for Model {}
 pub enum LLMArchitecture {
     HfLlama,
     HfDeepseek,
+    HfNanoGPT,
     HfAuto,
 }
 

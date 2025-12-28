@@ -1,6 +1,6 @@
 use crate::{
     AttentionImplementation, CausalLM, CommunicatorId, DeepseekForCausalLM, LlamaForCausalLM,
-    ModelLoadError, PretrainedSource,
+    NanoGPTForCausalLM, ModelLoadError, PretrainedSource,
 };
 
 use std::path::PathBuf;
@@ -40,6 +40,15 @@ pub fn auto_model_for_causal_lm_from_pretrained(
         )
         .map(|x| Box::new(x) as Box<dyn CausalLM>),
         "deepseek_v2" | "deepseek_v3" => DeepseekForCausalLM::from_pretrained(
+            &PretrainedSource::RepoFiles(repo_files),
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+        )
+        .map(|x| Box::new(x) as Box<dyn CausalLM>),
+        "nanogpt" => NanoGPTForCausalLM::from_pretrained(
             &PretrainedSource::RepoFiles(repo_files),
             kind,
             attn_implementation,
