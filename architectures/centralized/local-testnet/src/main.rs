@@ -101,6 +101,20 @@ struct StartArgs {
     #[clap(long, value_delimiter = ',')]
     client_matformer_tiers: Vec<u8>,
 
+    /// MatFormer helper fraction(s) for each client (comma-separated).
+    ///
+    /// When > 0, clients will also train a random sample of suffix neurons.
+    /// Values should be in range 0.0-1.0. Assigned in cycle like tiers.
+    #[clap(long, value_delimiter = ',')]
+    client_matformer_helper_fractions: Vec<f32>,
+
+    /// MatFormer helper rotation interval(s) for each client (comma-separated).
+    ///
+    /// How many rounds to keep helper indices fixed before rotating.
+    /// Assigned in cycle like tiers.
+    #[clap(long, value_delimiter = ',')]
+    client_matformer_helper_rotation_intervals: Vec<u64>,
+
     /// What discovery mode to use for spawned clients (`local` or `n0`).
     #[clap(long, default_value = "local")]
     client_iroh_discovery: String,
@@ -628,7 +642,10 @@ fn spawn_client_headless(
 ) -> Result<Child> {
     let raw_key = format!("{:0>64x}", i - 1);
     let metrics_local_port = 6269 + i - 1;
-    let matformer_tier = client_matformer_tier(args, i.saturating_sub(2));
+    let client_idx = i.saturating_sub(2);
+    let matformer_tier = client_matformer_tier(args, client_idx);
+    let helper_fraction = client_matformer_helper_fraction(args, client_idx);
+    let rotation_interval = client_matformer_helper_rotation_interval(args, client_idx);
 
     let logs_mode = if args.tui { "tui" } else { "console" };
     let mut cmd = Command::new(client_bin);
@@ -648,6 +665,10 @@ fn spawn_client_headless(
             &args.client_device,
             "--matformer-tier",
             &matformer_tier.to_string(),
+            "--matformer-helper-fraction",
+            &helper_fraction.to_string(),
+            "--matformer-helper-rotation-interval",
+            &rotation_interval.to_string(),
             "--iroh-discovery",
             &args.client_iroh_discovery,
             "--iroh-relay",
@@ -738,7 +759,10 @@ fn start_client(
 ) {
     // hex 1, 2, 3, etc.
     let raw_key = format!("{:0>64x}", i - 1);
-    let matformer_tier = client_matformer_tier(args, i.saturating_sub(2));
+    let client_idx = i.saturating_sub(2);
+    let matformer_tier = client_matformer_tier(args, client_idx);
+    let helper_fraction = client_matformer_helper_fraction(args, client_idx);
+    let rotation_interval = client_matformer_helper_rotation_interval(args, client_idx);
 
     Command::new("tmux")
         .args(["select-pane", "-t", &i.to_string()])
@@ -756,7 +780,7 @@ fn start_client(
     let metrics_local_port = 6269 + i - 1;
 
     cmd.push(format!(
-        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {} --device {} --matformer-tier {} --iroh-discovery {} --iroh-relay {}",
+        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {} --device {} --matformer-tier {} --matformer-helper-fraction {} --matformer-helper-rotation-interval {} --iroh-discovery {} --iroh-relay {}",
         args.log,
         raw_key,
         run_id,
@@ -768,6 +792,8 @@ fn start_client(
         },
         args.client_device,
         matformer_tier,
+        helper_fraction,
+        rotation_interval,
         args.client_iroh_discovery,
         args.client_iroh_relay,
     ));
@@ -831,5 +857,24 @@ fn client_matformer_tier(args: &StartArgs, client_zero_based_index: usize) -> u8
         [] => 0,
         [tier] => *tier,
         tiers => tiers[client_zero_based_index % tiers.len()],
+    }
+}
+
+fn client_matformer_helper_fraction(args: &StartArgs, client_zero_based_index: usize) -> f32 {
+    match args.client_matformer_helper_fractions.as_slice() {
+        [] => 0.0,
+        [fraction] => *fraction,
+        fractions => fractions[client_zero_based_index % fractions.len()],
+    }
+}
+
+fn client_matformer_helper_rotation_interval(
+    args: &StartArgs,
+    client_zero_based_index: usize,
+) -> u64 {
+    match args.client_matformer_helper_rotation_intervals.as_slice() {
+        [] => 16,
+        [interval] => *interval,
+        intervals => intervals[client_zero_based_index % intervals.len()],
     }
 }
