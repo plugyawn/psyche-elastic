@@ -91,7 +91,35 @@ impl RoPECache {
         rope_theta: f32,
         device: &Device,
     ) -> Self {
-        let inv_freq = calculate_default_inv_freq(head_dim, rope_theta);
+        Self::new_with_options(rope_config, head_dim, rope_theta, device, false)
+    }
+
+    /// Create RoPE cache with optional half-truncate mode.
+    /// Half-truncate: first quarter of dimensions use varying frequencies, second quarter gets zeros.
+    pub fn new_with_options(
+        rope_config: &Option<RoPEConfig>,
+        head_dim: usize,
+        rope_theta: f32,
+        device: &Device,
+        half_truncate: bool,
+    ) -> Self {
+        let inv_freq = if half_truncate {
+            // Half-truncate: only first quarter varies, second quarter is zeros
+            // Normal RoPE has head_dim/2 frequency pairs
+            // Half-truncate uses head_dim/4 frequencies + head_dim/4 zeros
+            let quarter_dim = head_dim / 4;
+            let mut freq = Vec::with_capacity(head_dim / 2);
+            for i in 0..quarter_dim {
+                freq.push(1f32 / rope_theta.powf(2.0 * i as f32 / head_dim as f32));
+            }
+            // Add zeros for the second quarter
+            for _ in 0..quarter_dim {
+                freq.push(0.0);
+            }
+            freq
+        } else {
+            calculate_default_inv_freq(head_dim, rope_theta)
+        };
 
         let (inv_freq, mscale) = match rope_config {
             None
