@@ -390,6 +390,16 @@ impl NanoGPTMlp {
             );
         }
 
+        // Log helper mode configuration
+        if let Some(ref config) = helper_config {
+            if config.helper_fraction > 0.0 {
+                eprintln!(
+                    "[NanoGPT MLP layer {}] Helper mode enabled: fraction={}, rotation_interval={}, matformer_hidden={}",
+                    layer_idx, config.helper_fraction, config.rotation_interval, matformer_hidden_size.unwrap_or(intermediate_size)
+                );
+            }
+        }
+
         Self {
             gate_proj: ColumnParallelLinear::new(
                 &vs / "gate_proj",
