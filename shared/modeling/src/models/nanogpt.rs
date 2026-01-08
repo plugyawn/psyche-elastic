@@ -19,11 +19,15 @@ use crate::{
     causal_language_model::{
         CausalLanguageModel, EosToks, LanguageModelConfig, LanguageModelForward,
     },
+    matformer_helper::HelperConfig,
     parallelism::{ColumnParallelLinear, Communicator, CommunicatorId, RowParallelLinear},
     rms_norm::RMSNorm,
     rope::{RoPECache, RoPEConfig},
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tch::{
     nn::{self, Module},
     Device, Kind, Tensor,
@@ -127,6 +131,16 @@ pub struct NanoGPTConfig {
     // tier 0 = full width, tier N = width / 2^N
     #[serde(default)]
     pub matformer_tier: u8,
+    /// Fraction of suffix neurons to help train (0.0-1.0) for stochastic suffix sampling.
+    #[serde(default)]
+    pub matformer_helper_fraction: f32,
+    /// Rounds to keep helper indices fixed before rotating.
+    #[serde(default = "default_helper_rotation_interval")]
+    pub matformer_helper_rotation_interval: u64,
+}
+
+fn default_helper_rotation_interval() -> u64 {
+    16
 }
 
 impl NanoGPTConfig {
@@ -177,6 +191,20 @@ impl NanoGPTConfig {
             use_learnable_attn_scale: false,
             use_attention_gate: false,
             matformer_tier: 0,
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
+        }
+    }
+
+    /// Get helper config if helper mode is enabled.
+    pub fn helper_config(&self) -> Option<crate::matformer_helper::HelperConfig> {
+        if self.matformer_helper_fraction > 0.0 && self.matformer_tier > 0 {
+            Some(crate::matformer_helper::HelperConfig::new(
+                self.matformer_helper_fraction,
+                self.matformer_helper_rotation_interval,
+            ))
+        } else {
+            None
         }
     }
 }
@@ -319,7 +347,16 @@ struct NanoGPTMlp {
     up_proj: ColumnParallelLinear,
     down_proj: RowParallelLinear,
     use_relu_squared: bool,
+    /// Prefix size for this tier (None = tier 0, full width)
     matformer_hidden_size: Option<i64>,
+    /// Full intermediate size for helper index generation
+    full_intermediate_size: i64,
+    /// Layer index for deterministic helper sampling
+    layer_idx: usize,
+    /// Helper config (None = no helper mode)
+    helper_config: Option<HelperConfig>,
+    /// Shared reference to current round number
+    current_round: Arc<AtomicU64>,
     is_tensor_parallel: bool,
 }
 
@@ -332,6 +369,9 @@ impl NanoGPTMlp {
         comm: Option<Arc<Communicator>>,
         use_relu_squared: bool,
         matformer_hidden_size: Option<i64>,
+        layer_idx: usize,
+        helper_config: Option<HelperConfig>,
+        current_round: Arc<AtomicU64>,
     ) -> Self {
         let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
         let tp_size = comm.as_ref().map(|x| x.size()).unwrap_or(1);
@@ -377,6 +417,10 @@ impl NanoGPTMlp {
             ),
             use_relu_squared,
             matformer_hidden_size,
+            full_intermediate_size: intermediate_size,
+            layer_idx,
+            helper_config,
+            current_round,
             is_tensor_parallel,
         }
     }
@@ -384,7 +428,7 @@ impl NanoGPTMlp {
 
 impl Module for NanoGPTMlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
-        // Check if MatFormer slicing is enabled
+        // Tier 0 (full width): use standard forward
         let Some(matformer_hidden_size) = self.matformer_hidden_size else {
             // No MatFormer: use standard forward
             return if self.use_relu_squared {
@@ -405,39 +449,67 @@ impl Module for NanoGPTMlp {
             "matformer_tier is not yet supported with tensor parallelism"
         );
 
-        // Weight shapes:
-        // - gate_proj/up_proj: [intermediate_size, hidden_size]
-        // - down_proj: [hidden_size, intermediate_size]
-        // We narrow along the intermediate dimension:
-        // - gate/up: narrow rows (dim 0) to get [matformer_hidden_size, hidden_size]
-        // - down: narrow cols (dim 1) to get [hidden_size, matformer_hidden_size]
-        let gate_w = self
-            .gate_proj
-            .linear
-            .ws
-            .narrow(0, 0, matformer_hidden_size);
-        let up_w = self
-            .up_proj
-            .linear
-            .ws
-            .narrow(0, 0, matformer_hidden_size);
-        let down_w = self
-            .down_proj
-            .linear
-            .ws
-            .narrow(1, 0, matformer_hidden_size);
+        // Check if we have helper mode enabled
+        let use_helper =
+            self.helper_config.is_some() && matformer_hidden_size < self.full_intermediate_size;
 
-        // Manual matmul with narrowed weights
-        let gate = xs.matmul(&gate_w.transpose(0, 1));
-        let up = xs.matmul(&up_w.transpose(0, 1));
+        if use_helper {
+            // Helper mode: use index_select with prefix + stochastic suffix indices
+            let helper_config = self.helper_config.as_ref().unwrap();
+            let round = self.current_round.load(Ordering::Relaxed);
 
-        let hidden = if self.use_relu_squared {
-            gate.relu().square() * up
+            let indices = crate::matformer_helper::get_matformer_indices(
+                matformer_hidden_size as usize,
+                self.full_intermediate_size as usize,
+                helper_config,
+                round,
+                self.layer_idx,
+            );
+
+            let indices_tensor = Tensor::from_slice(&indices).to_device(xs.device());
+
+            // Weight shapes:
+            // - gate_proj/up_proj: [intermediate_size, hidden_size] - select rows
+            // - down_proj: [hidden_size, intermediate_size] - select columns
+            let gate_w = self.gate_proj.linear.ws.index_select(0, &indices_tensor);
+            let up_w = self.up_proj.linear.ws.index_select(0, &indices_tensor);
+            let down_w = self.down_proj.linear.ws.index_select(1, &indices_tensor);
+
+            // Manual matmul with indexed weights
+            let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let up = xs.matmul(&up_w.transpose(0, 1));
+
+            let hidden = if self.use_relu_squared {
+                gate.relu().square() * up
+            } else {
+                gate.silu() * up
+            };
+
+            hidden.matmul(&down_w.transpose(0, 1))
         } else {
-            gate.silu() * up
-        };
+            // Standard MatFormer: use narrow for contiguous prefix (more efficient)
+            // Weight shapes:
+            // - gate_proj/up_proj: [intermediate_size, hidden_size]
+            // - down_proj: [hidden_size, intermediate_size]
+            // We narrow along the intermediate dimension:
+            // - gate/up: narrow rows (dim 0) to get [matformer_hidden_size, hidden_size]
+            // - down: narrow cols (dim 1) to get [hidden_size, matformer_hidden_size]
+            let gate_w = self.gate_proj.linear.ws.narrow(0, 0, matformer_hidden_size);
+            let up_w = self.up_proj.linear.ws.narrow(0, 0, matformer_hidden_size);
+            let down_w = self.down_proj.linear.ws.narrow(1, 0, matformer_hidden_size);
 
-        hidden.matmul(&down_w.transpose(0, 1))
+            // Manual matmul with narrowed weights
+            let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let up = xs.matmul(&up_w.transpose(0, 1));
+
+            let hidden = if self.use_relu_squared {
+                gate.relu().square() * up
+            } else {
+                gate.silu() * up
+            };
+
+            hidden.matmul(&down_w.transpose(0, 1))
+        }
     }
 }
 
@@ -835,6 +907,7 @@ impl NanoGPTBlock {
         vs: nn::Path,
         config: &NanoGPTConfig,
         layer_idx: usize,
+        current_round: Arc<AtomicU64>,
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
         matformer_hidden_size: Option<i64>,
@@ -884,6 +957,9 @@ impl NanoGPTBlock {
                 comm,
                 config.use_relu_squared_mlp,
                 matformer_hidden_size,
+                layer_idx,
+                config.helper_config(),
+                current_round,
             ),
             x0_lambda,
             resid_lambda,
@@ -952,6 +1028,8 @@ pub struct NanoGPT {
     // Value embeddings - extra embedding tables mixed into V
     value_embeddings: Option<Vec<nn::Embedding>>,
     config: NanoGPTConfig,
+    /// Shared round counter for helper index generation
+    current_round: Arc<AtomicU64>,
 }
 
 impl NanoGPT {
@@ -962,6 +1040,7 @@ impl NanoGPT {
         comm: Option<Arc<Communicator>>,
     ) -> Self {
         let model_vs = &vs / "model";
+        let current_round = Arc::new(AtomicU64::new(0));
 
         // Compute MatFormer hidden size from tier
         // tier 0 = full width (None), tier N = width / 2^N
@@ -990,6 +1069,7 @@ impl NanoGPT {
                     &model_vs / "layers" / i,
                     config,
                     i,
+                    current_round.clone(),
                     attn_implementation,
                     comm.clone(),
                     matformer_hidden_size,
@@ -1037,7 +1117,19 @@ impl NanoGPT {
             rope_cache,
             value_embeddings,
             config: config.clone(),
+            current_round,
         }
+    }
+
+    /// Set the current round number for helper index generation.
+    /// This should be called before each forward pass during training.
+    pub fn set_round(&self, round: u64) {
+        self.current_round.store(round, Ordering::Relaxed);
+    }
+
+    /// Get the current round number.
+    pub fn get_round(&self) -> u64 {
+        self.current_round.load(Ordering::Relaxed)
     }
 }
 
@@ -1270,13 +1362,37 @@ mod tests {
 
     #[test]
     fn test_nanogpt_mlp_relu_squared() {
+        use std::sync::{atomic::AtomicU64, Arc};
         let vs = nn::VarStore::new(Device::Cpu);
+        let current_round = Arc::new(AtomicU64::new(0));
 
         // Standard SiLU MLP
-        let mlp_silu = NanoGPTMlp::new(vs.root() / "silu", 64, 128, false, None, false, None);
+        let mlp_silu = NanoGPTMlp::new(
+            vs.root() / "silu",
+            64,
+            128,
+            false,
+            None,
+            false,
+            None,
+            0,
+            None,
+            current_round.clone(),
+        );
 
         // ReLU² MLP
-        let mlp_relu = NanoGPTMlp::new(vs.root() / "relu", 64, 128, false, None, true, None);
+        let mlp_relu = NanoGPTMlp::new(
+            vs.root() / "relu",
+            64,
+            128,
+            false,
+            None,
+            true,
+            None,
+            0,
+            None,
+            current_round,
+        );
 
         let input = Tensor::randn([2, 16, 64], (Kind::Float, Device::Cpu));
 
@@ -2299,7 +2415,10 @@ mod tests {
 
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let data_start = if magic == MODDED_NANOGPT_MAGIC {
-            eprintln!("Detected modded-nanogpt format, skipping {} byte header", HEADER_SIZE);
+            eprintln!(
+                "Detected modded-nanogpt format, skipping {} byte header",
+                HEADER_SIZE
+            );
             HEADER_SIZE
         } else {
             0
@@ -2408,7 +2527,8 @@ mod tests {
         let logits = lm_head.forward(&hidden);
 
         // Compute loss
-        let flat_logits = logits.reshape([batch_size as i64 * seq_len as i64, config.vocab_size as i64]);
+        let flat_logits =
+            logits.reshape([batch_size as i64 * seq_len as i64, config.vocab_size as i64]);
         let flat_labels = labels.reshape([batch_size as i64 * seq_len as i64]);
         let loss = flat_logits.cross_entropy_for_logits(&flat_labels);
         let loss_val = loss.double_value(&[]);
@@ -2483,10 +2603,12 @@ mod tests {
     /// This is the key property of MatFormer - unused neurons don't get gradients
     #[test]
     fn test_nanogpt_matformer_mlp_has_zero_tail_grads() {
+        use std::sync::{atomic::AtomicU64, Arc};
         let vs = nn::VarStore::new(Device::Cpu);
         let hidden_size = 4;
         let intermediate_size = 8;
         let matformer_hidden = 4; // Use half the FFN width
+        let current_round = Arc::new(AtomicU64::new(0));
 
         let mlp = NanoGPTMlp::new(
             vs.root(),
@@ -2496,10 +2618,14 @@ mod tests {
             None,  // no comm
             false, // SiLU, not ReLU²
             Some(matformer_hidden),
+            0,    // layer_idx
+            None, // no helper mode
+            current_round,
         );
 
         // Forward + backward
-        let x = Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let x =
+            Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
         let y = mlp.forward(&x);
         let loss = y.sum(Kind::Float);
         loss.backward();
@@ -2547,10 +2673,12 @@ mod tests {
     /// Test: MatFormer MLP with ReLU² also has zero tail gradients
     #[test]
     fn test_nanogpt_matformer_mlp_relu_squared_zero_tail_grads() {
+        use std::sync::{atomic::AtomicU64, Arc};
         let vs = nn::VarStore::new(Device::Cpu);
         let hidden_size = 4;
         let intermediate_size = 8;
         let matformer_hidden = 4;
+        let current_round = Arc::new(AtomicU64::new(0));
 
         let mlp = NanoGPTMlp::new(
             vs.root(),
@@ -2560,9 +2688,13 @@ mod tests {
             None,
             true, // ReLU²
             Some(matformer_hidden),
+            0,    // layer_idx
+            None, // no helper mode
+            current_round,
         );
 
-        let x = Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let x =
+            Tensor::randn([2, 3, hidden_size], (Kind::Float, Device::Cpu)).set_requires_grad(true);
         let y = mlp.forward(&x);
         let loss = y.sum(Kind::Float);
         loss.backward();
@@ -2621,6 +2753,8 @@ mod tests {
             use_learnable_attn_scale: false,
             use_attention_gate: false,
             matformer_tier: 1, // Half FFN width (128 -> 64)
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
         };
 
         let vs = nn::VarStore::new(device);
@@ -2651,7 +2785,9 @@ mod tests {
             let logits = lm_head.forward(&hidden);
             let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
             let flat_labels = labels.reshape([batch_size * seq_len]);
-            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+            flat_logits
+                .cross_entropy_for_logits(&flat_labels)
+                .double_value(&[])
         };
 
         // Train for 100 steps
@@ -2669,7 +2805,9 @@ mod tests {
             let logits = lm_head.forward(&hidden);
             let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
             let flat_labels = labels.reshape([batch_size * seq_len]);
-            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+            flat_logits
+                .cross_entropy_for_logits(&flat_labels)
+                .double_value(&[])
         };
 
         let improvement = (initial_loss - final_loss) / initial_loss;
@@ -2761,7 +2899,9 @@ mod tests {
             let logits = lm_head.forward(&hidden);
             let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
             let flat_labels = labels.reshape([batch_size * seq_len]);
-            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+            flat_logits
+                .cross_entropy_for_logits(&flat_labels)
+                .double_value(&[])
         };
 
         for _ in 0..100 {
@@ -2778,7 +2918,9 @@ mod tests {
             let logits = lm_head.forward(&hidden);
             let flat_logits = logits.reshape([batch_size * seq_len, config.vocab_size as i64]);
             let flat_labels = labels.reshape([batch_size * seq_len]);
-            flat_logits.cross_entropy_for_logits(&flat_labels).double_value(&[])
+            flat_logits
+                .cross_entropy_for_logits(&flat_labels)
+                .double_value(&[])
         };
 
         let improvement = (initial_loss - final_loss) / initial_loss;
