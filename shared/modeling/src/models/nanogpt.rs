@@ -2506,6 +2506,8 @@ mod tests {
             use_learnable_attn_scale: false,
             use_attention_gate: false,
             matformer_tier: 0,
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
         };
 
         let vs = nn::VarStore::new(device);
@@ -2870,6 +2872,8 @@ mod tests {
             use_learnable_attn_scale: false,
             use_attention_gate: false,
             matformer_tier: 2, // Quarter FFN width (128 -> 32)
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
         };
 
         let vs = nn::VarStore::new(device);
@@ -2985,6 +2989,8 @@ mod tests {
             use_learnable_attn_scale: false,
             use_attention_gate: false,
             matformer_tier: 0, // Full width
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
         };
 
         let vs = nn::VarStore::new(device);

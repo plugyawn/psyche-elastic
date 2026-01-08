@@ -88,7 +88,7 @@ pub fn align_matformer_sparse_grad(
     }
 
     // Create full-size zero tensor
-    let full_grad = Tensor::zeros(full_shape, (grad.kind(), grad.device()));
+    let mut full_grad = Tensor::zeros(full_shape, (grad.kind(), grad.device()));
 
     // Create index tensor
     let indices_tensor = Tensor::from_slice(indices).to_device(grad.device());
