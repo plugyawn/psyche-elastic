@@ -1,13 +1,17 @@
 use crate::{
+    default_rope, matformer_helper::HelperConfig, parallelism::Communicator,
     AttentionImplementation, AutoConfig, CausalLanguageModel, CausalSelfAttention,
     ColumnParallelLinear, CommunicatorId, EosToks, LanguageModelConfig, LanguageModelForward,
     ModelConfig, ModelLoadError, PretrainedSource, RMSNorm, RoPECache, RoPEConfig,
-    RowParallelLinear, default_rope, parallelism::Communicator,
+    RowParallelLinear,
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tch::{
-    Device, Kind, Tensor,
     nn::{self, Module},
+    Device, Kind, Tensor,
 };
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -16,6 +20,12 @@ pub struct LlamaConfig {
     pub intermediate_size: usize,
     #[serde(default)]
     pub matformer_tier: u8,
+    /// Fraction of suffix neurons to help train (0.0-1.0) for stochastic suffix sampling.
+    #[serde(default)]
+    pub matformer_helper_fraction: f32,
+    /// Rounds to keep helper indices fixed before rotating.
+    #[serde(default = "default_helper_rotation_interval")]
+    pub matformer_helper_rotation_interval: u64,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -36,6 +46,10 @@ pub struct LlamaConfig {
     pub sliding_window: Option<i64>,
 }
 
+fn default_helper_rotation_interval() -> u64 {
+    16
+}
+
 impl LlamaConfig {
     pub fn num_key_value_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
@@ -46,6 +60,8 @@ impl LlamaConfig {
             hidden_size: 1,
             intermediate_size: 1,
             matformer_tier: 0,
+            matformer_helper_fraction: 0.0,
+            matformer_helper_rotation_interval: 16,
             vocab_size: 1,
             num_hidden_layers: 1,
             num_attention_heads: 1,
@@ -61,6 +77,18 @@ impl LlamaConfig {
             sliding_window: None,
         }
     }
+
+    /// Get helper config if helper mode is enabled.
+    pub fn helper_config(&self) -> Option<HelperConfig> {
+        if self.matformer_helper_fraction > 0.0 && self.matformer_tier > 0 {
+            Some(HelperConfig::new(
+                self.matformer_helper_fraction,
+                self.matformer_helper_rotation_interval,
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -68,7 +96,16 @@ struct Mlp {
     gate_proj: ColumnParallelLinear,
     up_proj: ColumnParallelLinear,
     down_proj: RowParallelLinear,
+    /// Prefix size for this tier (None = tier 0, full width)
     matformer_hidden_size: Option<i64>,
+    /// Full intermediate size for helper index generation
+    full_intermediate_size: i64,
+    /// Layer index for deterministic helper sampling
+    layer_idx: usize,
+    /// Helper config (None = no helper mode)
+    helper_config: Option<HelperConfig>,
+    /// Shared reference to current round number
+    current_round: Arc<AtomicU64>,
     is_tensor_parallel: bool,
 }
 
@@ -78,6 +115,9 @@ impl Mlp {
         n_embd: i64,
         n_hidden: i64,
         matformer_hidden_size: Option<i64>,
+        layer_idx: usize,
+        helper_config: Option<HelperConfig>,
+        current_round: Arc<AtomicU64>,
         comm: Option<Arc<Communicator>>,
     ) -> Self {
         let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
@@ -126,6 +166,10 @@ impl Mlp {
             up_proj,
             down_proj,
             matformer_hidden_size,
+            full_intermediate_size: n_hidden,
+            layer_idx,
+            helper_config,
+            current_round,
             is_tensor_parallel,
         }
     }
@@ -133,39 +177,61 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
+        // Tier 0 (full width): use standard forward
         let Some(matformer_hidden_size) = self.matformer_hidden_size else {
-            return self.down_proj.forward(
-                &(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)),
-            );
+            return self
+                .down_proj
+                .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)));
         };
         assert!(
             !self.is_tensor_parallel,
             "matformer_tier is not yet supported with tensor parallelism"
         );
 
-        // Weight shapes:
-        // - gate_proj/up_proj: [n_hidden, n_embd]
-        // - down_proj: [n_embd, n_hidden]
-        let gate_w = self
-            .gate_proj
-            .linear
-            .ws
-            .narrow(0, 0, matformer_hidden_size);
-        let up_w = self
-            .up_proj
-            .linear
-            .ws
-            .narrow(0, 0, matformer_hidden_size);
-        let down_w = self
-            .down_proj
-            .linear
-            .ws
-            .narrow(1, 0, matformer_hidden_size);
+        // Check if we have helper mode enabled
+        let use_helper =
+            self.helper_config.is_some() && matformer_hidden_size < self.full_intermediate_size;
 
-        let gate = xs.matmul(&gate_w.transpose(0, 1));
-        let up = xs.matmul(&up_w.transpose(0, 1));
-        let hidden = gate.silu() * up;
-        hidden.matmul(&down_w.transpose(0, 1))
+        if use_helper {
+            // Helper mode: use index_select with prefix + stochastic suffix indices
+            let helper_config = self.helper_config.as_ref().unwrap();
+            let round = self.current_round.load(Ordering::Relaxed);
+
+            let indices = crate::matformer_helper::get_matformer_indices(
+                matformer_hidden_size as usize,
+                self.full_intermediate_size as usize,
+                helper_config,
+                round,
+                self.layer_idx,
+            );
+
+            let indices_tensor = Tensor::from_slice(&indices).to_device(xs.device());
+
+            // Weight shapes:
+            // - gate_proj/up_proj: [n_hidden, n_embd] - select rows
+            // - down_proj: [n_embd, n_hidden] - select columns
+            let gate_w = self.gate_proj.linear.ws.index_select(0, &indices_tensor);
+            let up_w = self.up_proj.linear.ws.index_select(0, &indices_tensor);
+            let down_w = self.down_proj.linear.ws.index_select(1, &indices_tensor);
+
+            let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let up = xs.matmul(&up_w.transpose(0, 1));
+            let hidden = gate.silu() * up;
+            hidden.matmul(&down_w.transpose(0, 1))
+        } else {
+            // Standard MatFormer: use narrow for contiguous prefix (more efficient)
+            // Weight shapes:
+            // - gate_proj/up_proj: [n_hidden, n_embd]
+            // - down_proj: [n_embd, n_hidden]
+            let gate_w = self.gate_proj.linear.ws.narrow(0, 0, matformer_hidden_size);
+            let up_w = self.up_proj.linear.ws.narrow(0, 0, matformer_hidden_size);
+            let down_w = self.down_proj.linear.ws.narrow(1, 0, matformer_hidden_size);
+
+            let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let up = xs.matmul(&up_w.transpose(0, 1));
+            let hidden = gate.silu() * up;
+            hidden.matmul(&down_w.transpose(0, 1))
+        }
     }
 }
 
@@ -181,6 +247,8 @@ impl Block {
     fn new(
         vs: nn::Path,
         config: &LlamaConfig,
+        layer_idx: usize,
+        current_round: Arc<AtomicU64>,
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
     ) -> Self {
@@ -219,6 +287,9 @@ impl Block {
                     Some((config.intermediate_size as i64) / divisor)
                 }
             },
+            layer_idx,
+            config.helper_config(),
+            current_round,
             comm,
         );
         Self {
@@ -254,6 +325,8 @@ pub struct Llama {
     ln_f: RMSNorm,
     attn_implementation: AttentionImplementation,
     rope_cache: RoPECache,
+    /// Shared round counter for helper index generation
+    current_round: Arc<AtomicU64>,
 }
 
 impl Llama {
@@ -263,6 +336,7 @@ impl Llama {
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
     ) -> Self {
+        let current_round = Arc::new(AtomicU64::new(0));
         let wte = nn::embedding(
             &vs / "model" / "embed_tokens",
             config.vocab_size as i64,
@@ -279,6 +353,8 @@ impl Llama {
                 Block::new(
                     &vs / "model" / "layers" / i,
                     config,
+                    i,
+                    current_round.clone(),
                     attn_implementation,
                     comm.clone(),
                 )
@@ -296,7 +372,19 @@ impl Llama {
             ln_f,
             attn_implementation,
             rope_cache,
+            current_round,
         }
+    }
+
+    /// Set the current round number for helper index generation.
+    /// This should be called before each forward pass during training.
+    pub fn set_round(&self, round: u64) {
+        self.current_round.store(round, Ordering::Relaxed);
+    }
+
+    /// Get the current round number.
+    pub fn get_round(&self) -> u64 {
+        self.current_round.load(Ordering::Relaxed)
     }
 }
 
@@ -499,8 +587,9 @@ impl LanguageModelConfig for LlamaConfig {
 #[cfg(test)]
 mod tests {
     use super::Mlp;
-    use tch::{Device, Kind, Tensor, nn};
+    use std::sync::{atomic::AtomicU64, Arc};
     use tch::nn::Module;
+    use tch::{nn, Device, Kind, Tensor};
 
     #[test]
     fn matformer_mlp_has_zero_tail_grads() {
@@ -508,12 +597,16 @@ mod tests {
         let n_embd = 4;
         let n_hidden = 8;
         let matformer_hidden = 4;
+        let current_round = Arc::new(AtomicU64::new(0));
 
         let mlp = Mlp::new(
             vs.root(),
             n_embd,
             n_hidden,
             Some(matformer_hidden),
+            0,    // layer_idx
+            None, // helper_config (no helper mode for this test)
+            current_round,
             None,
         );
 
@@ -540,5 +633,45 @@ mod tests {
         assert_eq!(gate_tail_max, 0.0);
         assert_eq!(up_tail_max, 0.0);
         assert_eq!(down_tail_max, 0.0);
+    }
+
+    #[test]
+    fn matformer_mlp_helper_mode_has_helper_grads() {
+        use crate::matformer_helper::HelperConfig;
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let n_embd = 4;
+        let n_hidden = 16;
+        let matformer_hidden = 4;
+        let current_round = Arc::new(AtomicU64::new(0));
+        let helper_config = HelperConfig::new(0.5, 16); // 50% helper
+
+        let mlp = Mlp::new(
+            vs.root(),
+            n_embd,
+            n_hidden,
+            Some(matformer_hidden),
+            0,
+            Some(helper_config),
+            current_round,
+            None,
+        );
+
+        let xs = Tensor::randn([2, 3, n_embd], (Kind::Float, Device::Cpu));
+        let out = mlp.forward(&xs);
+        let loss = out.sum(Kind::Float);
+        loss.backward();
+
+        let gate_grad = mlp.gate_proj.linear.ws.grad();
+
+        // With helper mode, some suffix neurons should have non-zero grads
+        // (prefix = 4, helper = 4*0.5 = 2, so 6 total neurons trained)
+        let prefix_grad = gate_grad.narrow(0, 0, matformer_hidden);
+        let prefix_max = prefix_grad.abs().max().double_value(&[]);
+        assert!(prefix_max > 0.0, "prefix should have gradients");
+
+        // Overall gradient should have some non-zero values beyond prefix
+        let total_nonzero = gate_grad.abs().sum(Kind::Float).double_value(&[]);
+        assert!(total_nonzero > 0.0);
     }
 }
