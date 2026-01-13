@@ -1142,13 +1142,30 @@ impl NanoGPT {
             config.rms_norm_eps,
         );
 
-        // RoPE cache (with optional half-truncate mode)
-        let rope_cache = RoPECache::new_with_options(
-            &config.rope_scaling,
+        // RoPE cache - combine rope_scaling with half_truncate setting
+        let rope_config = config
+            .rope_scaling
+            .clone()
+            .map(|mut rc| {
+                rc.half_truncate = config.use_half_truncate_rope;
+                rc
+            })
+            .or_else(|| {
+                // If no rope_scaling but half_truncate is enabled, create minimal config
+                if config.use_half_truncate_rope {
+                    Some(RoPEConfig {
+                        half_truncate: true,
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                }
+            });
+        let rope_cache = RoPECache::new(
+            &rope_config,
             config.head_dim(),
             config.rope_theta,
             &vs.device(),
-            config.use_half_truncate_rope,
         );
 
         // Value embeddings - extra embedding tables mixed into V
