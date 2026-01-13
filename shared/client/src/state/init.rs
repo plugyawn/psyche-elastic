@@ -37,9 +37,11 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::{
-    CheckpointConfig, FinishedBroadcast, cooldown::CooldownStepMetadata, evals::ModelTaskRunner,
-    stats::StatsLogger, steps::StepStateMachine, train::TrainingStepMetadata,
-    types::DistroBroadcastAndPayload, warmup::WarmupStepMetadata, witness::WitnessStepMetadata,
+    CheckpointConfig, FinishedBroadcast,
+    cooldown::{CooldownStepMetadata, MatformerCheckpointInfo},
+    evals::ModelTaskRunner, stats::StatsLogger, steps::StepStateMachine,
+    train::TrainingStepMetadata, types::DistroBroadcastAndPayload,
+    warmup::WarmupStepMetadata, witness::WitnessStepMetadata,
 };
 use iroh_blobs::api::Tag;
 
@@ -206,6 +208,73 @@ async fn resolve_matformer_local_repo_path(
     }
 }
 
+/// Infer matformer tier from checkpoint config.json.
+/// Returns (inferred_tier, base_intermediate_size) if determinable.
+fn infer_tier_from_checkpoint_config(config: &serde_json::Value) -> (Option<u8>, Option<u64>) {
+    let intermediate_size = config.get("intermediate_size").and_then(|v| v.as_u64());
+
+    // Check for explicit tier stored in checkpoint
+    if let Some(tier) = config.get("matformer_tier").and_then(|v| v.as_u64()) {
+        let base_size = config
+            .get("matformer_base_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                // Infer base size from tier if not explicitly stored
+                intermediate_size.and_then(|size| size.checked_shl(tier as u32))
+            });
+        return (Some(tier as u8), base_size);
+    }
+
+    // No explicit tier - check if base size stored (can infer tier)
+    if let (Some(base), Some(current)) = (
+        config.get("matformer_base_intermediate_size").and_then(|v| v.as_u64()),
+        intermediate_size,
+    ) {
+        if base > 0 && current > 0 && base >= current {
+            let ratio = base / current;
+            if ratio.is_power_of_two() {
+                return (Some(ratio.trailing_zeros() as u8), Some(base));
+            }
+        }
+    }
+
+    (None, intermediate_size)
+}
+
+/// Validate that the requested tier configuration won't cause double-slicing.
+/// Returns an error if a sliced checkpoint would be further sliced.
+fn validate_no_double_slicing(
+    checkpoint_config: &serde_json::Value,
+    cli_tier: u8,
+    load_strategy: &MatformerLoadStrategy,
+    uses_sliced_checkpoint: bool,
+) -> Result<(), InitRunError> {
+    let (checkpoint_tier, _) = infer_tier_from_checkpoint_config(checkpoint_config);
+
+    // If we detected this is a sliced checkpoint (via naming or explicit tier)
+    let is_sliced = uses_sliced_checkpoint || checkpoint_tier.map(|t| t > 0).unwrap_or(false);
+
+    if is_sliced && cli_tier > 0 {
+        // Check if user is trying to further slice an already-sliced checkpoint
+        match load_strategy {
+            MatformerLoadStrategy::Universal => {
+                // Universal mode bypasses sliced detection - this is dangerous
+                return Err(InitRunError::DoubleSlicingDetected {
+                    checkpoint_tier: checkpoint_tier.unwrap_or(0),
+                    cli_tier,
+                    hint: "Use --matformer-load-strategy auto or specify --matformer-tier 0".to_string(),
+                });
+            }
+            MatformerLoadStrategy::Auto | MatformerLoadStrategy::Sliced => {
+                // These modes correctly set effective_tier=0 for sliced checkpoints
+                // Double-slicing is prevented by the effective_tier logic
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn schema_hash_for_config(
     architecture: model::LLMArchitecture,
     config: &serde_json::Value,
@@ -304,6 +373,13 @@ pub enum InitRunError {
 
     #[error("Required MatFormer tier checkpoint for tier {tier} not found at {path}")]
     MissingMatformerTierCheckpoint { path: String, tier: u8 },
+
+    #[error("Double-slicing detected: checkpoint is tier {checkpoint_tier}, CLI requests tier {cli_tier}. {hint}")]
+    DoubleSlicingDetected {
+        checkpoint_tier: u8,
+        cli_tier: u8,
+        hint: String,
+    },
 }
 
 enum RawLoadedModelType {
@@ -320,6 +396,8 @@ struct RawLoadedModel {
     model_task_runner: ModelTaskRunner,
     checkpoint_extra_files: Vec<PathBuf>,
     parameter_names: Arc<Vec<String>>,
+    matformer_effective_tier: u8,
+    matformer_base_intermediate_size: Option<u64>,
 }
 
 type OneshotModelParameterSender = oneshot::Sender<HashMap<String, Tensor>>;
@@ -524,6 +602,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             0,
                         ),
                         parameter_names: parameter_names.clone(),
+                        matformer_effective_tier: 0,
+                        matformer_base_intermediate_size: None,
                     };
                     #[allow(clippy::arc_with_non_send_sync)]
                     let config = &PretrainedSource::ConfigAndTensors(
@@ -910,6 +990,15 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
                         let config_json: serde_json::Value =
                             serde_json::from_str(&serialized_config)?;
+
+                        // Validate no double-slicing before proceeding
+                        validate_no_double_slicing(
+                            &config_json,
+                            init_config.matformer_tier,
+                            &init_config.matformer_load_strategy,
+                            uses_sliced_checkpoint,
+                        )?;
+
                         let hidden_size = config_json
                             .get("hidden_size")
                             .and_then(|v| v.as_u64());
@@ -919,6 +1008,17 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         let active_intermediate_size = intermediate_size.and_then(|h| {
                             let divisor = 1_u64.checked_shl(matformer_tier_for_loading as u32)?;
                             Some(h / divisor)
+                        });
+                        // Compute base intermediate size (before any tier slicing)
+                        // For sliced checkpoints, scale up by CLI tier to get original base
+                        let base_intermediate_size: Option<u64> = intermediate_size.and_then(|size| {
+                            if uses_sliced_checkpoint && init_config.matformer_tier > 0 {
+                                // Sliced checkpoint: scale up to get base
+                                size.checked_shl(init_config.matformer_tier as u32)
+                            } else {
+                                // Full checkpoint: intermediate_size IS the base
+                                Some(size)
+                            }
                         });
                         let num_hidden_layers = config_json
                             .get("num_hidden_layers")
@@ -1004,6 +1104,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             model_task_runner,
                             checkpoint_extra_files,
                             parameter_names,
+                            matformer_effective_tier: matformer_tier_for_loading,
+                            matformer_base_intermediate_size: base_intermediate_size,
                         })
                     }),
                 model::Checkpoint::Ephemeral => return Err(InitRunError::ModelIsEphemeral),
@@ -1066,6 +1168,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             checkpoint_extra_files,
             model_task_runner,
             parameter_names,
+            matformer_effective_tier,
+            matformer_base_intermediate_size,
         } = models.map_err(InitRunError::ModelLoadingThreadCrashed)??;
 
         // TODO add data fetching for verifying, too..
@@ -1220,6 +1324,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             tx_model,
             init_config.checkpoint_config,
             checkpoint_extra_files,
+            MatformerCheckpointInfo {
+                effective_tier: matformer_effective_tier,
+                base_intermediate_size: matformer_base_intermediate_size,
+            },
             model_task_runner,
         );
 

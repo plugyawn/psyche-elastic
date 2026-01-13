@@ -40,11 +40,21 @@ pub enum CooldownError {
     Checkpoint(#[from] CheckpointError),
 }
 
+/// MatFormer tier information for checkpoint saving.
+#[derive(Clone, Copy, Debug)]
+pub struct MatformerCheckpointInfo {
+    /// The effective tier used during training (0 = full width).
+    pub effective_tier: u8,
+    /// The base intermediate size before any tier slicing.
+    pub base_intermediate_size: Option<u64>,
+}
+
 pub struct CooldownStepMetadata {
     tx_checkpoint: mpsc::UnboundedSender<model::HubRepo>,
     tx_model: mpsc::UnboundedSender<HashMap<String, Tensor>>,
     checkpoint_info: Option<CheckpointConfig>,
     checkpoint_extra_files: Vec<PathBuf>,
+    matformer_info: MatformerCheckpointInfo,
 
     model_task_runner: ModelTaskRunner,
     // use a heap here as a best-effort attempt to ensure we get rid of the lowest step number dir even if we spawn multiple tasks
@@ -62,6 +72,7 @@ impl CooldownStepMetadata {
         tx_model: mpsc::UnboundedSender<HashMap<String, Tensor>>,
         checkpoint_info: Option<CheckpointConfig>,
         checkpoint_extra_files: Vec<PathBuf>,
+        matformer_info: MatformerCheckpointInfo,
         model_task_runner: ModelTaskRunner,
     ) -> Self {
         Self {
@@ -69,6 +80,7 @@ impl CooldownStepMetadata {
             tx_model,
             checkpoint_info,
             checkpoint_extra_files,
+            matformer_info,
             model_task_runner,
             delete_queue: Arc::new(Mutex::new(BinaryHeap::new())),
         }
@@ -90,7 +102,16 @@ pub enum CheckpointError {
     WriteSafetensors(#[from] SaveSafetensorsError),
 
     #[error("Writing extra file to disk failed: {0}")]
-    WriteExtraFile(#[from] tokio::io::Error),
+    WriteExtraFile(tokio::io::Error),
+
+    #[error("Reading config.json failed: {0}")]
+    ReadConfigJson(tokio::io::Error),
+
+    #[error("Parsing config.json failed: {0}")]
+    ParseConfigJson(serde_json::Error),
+
+    #[error("Writing config.json failed: {0}")]
+    WriteConfigJson(tokio::io::Error),
 
     #[error("Couldn't upload model to huggingface: {0}")]
     UploadError(#[from] UploadModelError),
@@ -138,6 +159,7 @@ impl CooldownStepMetadata {
         let run_id = String::from(&state.run_id);
         let checkpoint_extra_files = self.checkpoint_extra_files.clone();
         let checkpoint_info = self.checkpoint_info.clone();
+        let matformer_info = self.matformer_info;
         let tx_checkpoint = self.tx_checkpoint.clone();
         let tx_model = self.tx_model.clone();
         let model_task_runner = self.model_task_runner.clone();
@@ -190,10 +212,42 @@ impl CooldownStepMetadata {
                     .map_err(|_| CheckpointError::WriteThreadCrashed)??;
 
                     for extra in checkpoint_extra_files {
-                        let to = path.join(extra.file_name().unwrap());
-                        tokio::fs::copy(extra.clone(), to.clone())
-                            .await
-                            .map_err(CheckpointError::WriteExtraFile)?;
+                        let filename = extra.file_name().unwrap();
+                        let to = path.join(filename);
+
+                        // Handle config.json specially: inject matformer_tier info
+                        if filename == "config.json" {
+                            let content = tokio::fs::read_to_string(&extra)
+                                .await
+                                .map_err(CheckpointError::ReadConfigJson)?;
+                            let mut config: serde_json::Value = serde_json::from_str(&content)
+                                .map_err(CheckpointError::ParseConfigJson)?;
+
+                            if let Some(obj) = config.as_object_mut() {
+                                // Store the effective tier used during training
+                                obj.insert(
+                                    "matformer_tier".to_string(),
+                                    serde_json::Value::from(matformer_info.effective_tier),
+                                );
+                                // Store base intermediate size if known
+                                if let Some(base_size) = matformer_info.base_intermediate_size {
+                                    obj.insert(
+                                        "matformer_base_intermediate_size".to_string(),
+                                        serde_json::Value::from(base_size),
+                                    );
+                                }
+                            }
+
+                            let updated = serde_json::to_string_pretty(&config)
+                                .map_err(CheckpointError::ParseConfigJson)?;
+                            tokio::fs::write(&to, updated)
+                                .await
+                                .map_err(CheckpointError::WriteConfigJson)?;
+                        } else {
+                            tokio::fs::copy(extra.clone(), to.clone())
+                                .await
+                                .map_err(CheckpointError::WriteExtraFile)?;
+                        }
                         local.push(to);
                     }
 
