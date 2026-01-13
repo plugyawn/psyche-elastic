@@ -1,2 +1,6 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[env]
+LIBTORCH_USE_PYTORCH = "1"
+LIBTORCH_BYPASS_VERSION_CHECK = "1"
