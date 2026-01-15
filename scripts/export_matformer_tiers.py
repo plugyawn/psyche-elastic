@@ -6,7 +6,9 @@ Usage:
   python scripts/export_matformer_tiers.py --src checkpoints/matformer-test --tiers 1 2
 
 This will write checkpoints/matformer-test-tier1 and -tier2 with:
-- config.json updated to the sliced FFN width and matformer_tier=0
+- config.json updated to the sliced FFN width
+- matformer_tier set to the tier number
+- matformer_base_intermediate_size recorded for auto-detection
 - sliced safetensors (single-shard only)
 - tokenizer and auxiliary json files copied over
 """
@@ -58,9 +60,13 @@ def export_tier(src: Path, tier: int) -> Path:
     config = json.loads(cfg_path.read_text())
     if "intermediate_size" not in config:
         raise ValueError("config.json missing intermediate_size")
+    if config.get("matformer_tier", 0) not in (0, None):
+        raise ValueError("source checkpoint appears tier-sliced; expected universal checkpoint")
     divisor = 1 << tier
-    config["intermediate_size"] = config["intermediate_size"] // divisor
-    config["matformer_tier"] = 0
+    base_intermediate_size = config.get("matformer_base_intermediate_size", config["intermediate_size"])
+    config["intermediate_size"] = base_intermediate_size // divisor
+    config["matformer_tier"] = tier
+    config["matformer_base_intermediate_size"] = base_intermediate_size
     (dst / "config.json").write_text(json.dumps(config, indent=2))
 
     # Weights (single-shard only)

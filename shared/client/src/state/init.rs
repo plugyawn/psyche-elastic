@@ -89,6 +89,75 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub sidecar_port: Option<u16>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_apply_matformer_checkpoint_tier_overrides_auto() {
+        let config = json!({
+            "intermediate_size": 1024,
+            "matformer_tier": 1
+        });
+        let (uses_sliced, effective_tier) = apply_matformer_checkpoint_tier_overrides(
+            &config,
+            &MatformerLoadStrategy::Auto,
+            false,
+            2,
+        );
+        assert!(uses_sliced);
+        assert_eq!(effective_tier, 0);
+    }
+
+    #[test]
+    fn test_apply_matformer_checkpoint_tier_overrides_universal() {
+        let config = json!({
+            "intermediate_size": 1024,
+            "matformer_tier": 1
+        });
+        let (uses_sliced, effective_tier) = apply_matformer_checkpoint_tier_overrides(
+            &config,
+            &MatformerLoadStrategy::Universal,
+            false,
+            2,
+        );
+        assert!(uses_sliced);
+        assert_eq!(effective_tier, 2);
+    }
+
+    #[test]
+    fn test_validate_no_double_slicing_universal() {
+        let config = json!({
+            "intermediate_size": 1024,
+            "matformer_tier": 1
+        });
+        let err = validate_no_double_slicing(
+            &config,
+            1,
+            &MatformerLoadStrategy::Universal,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, InitRunError::DoubleSlicingDetected { .. }));
+    }
+
+    #[test]
+    fn test_validate_no_double_slicing_auto() {
+        let config = json!({
+            "intermediate_size": 1024,
+            "matformer_tier": 1
+        });
+        assert!(validate_no_double_slicing(
+            &config,
+            1,
+            &MatformerLoadStrategy::Auto,
+            true,
+        )
+        .is_ok());
+    }
+}
+
 /// Print MatFormer configuration summary with ASCII art header.
 /// Called after model loading to provide clear visibility into tier configuration.
 fn print_matformer_summary(
@@ -239,6 +308,26 @@ fn infer_tier_from_checkpoint_config(config: &serde_json::Value) -> (Option<u8>,
     }
 
     (None, intermediate_size)
+}
+
+fn apply_matformer_checkpoint_tier_overrides(
+    checkpoint_config: &serde_json::Value,
+    load_strategy: &MatformerLoadStrategy,
+    uses_sliced_checkpoint: bool,
+    matformer_tier_for_loading: u8,
+) -> (bool, u8) {
+    let (checkpoint_tier, _) = infer_tier_from_checkpoint_config(checkpoint_config);
+    let mut uses_sliced_checkpoint =
+        uses_sliced_checkpoint || checkpoint_tier.map(|tier| tier > 0).unwrap_or(false);
+    let mut matformer_tier_for_loading = matformer_tier_for_loading;
+
+    if uses_sliced_checkpoint
+        && matches!(load_strategy, MatformerLoadStrategy::Auto | MatformerLoadStrategy::Sliced)
+    {
+        matformer_tier_for_loading = 0;
+    }
+
+    (uses_sliced_checkpoint, matformer_tier_for_loading)
 }
 
 /// Validate that the requested tier configuration won't cause double-slicing.
@@ -766,8 +855,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     let source = loaded_checkpoint.source;
                     let tokenizer = loaded_checkpoint.tokenizer;
                     let checkpoint_extra_files = loaded_checkpoint.checkpoint_extra_files;
-                    let uses_sliced_checkpoint = loaded_checkpoint.uses_sliced_checkpoint;
-                    let matformer_tier_for_loading = loaded_checkpoint.matformer_tier_for_loading;
+                    let mut uses_sliced_checkpoint = loaded_checkpoint.uses_sliced_checkpoint;
+                    let mut matformer_tier_for_loading =
+                        loaded_checkpoint.matformer_tier_for_loading;
                     let matformer_checkpoint_path = loaded_checkpoint.matformer_checkpoint_path;
 
                     info!("Loading model...");
@@ -788,6 +878,22 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     );
 
                     let serialized_config = source.serialize_config()?;
+                    let config_json: serde_json::Value =
+                        serde_json::from_str(&serialized_config)?;
+                    (uses_sliced_checkpoint, matformer_tier_for_loading) =
+                        apply_matformer_checkpoint_tier_overrides(
+                            &config_json,
+                            &init_config.matformer_load_strategy,
+                            uses_sliced_checkpoint,
+                            matformer_tier_for_loading,
+                        );
+                    // Validate no double-slicing before model load
+                    validate_no_double_slicing(
+                        &config_json,
+                        init_config.matformer_tier,
+                        &init_config.matformer_load_strategy,
+                        uses_sliced_checkpoint,
+                    )?;
                     let mut parameter_names = match llm.architecture {
                         model::LLMArchitecture::HfLlama => {
                             let config: LlamaConfig = serde_json::from_str(&serialized_config)?;
@@ -987,17 +1093,6 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         tx_config
                             .send((serialized_config.clone(), serialized_tokenizer))
                             .unwrap();
-
-                        let config_json: serde_json::Value =
-                            serde_json::from_str(&serialized_config)?;
-
-                        // Validate no double-slicing before proceeding
-                        validate_no_double_slicing(
-                            &config_json,
-                            init_config.matformer_tier,
-                            &init_config.matformer_load_strategy,
-                            uses_sliced_checkpoint,
-                        )?;
 
                         let hidden_size = config_json
                             .get("hidden_size")

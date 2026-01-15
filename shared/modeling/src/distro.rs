@@ -33,6 +33,7 @@ fn extract_layer_index(name: &str) -> Option<usize> {
     None
 }
 
+// TODO: Wire this into DisTrO apply once helper-mode indices are transmitted.
 /// Align gradient with non-contiguous MatFormer helper indices.
 ///
 /// This function scatters a gradient from a subset of indices back to the full shape.
