@@ -127,6 +127,12 @@ impl Mlp {
             0,
             "n_hidden must be divisible by tp_size"
         );
+        if let Some(ref config) = helper_config {
+            assert!(
+                config.helper_fraction <= 0.0,
+                "MatFormer helper mode is temporarily disabled (suffix sampling not wired)"
+            );
+        }
         if let Some(matformer_hidden_size) = matformer_hidden_size {
             assert!(
                 matformer_hidden_size > 0,
@@ -672,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "MatFormer helper mode is temporarily disabled")]
     fn matformer_mlp_helper_mode_has_helper_grads() {
         use crate::matformer_helper::HelperConfig;
 
@@ -682,7 +689,7 @@ mod tests {
         let current_round = Arc::new(AtomicU64::new(0));
         let helper_config = HelperConfig::new(0.5, 16); // 50% helper
 
-        let mlp = Mlp::new(
+        let _ = Mlp::new(
             vs.root(),
             n_embd,
             n_hidden,
@@ -692,22 +699,5 @@ mod tests {
             current_round,
             None,
         );
-
-        let xs = Tensor::randn([2, 3, n_embd], (Kind::Float, Device::Cpu));
-        let out = mlp.forward(&xs);
-        let loss = out.sum(Kind::Float);
-        loss.backward();
-
-        let gate_grad = mlp.gate_proj.linear.ws.grad();
-
-        // With helper mode, some suffix neurons should have non-zero grads
-        // (prefix = 4, helper = 4*0.5 = 2, so 6 total neurons trained)
-        let prefix_grad = gate_grad.narrow(0, 0, matformer_hidden);
-        let prefix_max = prefix_grad.abs().max().double_value(&[]);
-        assert!(prefix_max > 0.0, "prefix should have gradients");
-
-        // Overall gradient should have some non-zero values beyond prefix
-        let total_nonzero = gate_grad.abs().sum(Kind::Float).double_value(&[]);
-        assert!(total_nonzero > 0.0);
     }
 }

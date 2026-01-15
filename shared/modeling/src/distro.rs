@@ -22,6 +22,8 @@ fn matformer_prefix_dim(name: &str) -> Option<usize> {
 }
 
 /// Extract layer index from parameter name like "model.layers.5.mlp.gate_proj.weight"
+// TODO: Use this when helper-mode sparse indices are wired (map params -> layer for index lookup).
+// TODO: Remove if helper-mode sparse indices are dropped or moved elsewhere.
 fn extract_layer_index(name: &str) -> Option<usize> {
     // Look for "layers.N" pattern
     let parts: Vec<&str> = name.split('.').collect();
@@ -33,7 +35,8 @@ fn extract_layer_index(name: &str) -> Option<usize> {
     None
 }
 
-// TODO: Wire this into DisTrO apply once helper-mode indices are transmitted.
+// TODO: Wire this into DisTrO apply once helper-mode indices are transmitted or computed.
+// TODO: Plumb helper indices through DistroResult or compute via helper config + layer index.
 /// Align gradient with non-contiguous MatFormer helper indices.
 ///
 /// This function scatters a gradient from a subset of indices back to the full shape.

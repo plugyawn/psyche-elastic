@@ -399,6 +399,10 @@ impl NanoGPTMlp {
 
         // Validate matformer settings
         if let Some(mf_size) = matformer_hidden_size {
+            assert!(
+                !bias,
+                "mlp_bias is not supported with MatFormer tiers (matformer_tier > 0)"
+            );
             assert!(mf_size > 0, "matformer_hidden_size must be > 0");
             assert!(
                 mf_size <= intermediate_size,
@@ -408,6 +412,12 @@ impl NanoGPTMlp {
                 mf_size % tp_size,
                 0,
                 "matformer_hidden_size must be divisible by tp_size"
+            );
+        }
+        if let Some(ref config) = helper_config {
+            assert!(
+                config.helper_fraction <= 0.0,
+                "MatFormer helper mode is temporarily disabled (suffix sampling not wired)"
             );
         }
 
@@ -508,7 +518,17 @@ impl Module for NanoGPTMlp {
 
             // Manual matmul with indexed weights
             let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let gate = if let Some(ref bias) = self.gate_proj.linear.bs {
+                gate + bias.index_select(0, &indices_tensor)
+            } else {
+                gate
+            };
             let up = xs.matmul(&up_w.transpose(0, 1));
+            let up = if let Some(ref bias) = self.up_proj.linear.bs {
+                up + bias.index_select(0, &indices_tensor)
+            } else {
+                up
+            };
 
             let hidden = if self.use_relu_squared {
                 gate.relu().square() * up
@@ -516,7 +536,12 @@ impl Module for NanoGPTMlp {
                 gate.silu() * up
             };
 
-            hidden.matmul(&down_w.transpose(0, 1))
+            let out = hidden.matmul(&down_w.transpose(0, 1));
+            if let Some(ref bias) = self.down_proj.linear.bs {
+                out + bias
+            } else {
+                out
+            }
         } else {
             // Standard MatFormer: use narrow for contiguous prefix (more efficient)
             // Weight shapes:
@@ -531,7 +556,17 @@ impl Module for NanoGPTMlp {
 
             // Manual matmul with narrowed weights
             let gate = xs.matmul(&gate_w.transpose(0, 1));
+            let gate = if let Some(ref bias) = self.gate_proj.linear.bs {
+                gate + bias.narrow(0, 0, matformer_hidden_size)
+            } else {
+                gate
+            };
             let up = xs.matmul(&up_w.transpose(0, 1));
+            let up = if let Some(ref bias) = self.up_proj.linear.bs {
+                up + bias.narrow(0, 0, matformer_hidden_size)
+            } else {
+                up
+            };
 
             let hidden = if self.use_relu_squared {
                 gate.relu().square() * up
@@ -539,7 +574,12 @@ impl Module for NanoGPTMlp {
                 gate.silu() * up
             };
 
-            hidden.matmul(&down_w.transpose(0, 1))
+            let out = hidden.matmul(&down_w.transpose(0, 1));
+            if let Some(ref bias) = self.down_proj.linear.bs {
+                out + bias
+            } else {
+                out
+            }
         }
     }
 }
@@ -2774,6 +2814,30 @@ mod tests {
         );
 
         eprintln!("MatFormer MLP zero-tail-grads test passed!");
+    }
+
+    #[test]
+    #[should_panic(expected = "mlp_bias is not supported with MatFormer tiers")]
+    fn test_nanogpt_matformer_mlp_bias_not_supported() {
+        use std::sync::{atomic::AtomicU64, Arc};
+        let vs = nn::VarStore::new(Device::Cpu);
+        let hidden_size = 1;
+        let intermediate_size = 2;
+        let matformer_hidden = 1;
+        let current_round = Arc::new(AtomicU64::new(0));
+
+        let _ = NanoGPTMlp::new(
+            vs.root(),
+            hidden_size,
+            intermediate_size,
+            true,  // bias enabled
+            None,  // no comm
+            false, // SiLU, not ReLU²
+            Some(matformer_hidden),
+            0,    // layer_idx
+            None, // no helper mode
+            current_round,
+        );
     }
 
     /// Test: MatFormer MLP with ReLU² also has zero tail gradients
