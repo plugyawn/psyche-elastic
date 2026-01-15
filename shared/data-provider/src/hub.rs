@@ -169,23 +169,27 @@ pub async fn download_model_repo_files_async(
         });
 
     let chunk_size = max_concurrent_downloads.unwrap_or(files.len());
+    let api = &api;
     let mut ret: Vec<PathBuf> = Vec::with_capacity(files.len());
     for chunk in files.chunks(chunk_size) {
         let futures = chunk
             .iter()
-            .map(|name| async {
-                let start_time = Instant::now();
-                tracing::debug!(filename = name, "Starting file download from hub");
-                let res = api.get(name).await;
-                if res.is_ok() {
-                    let duration_secs = (Instant::now() - start_time).as_secs_f32();
-                    tracing::info!(
-                        filename = name,
-                        duration_secs = duration_secs,
-                        "Finished downloading file from hub"
-                    );
+            .map(|name| {
+                let name = name.clone();
+                async move {
+                    let start_time = Instant::now();
+                    tracing::debug!(filename = name, "Starting file download from hub");
+                    let res = api.get(&name).await;
+                    if res.is_ok() {
+                        let duration_secs = (Instant::now() - start_time).as_secs_f32();
+                        tracing::info!(
+                            filename = name,
+                            duration_secs = duration_secs,
+                            "Finished downloading file from hub"
+                        );
+                    }
+                    res
                 }
-                res
             })
             .collect::<Vec<_>>();
         for future in futures {

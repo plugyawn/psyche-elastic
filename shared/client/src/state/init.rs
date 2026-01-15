@@ -391,11 +391,13 @@ async fn resolve_matformer_local_repo_path(
     }
 }
 
+#[derive(Debug)]
 struct ManifestSelection {
     files: Vec<String>,
     config_path: String,
 }
 
+#[derive(Debug)]
 struct ResolvedRepoFiles {
     repo_files: Vec<PathBuf>,
     uses_sliced_checkpoint: bool,
