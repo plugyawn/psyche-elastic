@@ -848,6 +848,7 @@ impl Distro {
             } else {
                 // Heterogeneous shapes: decode individually, then align to local shape.
                 let mut combined: Option<Tensor> = None;
+                let mut contributing_peers: usize = 0;
                 for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
                     let res = &peer_results[index];
                     let sparse_idx = res.sparse_idx.to_device(device);
@@ -876,10 +877,17 @@ impl Distro {
                         Some(acc) => acc + aligned,
                         None => aligned,
                     });
+                    contributing_peers += 1;
                 }
 
                 if let Some(combined) = combined {
-                    var.set_grad(combined);
+                    // Normalize by contributing peer count (consistent with "mean" in batch_decompress)
+                    let normalized = if contributing_peers > 1 {
+                        combined / (contributing_peers as f64)
+                    } else {
+                        combined
+                    };
+                    var.set_grad(normalized);
                 } else {
                     warn!(
                         parameter = var.name(),
