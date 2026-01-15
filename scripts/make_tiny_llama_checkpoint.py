@@ -66,6 +66,8 @@ def main() -> None:
         bos_token_id=1,
         eos_token_id=2,
     )
+    config.matformer_tier = 0
+    config.matformer_base_intermediate_size = config.intermediate_size
 
     model = LlamaForCausalLM(config)
     total_params = sum(p.numel() for p in model.parameters())
@@ -81,4 +83,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

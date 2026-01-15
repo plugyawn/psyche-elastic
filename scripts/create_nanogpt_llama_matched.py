@@ -54,6 +54,8 @@ config = {
     "use_learnable_attn_scale": False,
     "use_attention_gate": False,
 }
+config["matformer_tier"] = 0
+config["matformer_base_intermediate_size"] = config["intermediate_size"]
 
 def count_params(config):
     """Estimate parameter count with GQA."""

@@ -41,6 +41,8 @@ config = {
     "use_cache": True,
     "vocab_size": 32000,        # LLaMA tokenizer
 }
+config["matformer_tier"] = 0
+config["matformer_base_intermediate_size"] = config["intermediate_size"]
 
 def count_params(config):
     """Estimate parameter count with GQA."""

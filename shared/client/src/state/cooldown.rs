@@ -224,13 +224,37 @@ impl CooldownStepMetadata {
                                 .map_err(CheckpointError::ParseConfigJson)?;
 
                             if let Some(obj) = config.as_object_mut() {
-                                // Store the effective tier used during training
+                                let intermediate_size = obj
+                                    .get("intermediate_size")
+                                    .and_then(|v| v.as_u64());
+                                let base_size = matformer_info
+                                    .base_intermediate_size
+                                    .or_else(|| {
+                                        obj.get("matformer_base_intermediate_size")
+                                            .and_then(|v| v.as_u64())
+                                    })
+                                    .or(intermediate_size);
+
+                                let actual_tier = match (base_size, intermediate_size) {
+                                    (Some(base), Some(current))
+                                        if current > 0 && base >= current && base % current == 0 =>
+                                    {
+                                        let ratio = base / current;
+                                        if ratio.is_power_of_two() {
+                                            ratio.trailing_zeros() as u8
+                                        } else {
+                                            0
+                                        }
+                                    }
+                                    _ => 0,
+                                };
+
                                 obj.insert(
                                     "matformer_tier".to_string(),
-                                    serde_json::Value::from(matformer_info.effective_tier),
+                                    serde_json::Value::from(actual_tier),
                                 );
-                                // Store base intermediate size if known
-                                if let Some(base_size) = matformer_info.base_intermediate_size {
+
+                                if let Some(base_size) = base_size {
                                     obj.insert(
                                         "matformer_base_intermediate_size".to_string(),
                                         serde_json::Value::from(base_size),
