@@ -270,6 +270,40 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
+
+    #[test]
+    fn test_canonical_schema_hash_matches_full_and_sliced() {
+        let parameter_names = vec!["model.layers.0.mlp.gate_proj.weight".to_string()];
+        let config_full = json!({
+            "intermediate_size": 256
+        });
+        let config_slice = json!({
+            "intermediate_size": 128,
+            "matformer_tier": 1,
+            "matformer_base_intermediate_size": 256
+        });
+
+        let canonical_full = canonicalize_config_for_schema(config_full, 0, false);
+        let canonical_slice = canonicalize_config_for_schema(config_slice, 1, true);
+
+        assert_eq!(canonical_full["intermediate_size"], 256);
+        assert_eq!(canonical_slice["intermediate_size"], 256);
+        assert_eq!(canonical_full["matformer_base_intermediate_size"], 256);
+        assert_eq!(canonical_slice["matformer_base_intermediate_size"], 256);
+
+        let hash_full = schema_hash_for_config(
+            model::LLMArchitecture::HfLlama,
+            &canonical_full,
+            &parameter_names,
+        );
+        let hash_slice = schema_hash_for_config(
+            model::LLMArchitecture::HfLlama,
+            &canonical_slice,
+            &parameter_names,
+        );
+
+        assert_eq!(hash_full, hash_slice);
+    }
 }
 
 /// Print MatFormer configuration summary with ASCII art header.
@@ -836,15 +870,30 @@ fn canonicalize_config_for_schema(
     matformer_tier: u8,
     uses_sliced_checkpoint: bool,
 ) -> serde_json::Value {
+    let mut base_intermediate_size = infer_matformer_checkpoint_metadata(&config)
+        .base_intermediate_size;
     if let Some(obj) = config.as_object_mut() {
-        if uses_sliced_checkpoint && matformer_tier > 0 {
-            if let Some(value) = obj.get_mut("intermediate_size") {
-                if let Some(base) = value.as_u64() {
-                    if let Some(scaled) = base.checked_shl(matformer_tier as u32) {
-                        *value = serde_json::Value::from(scaled);
-                    }
-                }
+        if uses_sliced_checkpoint {
+            let base = base_intermediate_size
+                .or_else(|| obj.get("intermediate_size").and_then(|v| v.as_u64()))
+                .or_else(|| {
+                    obj.get("intermediate_size")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|size| size.checked_shl(matformer_tier as u32))
+                });
+            if let Some(base) = base {
+                obj.insert("intermediate_size".to_string(), serde_json::Value::from(base));
+                base_intermediate_size = Some(base);
             }
+        }
+
+        if let Some(base) = base_intermediate_size
+            .or_else(|| obj.get("intermediate_size").and_then(|v| v.as_u64()))
+        {
+            obj.insert(
+                "matformer_base_intermediate_size".to_string(),
+                serde_json::Value::from(base),
+            );
         }
         // ALWAYS set matformer_tier to 0 for canonical comparison
         // This ensures full checkpoints (no field) and sliced checkpoints (field=0)
