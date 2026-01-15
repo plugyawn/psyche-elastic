@@ -1,0 +1,16 @@
+[package]
+name = "psyche-network-fault-injection"
+version = "0.1.0"
+edition = "2021"
+description = "Network fault injection for stress testing Psyche distributed training"
+
+[dependencies]
+rand = { version = "0.8", features = ["std_rng"] }
+rand_distr = "0.4"
+tokio = { version = "1", features = ["time", "sync"] }
+tracing = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
