@@ -34,6 +34,10 @@ pub fn infer_matformer_checkpoint_metadata(config: &Value) -> MatformerCheckpoin
                 base_intermediate_size: Some(base),
             };
         }
+        return MatformerCheckpointMetadata {
+            tier: None,
+            base_intermediate_size: Some(base),
+        };
     }
 
     MatformerCheckpointMetadata {
@@ -76,8 +80,64 @@ pub fn annotate_matformer_checkpoint_config(
     }
 }
 
+pub fn ensure_matformer_checkpoint_metadata(
+    config: &mut Value,
+    manifest_base_intermediate_size: Option<u64>,
+    sliced_checkpoint_tier: Option<u8>,
+) -> MatformerCheckpointMetadata {
+    let intermediate_size = config.get("intermediate_size").and_then(|v| v.as_u64());
+    let existing_base = config
+        .get("matformer_base_intermediate_size")
+        .and_then(|v| v.as_u64());
+    let existing_tier = config
+        .get("matformer_tier")
+        .and_then(|v| v.as_u64())
+        .and_then(|tier| u8::try_from(tier).ok());
+
+    let mut base_intermediate_size = existing_base.or(manifest_base_intermediate_size);
+    if base_intermediate_size.is_none() {
+        let tier_hint = existing_tier.or(sliced_checkpoint_tier);
+        if let (Some(tier_hint), Some(current)) = (tier_hint, intermediate_size) {
+            base_intermediate_size = current.checked_shl(tier_hint as u32);
+        }
+    }
+
+    let mut tier = existing_tier;
+    if tier.is_none() {
+        if let (Some(base), Some(current)) = (base_intermediate_size, intermediate_size) {
+            tier = compute_tier_from_sizes(base, current);
+        } else {
+            tier = sliced_checkpoint_tier;
+        }
+    }
+
+    if let Some(obj) = config.as_object_mut() {
+        if existing_base.is_none() {
+            if let Some(base) = base_intermediate_size {
+                obj.insert(
+                    "matformer_base_intermediate_size".to_string(),
+                    Value::from(base),
+                );
+            }
+        }
+        if existing_tier.is_none() {
+            if let Some(tier) = tier {
+                obj.insert("matformer_tier".to_string(), Value::from(tier));
+            }
+        }
+    }
+
+    MatformerCheckpointMetadata {
+        tier,
+        base_intermediate_size: base_intermediate_size.or(intermediate_size),
+    }
+}
+
 fn compute_tier_from_sizes(base: u64, current: u64) -> Option<u8> {
     if base == 0 || current == 0 || base < current {
+        return None;
+    }
+    if base % current != 0 {
         return None;
     }
     let ratio = base / current;

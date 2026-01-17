@@ -50,10 +50,18 @@ def slice_ffn_weights(weights: dict[str, torch.Tensor], divisor: int) -> dict[st
     for name, tensor in weights.items():
         if name.endswith("mlp.gate_proj.weight") or name.endswith("mlp.up_proj.weight"):
             hidden = tensor.shape[0]
+            if hidden % divisor != 0:
+                raise ValueError(
+                    f"{name} hidden size {hidden} not divisible by divisor {divisor}"
+                )
             width = hidden // divisor
             sliced[name] = tensor[:width, :].contiguous()
         elif name.endswith("mlp.down_proj.weight"):
             hidden = tensor.shape[1]
+            if hidden % divisor != 0:
+                raise ValueError(
+                    f"{name} hidden size {hidden} not divisible by divisor {divisor}"
+                )
             width = hidden // divisor
             sliced[name] = tensor[:, :width].contiguous()
         else:
@@ -116,6 +124,11 @@ def write_manifest(
     )
 
     for tier in tiers:
+        divisor = 1 << tier
+        if base_intermediate_size % divisor != 0:
+            raise ValueError(
+                f"base intermediate_size {base_intermediate_size} not divisible by 2**{tier}"
+            )
         tier_dir = manifest_dir.with_name(f"{manifest_dir.name}-tier{tier}")
         tier_config = tier_dir / "config.json"
         if not tier_config.is_file():
@@ -128,7 +141,7 @@ def write_manifest(
         tier_entries.append(
             {
                 "tier": tier,
-                "intermediate_size": base_intermediate_size // (1 << tier),
+                "intermediate_size": base_intermediate_size // divisor,
                 "files": tier_rel,
             }
         )
@@ -160,6 +173,10 @@ def export_tier(src: Path, tier: int) -> Path:
     base_intermediate_size = config.get(
         "matformer_base_intermediate_size", config["intermediate_size"]
     )
+    if base_intermediate_size % divisor != 0:
+        raise ValueError(
+            f"base intermediate_size {base_intermediate_size} not divisible by 2**{tier}"
+        )
     config["intermediate_size"] = base_intermediate_size // divisor
     config["matformer_tier"] = tier
     config["matformer_base_intermediate_size"] = base_intermediate_size
