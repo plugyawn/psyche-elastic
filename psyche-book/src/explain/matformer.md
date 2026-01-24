@@ -59,6 +59,117 @@ psyche-centralized-client train \
   --device cuda
 ```
 
+### End-to-End MatFormer Workflow
+
+This is the full lifecycle used in Psyche today:
+
+1. **Start from a universal checkpoint** (tier 0, full FFN width).
+2. **Export tier slices** using `scripts/export_matformer_tiers.py`. This writes
+   tier directories and `matformer_manifest.json`.
+3. **Publish to local storage or Hugging Face**. The manifest is used to
+   enumerate files for each tier.
+4. **Clients join with a tier and load strategy**:
+   - `auto` tries to load a tier slice via the manifest and falls back to
+     universal if missing.
+   - `sliced` requires the tier slice and fails fast if missing.
+   - `universal` always loads the full checkpoint.
+5. **Metadata is enforced or inferred**:
+   `matformer_tier` and `matformer_base_intermediate_size` are injected
+   (or inferred) so loaders and schema hashes remain consistent.
+6. **Heterogeneous training proceeds**:
+   clients at smaller tiers update the shared prefix weights; aggregation
+   uses parameter names and normalization logic to keep updates consistent
+   across tiers.
+
+This workflow makes it possible to mix large and small devices in the same run
+without requiring every client to download or compute the full model.
+
+### Tiered Checkpoints and Manifests
+
+MatFormer supports **tier-sliced checkpoints** so you can distribute and load only the
+subset of weights needed for a given tier. This is especially useful for
+heterogeneous training when lower-VRAM devices should download smaller slices.
+
+#### Exporting Tier Slices
+
+Use the export script to generate tier directories and a manifest:
+
+```bash
+python scripts/export_matformer_tiers.py --src checkpoints/my-model --tiers 1 2
+```
+
+This produces:
+
+- `checkpoints/my-model-tier1/` and `checkpoints/my-model-tier2/` (sliced weights)
+- `matformer_manifest.json` in the **universal** checkpoint directory
+- Updated `config.json` in each tier directory:
+  - `matformer_tier` = the tier number
+  - `matformer_base_intermediate_size` = the original full FFN width
+  - `intermediate_size` = the sliced width for the tier
+
+The export script validates that base FFN size is divisible by `2**tier` and only
+supports a single `.safetensors` shard (for now).
+
+#### Manifest (Schema v1)
+
+`matformer_manifest.json` provides a machine-readable list of files for each tier:
+
+```json
+{
+  "schema_version": 1,
+  "matformer_base_intermediate_size": 1024,
+  "common_files": ["tokenizer.json", "tokenizer_config.json"],
+  "tiers": [
+    {
+      "tier": 1,
+      "intermediate_size": 512,
+      "files": ["../my-model-tier1/config.json", "../my-model-tier1/model.safetensors"]
+    }
+  ],
+  "sha256": { "...": "..." }
+}
+```
+
+Paths are **relative to the manifest location**. On HF, the client normalizes
+these paths to repo-root and rejects absolute paths; `../` is supported for
+layouts where tier slices are siblings of the manifest directory.
+
+#### Load Strategy
+
+Use `--matformer-load-strategy` to control how slices are resolved:
+
+- `auto` (default): use a sliced tier if the manifest is complete; otherwise
+  fall back to the universal checkpoint.
+- `sliced`: require the tier slice; fail fast if missing.
+- `universal`: always load the full checkpoint.
+
+The loader detects when a checkpoint is already sliced (via manifest or
+`matformer_tier` metadata) and prevents **double-slicing** by forcing the
+effective tier to 0 in `auto`/`sliced` modes.
+
+#### Metadata and Schema Compatibility
+
+Tier-sliced checkpoints include:
+
+- `matformer_tier`: the slice tier (0 = full, 1 = half, 2 = quarter, etc.)
+- `matformer_base_intermediate_size`: the original full FFN width
+
+If these fields are missing, the client infers them from the manifest or
+the selected tier. This metadata is also used to **canonicalize** the schema
+hash so heterogeneous runs (mixing tier 0 and tiered checkpoints) agree on
+model compatibility.
+
+### What This Unlocks
+
+- **Heterogeneous training at scale**: smaller nodes can participate using
+  tier slices without downloading or storing the full model.
+- **Safe tier mixing**: schema canonicalization and double-slicing protection
+  prevent mismatched checkpoints in the same run.
+- **Faster joins and lower bandwidth**: manifest-based loading pulls only
+  the needed files for each tier.
+- **Operational clarity**: the manifest provides an explicit source of truth
+  for which files define a tier, with optional hashes for integrity.
+
 ### Heterogeneous Training Example
 
 A training run with clients of varying capabilities:
@@ -187,6 +298,8 @@ cargo test -p psyche-modeling matformer_mlp_has_zero_tail_grads
 2. **No tensor parallelism**: MatFormer tiers > 0 require disabling tensor parallelism
 3. **No Mix'n'Match**: Per-layer width schedules are not yet implemented
 4. **Attention unchanged**: Only FFN width is elastic; attention heads remain fixed
+5. **Helper mode disabled**: Stochastic suffix sampling ("helper mode") is wired through the CLI
+   but currently hard-disabled until sparse alignment and rotation are finalized
 
 ## References
 

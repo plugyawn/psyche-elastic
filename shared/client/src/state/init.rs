@@ -274,6 +274,37 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[tokio::test]
+    async fn test_resolve_local_tier_without_base_dir() {
+        let base = temp_dir("matformer-tier-only");
+        let tier_dir = base.with_file_name(format!(
+            "{}-tier1",
+            base.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&tier_dir).unwrap();
+
+        std::fs::write(
+            tier_dir.join("config.json"),
+            r#"{"intermediate_size":512,"matformer_tier":1,"matformer_base_intermediate_size":1024}"#,
+        )
+        .unwrap();
+        std::fs::write(tier_dir.join("model.safetensors"), b"").unwrap();
+
+        let resolved =
+            resolve_matformer_local_repo_files(&base, 1, MatformerLoadStrategy::Auto)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(resolved.uses_sliced_checkpoint);
+        assert_eq!(resolved.matformer_tier_for_loading, 0);
+        assert_eq!(
+            resolved.checkpoint_path.as_deref(),
+            Some(tier_dir.to_string_lossy().as_ref())
+        );
+
+        std::fs::remove_dir_all(&tier_dir).ok();
+    }
+
     #[test]
     fn test_canonical_schema_hash_matches_full_and_sliced() {
         let parameter_names = vec!["model.layers.0.mlp.gate_proj.weight".to_string()];
@@ -676,11 +707,11 @@ async fn resolve_matformer_local_repo_files(
     strategy: MatformerLoadStrategy,
 ) -> Result<Option<ResolvedRepoFiles>, InitRunError> {
     let base_exists = tokio::fs::try_exists(base).await?;
-    if !base_exists {
-        return Ok(None);
-    }
 
     if tier == 0 {
+        if !base_exists {
+            return Ok(None);
+        }
         return Ok(Some(ResolvedRepoFiles {
             repo_files: list_local_repo_files(base).await?,
             uses_sliced_checkpoint: false,
@@ -692,7 +723,7 @@ async fn resolve_matformer_local_repo_files(
     }
 
     let manifest_path = base.join(MATFORMER_MANIFEST_NAME);
-    if tokio::fs::try_exists(&manifest_path).await? {
+    if base_exists && tokio::fs::try_exists(&manifest_path).await? {
         let manifest_contents = tokio::fs::read_to_string(&manifest_path).await?;
         let manifest: MatformerManifest = serde_json::from_str(&manifest_contents)
             .map_err(InitRunError::MatformerManifestParse)?;
