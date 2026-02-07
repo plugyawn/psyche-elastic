@@ -1,0 +1,45 @@
+# Experiment: L-only (4 tier-0 clients)
+# 10-minute training run with DisTrO, batch=64 for VRAM analysis
+
+run_id = "exp-L-only"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 30
+cooldown_time = 10
+rounds_per_epoch = 30
+max_round_train_time = 30
+round_witness_time = 5
+epoch_time = 700
+min_clients = 4
+init_min_clients = 4
+global_batch_size_start = 64
+global_batch_size_end = 64
+global_batch_size_warmup_tokens = 0
+verification_percent = 0
+witness_nodes = 1
+total_steps = 2000
+waiting_for_members_extra_time = 10
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 512
+cold_start_warmup_steps = 0
+data_location = { Local = "/opt/psyche/data/tinyshakespeare" }
+
+[model.LLM.checkpoint.Hub]
+repo_id = "plugyawn/nanogpt-124m-init"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 0.008
+warmup_steps = 50
+warmup_init_lr = 0.0
+total_steps = 2000
+final_lr = 0.0008
+
+[model.LLM.optimizer.Distro]
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true

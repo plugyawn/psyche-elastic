@@ -1,0 +1,46 @@
+# Production Heterogeneous Training Configuration
+# S, S, S, L setup: 3 small (tier-2, 25% FFN) + 1 large (tier-0, 100% FFN)
+# NanoGPT 20M model on Fineweb dataset
+
+run_id = "prod-heterogeneous-sssl"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 60                    # Wait for all 4 clients
+cooldown_time = 10
+rounds_per_epoch = 20
+max_round_train_time = 120          # Tier-0 needs more time
+round_witness_time = 10
+epoch_time = 600
+min_clients = 4
+init_min_clients = 4
+global_batch_size_start = 4         # 4 clients x 1 = 4 global batch
+global_batch_size_end = 4
+global_batch_size_warmup_tokens = 0
+verification_percent = 0
+witness_nodes = 1
+waiting_for_members_extra_time = 30
+total_steps = 1000                  # Adjust as needed
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 512
+data_location = { Local = "/opt/psyche/data/fineweb10B" }
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "PLACEHOLDER/nanogpt-20m-psyche"  # Replace with your HuggingFace username
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 4.0e-4
+warmup_steps = 50
+warmup_init_lr = 0.0
+total_steps = 1000
+final_lr = 4.0e-5
+
+[model.LLM.optimizer.Distro]
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true

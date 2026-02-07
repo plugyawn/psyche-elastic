@@ -1,0 +1,42 @@
+run_id = "test-nanogpt-small"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 5
+cooldown_time = 5
+rounds_per_epoch = 5
+max_round_train_time = 30
+round_witness_time = 2
+epoch_time = 60
+min_clients = 2
+init_min_clients = 2
+global_batch_size_start = 4
+global_batch_size_end = 4
+global_batch_size_warmup_tokens = 0
+verification_percent = 0
+witness_nodes = 1
+total_steps = 10
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 128
+data_location = "Dummy"
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "plugyawn/nanogpt-34m-init"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 1.0e-4
+warmup_steps = 2
+warmup_init_lr = 0.0
+total_steps = 10
+final_lr = 1.0e-5
+
+[model.LLM.optimizer.Distro]
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true

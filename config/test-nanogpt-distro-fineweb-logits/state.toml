@@ -1,0 +1,41 @@
+run_id = "nanogpt-distro-fineweb-logits"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 5
+cooldown_time = 5
+max_round_train_time = 30
+round_witness_time = 5
+global_batch_size_warmup_tokens = 0
+epoch_time = 120
+total_steps = 16
+min_clients = 1
+init_min_clients = 1
+global_batch_size_start = 1
+global_batch_size_end = 1
+verification_percent = 0
+witness_nodes = 0
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 64
+data_location = { Local = "./data/fineweb10B" }
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "./checkpoints/nanogpt-20m-init"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 4.0e-4
+warmup_steps = 10
+warmup_init_lr = 0.0
+total_steps = 16
+final_lr = 4.0e-5
+
+[model.LLM.optimizer.Distro]
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 8
+quantize_1bit = true
