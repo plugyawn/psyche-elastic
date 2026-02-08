@@ -1,7 +1,7 @@
 use anyhow::{Error, Result};
 use rand::{
+    distr::{weighted::WeightedIndex, Distribution},
     SeedableRng,
-    distr::{Distribution, weighted::WeightedIndex},
 };
 use tch::{Kind, Tensor};
 

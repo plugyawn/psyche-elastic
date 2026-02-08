@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::CLIENT_CONTAINER_PREFIX;
 use bollard::container::KillContainerOptions;
-use bollard::{Docker, container::LogsOptions};
+use bollard::{container::LogsOptions, Docker};
 use futures_util::StreamExt;
 use psyche_client::IntegrationTestLogMarker;
 use psyche_core::BatchId;

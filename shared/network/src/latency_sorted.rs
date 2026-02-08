@@ -1,8 +1,8 @@
-use futures_util::StreamExt;
 use futures_util::stream::{self};
+use futures_util::StreamExt;
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::HashAndFormat;
 use iroh_blobs::api::downloader::ContentDiscovery;
+use iroh_blobs::HashAndFormat;
 use n0_future::stream::Boxed;
 use std::time::Duration;
 use tracing::debug;

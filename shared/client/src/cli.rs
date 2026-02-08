@@ -131,12 +131,35 @@ pub struct TrainArgs {
     #[clap(long, env, default_value_t = 0)]
     pub same_batch_warmup_steps: u32,
 
+    /// Experimental: periodic same-batch calibration schedule.
+    ///
+    /// When enabled, clients fetch a canonical same batch at sparse intervals for
+    /// alignment diagnostics/guardrails.
+    #[clap(long, env, default_value_t = 0)]
+    pub same_batch_calibration_every_steps: u32,
+
+    /// First step eligible for periodic same-batch calibration.
+    #[clap(long, env, default_value_t = 1)]
+    pub same_batch_calibration_start_step: u32,
+
+    /// If true, calibration steps still run forward/backward, but distributed apply is skipped.
+    #[clap(long, env, default_value_t = true)]
+    pub same_batch_calibration_no_apply: bool,
+
     /// Experimental: number of local inner training updates per coordinator step on
     /// smaller MatFormer tiers (`tier > 0`).
     ///
     /// The global LR schedule remains keyed to the outer coordinator step (not inner-step count).
     #[clap(long, env, default_value_t = 1)]
     pub matformer_local_inner_steps: u32,
+
+    /// Proximal strength for downweighting tier>0 peer updates during apply.
+    #[clap(long, env, default_value_t = 0.0)]
+    pub matformer_prox_mu: f64,
+
+    /// If true, apply proximal downweighting only on MatFormer FFN prefix tensors.
+    #[clap(long, env, default_value_t = true)]
+    pub matformer_prox_prefix_only: bool,
 
     /// If provided, every shared gradient this client sees will be written to this directory.
     #[clap(long, env)]
@@ -150,6 +173,15 @@ pub struct TrainArgs {
 
     #[clap(long, env)]
     pub eval_task_max_docs: Option<usize>,
+
+    /// If > 0, run held-out validation loss evaluation during cooldown/checkpointing.
+    /// This uses validation data only (where supported) and logs `heldout_eval`.
+    #[clap(long, env, default_value_t = 0)]
+    pub heldout_eval_batches: usize,
+
+    /// Batch size (number of sequences) per held-out eval batch.
+    #[clap(long, env, default_value_t = 16)]
+    pub heldout_eval_batch_size: usize,
 
     // enable the execution of the model prompting task
     #[clap(long, env)]
@@ -266,12 +298,26 @@ pub struct TrainArgs {
     #[clap(long, env, value_enum, default_value_t = DistroApplyMode::Sign)]
     pub distro_apply_mode: DistroApplyMode,
 
+    /// DisTrO aggregation mode.
+    /// - legacy: existing sparse aggregation path
+    /// - diloco-lite: weighted aggregation + outer momentum + trust-region scaling
+    #[clap(long, env, value_enum, default_value_t = DistroAggregateMode::Legacy)]
+    pub distro_aggregate_mode: DistroAggregateMode,
+
     /// DisTrO transmitted value mode.
     /// - auto: preserves existing behavior
     /// - sign: force sign-valued sparse payloads
     /// - raw: force raw sparse payloads (disables 1-bit sign quantization)
     #[clap(long, env, value_enum, default_value_t = DistroValueMode::Auto)]
     pub distro_value_mode: DistroValueMode,
+
+    /// Enable apply-side sign error-feedback memory (default off).
+    #[clap(long, env, default_value_t = false)]
+    pub distro_error_feedback: bool,
+
+    /// Apply-side sign error-feedback residual decay in [0,1].
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_ef_decay: f64,
 
     /// Experimental: apply updates from only one trainer "slot" per step.
     ///
@@ -322,6 +368,26 @@ pub struct TrainArgs {
         default_value_t = DistroRawMissingSidecarPolicy::WarnOff
     )]
     pub distro_raw_missing_sidecar_policy: DistroRawMissingSidecarPolicy,
+
+    /// DiLoCo-lite outer momentum (EMA beta) on the server-side aggregation path.
+    #[clap(long, env, default_value_t = 0.9)]
+    pub distro_diloco_outer_momentum: f64,
+
+    /// DiLoCo-lite multiplier on the aggregated direction before optimizer step.
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_diloco_outer_lr_multiplier: f64,
+
+    /// DiLoCo-lite trust-region target expressed as update-norm / parameter-norm.
+    #[clap(long, env, default_value_t = 0.02)]
+    pub distro_diloco_trust_region_target: f64,
+
+    /// DiLoCo-lite clamp factor for trust-region scaling.
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_diloco_trust_region_max_scale: f64,
+
+    /// DiLoCo-lite cap on per-peer aggregation weight as multiple of mean peer weight.
+    #[clap(long, env, default_value_t = 2.0)]
+    pub distro_diloco_tier_weight_cap: f64,
 
     /// Tier-0 suffix gate warmup steps (0 = disabled).
     ///
@@ -424,6 +490,10 @@ pub struct TrainArgs {
     #[clap(long, env)]
     pub matformer_distillation_min_teacher_topk_mass: Option<f64>,
 
+    /// Alias for KD confidence gating threshold (maps to min teacher top-k mass).
+    #[clap(long, env)]
+    pub matformer_distill_confidence_threshold: Option<f64>,
+
     /// Optional KD scaling to avoid "KD vanishes when the teacher is high-entropy".
     ///
     /// If > 0, KD is multiplied by:
@@ -457,6 +527,13 @@ pub enum MatformerDistillationCombineMode {
 pub enum DistroApplyMode {
     Sign,
     Raw,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum DistroAggregateMode {
+    Legacy,
+    DilocoLite,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

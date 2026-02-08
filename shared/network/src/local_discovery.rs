@@ -1,4 +1,4 @@
-use futures_util::{Stream, stream};
+use futures_util::{stream, Stream};
 use iroh::discovery::{DiscoveryError, DiscoveryItem};
 use iroh::endpoint_info::{EndpointData, EndpointInfo};
 use iroh::{EndpointId, TransportAddr};

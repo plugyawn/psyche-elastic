@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bollard::{
-    Docker,
     container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions},
     image::{CreateImageOptions, ListImagesOptions},
     secret::HostConfig,
+    Docker,
 };
 use futures_util::StreamExt;
 
@@ -183,9 +183,7 @@ async fn create_chaos_action_with_command(
     let network_name = "test_psyche-test-network";
     let host_config = HostConfig {
         network_mode: Some(network_name.to_string()),
-        binds: Some(vec![
-            "/var/run/docker.sock:/var/run/docker.sock".to_string(),
-        ]),
+        binds: Some(vec!["/var/run/docker.sock:/var/run/docker.sock".to_string()]),
         ..Default::default()
     };
 

@@ -1,7 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use itertools::Itertools;
-use tch::{Device, utils::has_mps};
+use tch::{utils::has_mps, Device};
 #[cfg(test)]
 use tch::{Kind, Tensor};
 use thiserror::Error;
@@ -242,11 +242,9 @@ mod tests {
                     .unwrap(),
                 Devices::Cuda((0..tch::Cuda::device_count() as usize).collect())
             );
-            assert!(
-                format!("cuda:{}", tch::Cuda::device_count())
-                    .parse::<Devices>()
-                    .is_err()
-            );
+            assert!(format!("cuda:{}", tch::Cuda::device_count())
+                .parse::<Devices>()
+                .is_err());
         } else {
             assert!(matches!(
                 "cuda".parse::<Devices>(),

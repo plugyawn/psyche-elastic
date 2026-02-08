@@ -2,8 +2,8 @@ use anchor_client::solana_sdk::native_token::lamports_to_sol;
 use anyhow::Result;
 use clap::Args;
 
-use crate::SolanaBackend;
 use crate::instructions;
+use crate::SolanaBackend;
 
 #[derive(Debug, Clone, Args)]
 #[command()]

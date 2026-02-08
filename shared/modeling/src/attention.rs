@@ -2,7 +2,7 @@ use crate::{
     AttentionImplementation, ColumnParallelLinear, Communicator, RoPECache, RowParallelLinear,
 };
 use std::sync::Arc;
-use tch::{Device, Tensor, nn::Module};
+use tch::{nn::Module, Device, Tensor};
 
 fn repeat_kv(hidden_states: &Tensor, n_rep: i64) -> Tensor {
     let (batch, num_key_value_heads, slen, head_dim) = hidden_states.size4().unwrap();
@@ -17,9 +17,6 @@ fn repeat_kv(hidden_states: &Tensor, n_rep: i64) -> Tensor {
 
     hidden_states.reshape([batch, num_key_value_heads * n_rep, slen, head_dim])
 }
-
-
-
 
 #[allow(dead_code)]
 pub fn create_cu_seqlens(lengths: &[Vec<i32>], device: Device) -> (Tensor, i32) {

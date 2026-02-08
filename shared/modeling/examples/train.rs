@@ -5,14 +5,15 @@ use psyche_core::{
     OptimizerDefinition, Shuffle,
 };
 use psyche_data_provider::{
-    DataProvider, LengthKnownDataProvider, LocalDataProvider, PreprocessedDataProvider, Split,
-    TokenizedDataProvider, download_model_repo_sync,
+    download_model_repo_sync, DataProvider, LengthKnownDataProvider, LocalDataProvider,
+    PreprocessedDataProvider, Split, TokenizedDataProvider,
 };
 use psyche_modeling::{
-    AttentionImplementation, Batch, BatchData, BatchDataCPU, CausalLM, CommunicatorId,
-    DataParallel, Devices, LocalTrainer, ModelLoadError, ParallelModels, Trainer,
     auto_model_for_causal_lm_from_pretrained,
     metrics::{MetricsConfig, MetricsRecorder, StepMetrics},
+    AttentionImplementation, Batch, BatchData, BatchDataCPU, CausalLM, CommunicatorId,
+    DataParallel, Devices, DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig,
+    DistroRawConfig, DistroValueMode, LocalTrainer, ModelLoadError, ParallelModels, Trainer,
 };
 use psyche_network::AuthenticatableIdentity;
 use psyche_tui::{logging, setup_ctrl_c};
@@ -339,6 +340,13 @@ async fn main() -> Result<()> {
                             model,
                             schedule.into(),
                             optimizer,
+                            DistroApplyMode::Sign,
+                            DistroAggregateMode::Legacy,
+                            DistroValueMode::Auto,
+                            DistroRawConfig::default(),
+                            DistroDilocoLiteConfig::default(),
+                            psyche_modeling::DistroSignErrorFeedbackConfig::default(),
+                            psyche_modeling::DistroTierProxConfig::default(),
                             args.micro_batch,
                             None,
                             args.grad_accum_in_fp32,
@@ -361,6 +369,13 @@ async fn main() -> Result<()> {
                             },
                             schedule.into(),
                             optimizer,
+                            DistroApplyMode::Sign,
+                            DistroAggregateMode::Legacy,
+                            DistroValueMode::Auto,
+                            DistroRawConfig::default(),
+                            DistroDilocoLiteConfig::default(),
+                            psyche_modeling::DistroSignErrorFeedbackConfig::default(),
+                            psyche_modeling::DistroTierProxConfig::default(),
                             args.micro_batch,
                             None,
                             args.grad_accum_in_fp32,
@@ -441,6 +456,13 @@ async fn main() -> Result<()> {
                         },
                         schedule.into(),
                         optimizer,
+                        DistroApplyMode::Sign,
+                        DistroAggregateMode::Legacy,
+                        DistroValueMode::Auto,
+                        DistroRawConfig::default(),
+                        DistroDilocoLiteConfig::default(),
+                        psyche_modeling::DistroSignErrorFeedbackConfig::default(),
+                        psyche_modeling::DistroTierProxConfig::default(),
                         args.micro_batch,
                         None,
                         args.grad_accum_in_fp32,
@@ -520,6 +542,9 @@ async fn main() -> Result<()> {
                             vec![],
                             prev_distro_results.clone(),
                             cancel.clone(),
+                            false, // produce_teacher_logits
+                            32,    // teacher_logits_top_k
+                            None,  // teacher_targets (distillation)
                         )
                         .unwrap();
                     if !distro || step > args.start_step {

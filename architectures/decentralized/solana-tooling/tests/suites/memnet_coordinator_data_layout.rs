@@ -1,5 +1,5 @@
 use psyche_solana_coordinator::{
-    CoordinatorAccount, coordinator_account_from_bytes,
+    coordinator_account_from_bytes, CoordinatorAccount,
 };
 
 #[tokio::test]

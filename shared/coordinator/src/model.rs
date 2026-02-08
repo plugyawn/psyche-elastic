@@ -1,8 +1,8 @@
-use crate::{SOLANA_MAX_STRING_LEN, coordinator::SOLANA_MAX_URL_STRING_LEN};
+use crate::{coordinator::SOLANA_MAX_URL_STRING_LEN, SOLANA_MAX_STRING_LEN};
 
 use anchor_lang::{
-    AnchorDeserialize, AnchorSerialize, InitSpace,
     prelude::{borsh, msg},
+    AnchorDeserialize, AnchorSerialize, InitSpace,
 };
 use bytemuck::{Zeroable, ZeroableInOption};
 use psyche_core::{

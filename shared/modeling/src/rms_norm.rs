@@ -1,6 +1,6 @@
 use tch::{
-    Kind, Tensor,
     nn::{self, Module},
+    Kind, Tensor,
 };
 
 #[derive(Debug)]
@@ -85,14 +85,13 @@ mod tests {
         let out_base = norm_base.forward(&xs);
         let out_scaled = norm_scaled.forward(&xs);
 
-        // out_scaled should be approximately gain * out_base
-        // (weights are both initialized to ones, so they should match)
-        let ratio = (&out_scaled / &out_base).mean(Kind::Float).double_value(&[]);
+        // out_scaled should be approximately gain * out_base.
+        // Avoid divide-by-zero: compare directly with an abs error tolerance.
+        let expected = &out_base * gain;
+        let max_abs_err = (&out_scaled - expected).abs().max().double_value(&[]);
         assert!(
-            (ratio - gain).abs() < 0.01,
-            "expected ratio ~{}, got {}",
-            gain,
-            ratio
+            max_abs_err < 1e-3,
+            "expected out_scaled ~= gain*out_base (gain={gain}), max_abs_err={max_abs_err}"
         );
     }
 }

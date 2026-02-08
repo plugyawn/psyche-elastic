@@ -1,6 +1,6 @@
 use anchor_lang::{AnchorDeserialize, AnchorSerialize};
 use bytemuck::Zeroable;
-use psyche_coordinator::{Coordinator, HealthChecks, model};
+use psyche_coordinator::{model, Coordinator, HealthChecks};
 use psyche_core::NodeIdentity;
 use psyche_network::{
     AuthenticatableIdentity, EndpointId, FromSignedBytesError, PublicKey, SecretKey, SignedMessage,
@@ -30,7 +30,9 @@ pub enum ClientToServerMessage {
         run_id: String,
         capabilities: ClientCapabilities,
     },
-    Schema { schema: ModelSchemaInfo },
+    Schema {
+        schema: ModelSchemaInfo,
+    },
     Witness(Box<OpportunisticData>),
     HealthCheck(HealthChecks<ClientId>),
     Checkpoint(model::HubRepo),

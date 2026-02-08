@@ -1,5 +1,5 @@
-use crate::{LengthKnownDataProvider, TokenizedData, traits::TokenizedDataProvider};
-use anyhow::{Result, bail};
+use crate::{traits::TokenizedDataProvider, LengthKnownDataProvider, TokenizedData};
+use anyhow::{bail, Result};
 use psyche_core::{BatchId, TokenSize};
 
 pub struct DummyDataProvider {

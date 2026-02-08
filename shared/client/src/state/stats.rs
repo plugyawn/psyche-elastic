@@ -1,7 +1,7 @@
-use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use nvml_wrapper::Nvml;
 use psyche_coordinator::{
-    Coordinator, MAX_TOKENS_TO_SEND, WitnessEvalResult, WitnessMetadata, model,
+    model, Coordinator, WitnessEvalResult, WitnessMetadata, MAX_TOKENS_TO_SEND,
 };
 use psyche_core::{BoundedQueue, FixedVec, LearningRateSchedule, NodeIdentity};
 use psyche_metrics::ClientMetrics;
@@ -400,10 +400,8 @@ impl StatsLogger {
                         for i in 0..device_count {
                             if let Ok(gpu) = nvml.device_by_index(i) {
                                 if let Ok(util) = gpu.utilization_rates() {
-                                    log_data.insert(
-                                        format!("gpu/{i}/usage_percent"),
-                                        util.gpu as f64,
-                                    );
+                                    log_data
+                                        .insert(format!("gpu/{i}/usage_percent"), util.gpu as f64);
                                     log_data.insert(
                                         format!("gpu/{i}/memory_util_percent"),
                                         util.memory as f64,
@@ -479,7 +477,11 @@ fn perplexity(loss: f32) -> f32 {
 }
 
 fn no_nan(val: f32, replacement: f32) -> f32 {
-    if val.is_nan() { replacement } else { val }
+    if val.is_nan() {
+        replacement
+    } else {
+        val
+    }
 }
 
 fn token_batch_size<T: NodeIdentity>(state: &Coordinator<T>) -> u32 {

@@ -249,8 +249,8 @@ impl MetricsRecorder {
             return Ok(());
         }
 
-        let metrics =
-            StepMetrics::new(step, loss, lr).with_norms_from_model(model, self.config.detailed_norms);
+        let metrics = StepMetrics::new(step, loss, lr)
+            .with_norms_from_model(model, self.config.detailed_norms);
 
         self.record(&metrics)
     }

@@ -5,13 +5,13 @@ use anchor_client::solana_sdk::pubkey::Pubkey;
 use anchor_client::solana_sdk::signature::Keypair;
 use anchor_client::solana_sdk::signer::Signer;
 use anchor_client::solana_sdk::system_instruction;
-use anyhow::Result;
 use anyhow::bail;
+use anyhow::Result;
 use clap::Args;
 use psyche_coordinator::SOLANA_RUN_ID_MAX_LEN;
 
-use crate::SolanaBackend;
 use crate::instructions;
+use crate::SolanaBackend;
 
 #[derive(Debug, Clone, Args)]
 #[command()]

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::{collections::HashMap, sync::Arc};
 use tch::{
-    Device, TchError, Tensor,
     nn::{self, Module, Shard},
+    Device, TchError, Tensor,
 };
 use torch_sys::IntList;
 
@@ -13,7 +13,7 @@ pub struct ParallelismConfig {
 }
 
 #[cfg(feature = "parallelism")]
-use tch::{CNCCL, CStore, ReduceOpType};
+use tch::{CStore, ReduceOpType, CNCCL};
 
 use crate::CausalLM;
 #[cfg(feature = "python")]
@@ -552,7 +552,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{set_suggested_env_vars, set_torch_rng_seed};
     use std::sync::{Arc, Barrier, Mutex};
-    use tch::{Device, Kind, Tensor, nn::VarStore};
+    use tch::{nn::VarStore, Device, Kind, Tensor};
 
     fn run_parallel_test<F>(world_size: usize, test_fn: F)
     where

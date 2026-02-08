@@ -1,6 +1,6 @@
 use crate::{
-    DataProviderTcpClient, DummyDataProvider, LocalDataProvider, PreprocessedDataProvider,
-    TokenizedData, TokenizedDataProvider, WeightedDataProvider, http::HttpDataProvider,
+    http::HttpDataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
+    PreprocessedDataProvider, TokenizedData, TokenizedDataProvider, WeightedDataProvider,
 };
 
 use psyche_core::BatchId;

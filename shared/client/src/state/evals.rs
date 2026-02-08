@@ -2,7 +2,7 @@ use futures::future::try_join_all;
 use psyche_core::RunningAverage;
 use psyche_eval::{EvalTaskOptions, Task};
 use psyche_modeling::Trainer;
-use rand::{Rng, seq::SliceRandom};
+use rand::{seq::SliceRandom, Rng};
 use std::sync::Arc;
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -11,7 +11,7 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, error, info, span, trace};
+use tracing::{error, info, span, trace, Level};
 
 use crate::state::{prompt::PromptTask, prompt_texts::get_prompt_texts};
 pub const PROMPT_TASK_NAME: &str = "Prompt";

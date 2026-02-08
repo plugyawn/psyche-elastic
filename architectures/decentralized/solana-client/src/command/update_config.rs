@@ -1,15 +1,16 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use psyche_coordinator::{
-    CoordinatorConfig, CoordinatorProgress, get_data_index_for_step,
+    get_data_index_for_step,
     model::{Checkpoint, Model},
+    CoordinatorConfig, CoordinatorProgress,
 };
 use psyche_solana_treasurer::logic::RunUpdateParams;
 use serde::{Deserialize, Serialize};
 
-use crate::{SolanaBackend, instructions};
+use crate::{instructions, SolanaBackend};
 
 #[derive(Debug, Clone, Args)]
 #[command()]

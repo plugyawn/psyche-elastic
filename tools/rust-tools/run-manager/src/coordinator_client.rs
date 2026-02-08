@@ -2,7 +2,7 @@ use anchor_client::solana_sdk::pubkey::Pubkey;
 use anchor_lang::AccountDeserialize;
 use anyhow::{Context, Result};
 use psyche_solana_coordinator::{
-    CoordinatorInstance, coordinator_account_from_bytes, find_coordinator_instance,
+    coordinator_account_from_bytes, find_coordinator_instance, CoordinatorInstance,
 };
 use solana_client::rpc_client::RpcClient;
 use tracing::info;

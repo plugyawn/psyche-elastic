@@ -1,4 +1,4 @@
-use safetensors::{SafeTensors, slice::TensorIndexer};
+use safetensors::{slice::TensorIndexer, SafeTensors};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
@@ -7,12 +7,21 @@ use std::{
     path::PathBuf,
 };
 use tch::{
-    Device, Kind, Tensor,
     nn::{Shard, VarStore},
+    Device, Kind, Tensor,
 };
 use thiserror::Error;
+use tracing::warn;
 
 const MAX_SAFETENSOR_PART_SIZE: usize = 1024 * 1024 * 1024 * 5;
+
+pub(crate) fn is_allowed_missing_checkpoint_variable(name: &str) -> bool {
+    // Backwards-compatible allowlist for newly-added MatFormer stabilization params.
+    // These are safe to initialize to their defaults when loading older checkpoints.
+    name.ends_with(".matformer_resid_gate_mlp_log")
+        || name.ends_with(".matformer_resid_gate_attn_log")
+        || name.ends_with(".matformer_suffix_gate_logit")
+}
 
 #[derive(Error, Debug)]
 pub enum LoadSafetensorsError {
@@ -113,7 +122,29 @@ pub fn load_safetensors_into_variables(
         }
     }
     if !unmatched.is_empty() {
-        return Err(LoadSafetensorsError::MissingVariables(unmatched));
+        let mut allowed_missing: HashSet<String> = HashSet::new();
+        let mut real_missing: HashSet<String> = HashSet::new();
+        for name in unmatched {
+            if is_allowed_missing_checkpoint_variable(&name) {
+                allowed_missing.insert(name);
+            } else {
+                real_missing.insert(name);
+            }
+        }
+
+        if !allowed_missing.is_empty() {
+            let mut examples: Vec<String> = allowed_missing.iter().take(5).cloned().collect();
+            examples.sort();
+            warn!(
+                count = allowed_missing.len(),
+                examples = ?examples,
+                "Checkpoint missing optional MatFormer residual-gate parameters; using initialized defaults"
+            );
+        }
+
+        if !real_missing.is_empty() {
+            return Err(LoadSafetensorsError::MissingVariables(real_missing));
+        }
     }
     Ok(())
 }

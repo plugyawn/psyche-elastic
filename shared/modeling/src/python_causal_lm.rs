@@ -1,7 +1,7 @@
 use crate::{
-    AttentionImplementation, AutoConfig, CausalLM, Communicator, EosToks, ModelConfig,
-    ModelLoadError, ParallelismConfig, PretrainedSource, StableVariableIterator, Variable,
-    device_utils::DevicePytorchStr,
+    device_utils::DevicePytorchStr, AttentionImplementation, AutoConfig, CausalLM, Communicator,
+    EosToks, ModelConfig, ModelLoadError, ParallelismConfig, PretrainedSource,
+    StableVariableIterator, Variable,
 };
 
 use crate::{DeepseekConfig, LlamaConfig};

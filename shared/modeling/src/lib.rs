@@ -35,25 +35,31 @@ pub use auto_config::{
     AttentionImplementation, AutoConfig, ModelConfig, ModelLoadError, PretrainedSource,
 };
 pub use auto_model::auto_model_for_causal_lm_from_pretrained;
-pub use auto_tokenizer::{AutoTokenizerError, auto_tokenizer};
+pub use auto_tokenizer::{auto_tokenizer, AutoTokenizerError};
 pub use batcher::Batcher;
 pub use causal_language_model::{
-    CausalLM, CausalLanguageModel, EosToks, LanguageModelBuilder, LanguageModelConfig,
-    LanguageModelForward, TeacherLogitTargets, kd_loss,
+    kd_loss_topk, CausalLM, CausalLanguageModel, EosToks, LanguageModelBuilder,
+    LanguageModelConfig, LanguageModelForward, TeacherLogitTargets,
 };
-pub use device_utils::{Devices, get_optimal_devices};
-pub use distro::{CompressDCT, Distro, DistroResult, TransformDCT};
-pub use dummy::{DummyModel, get_dummy_parameters};
+pub use device_utils::{get_optimal_devices, Devices};
+pub use distro::{
+    CompressDCT, Distro, DistroNormSidecar, DistroPeerMetadata, DistroResult, TransformDCT,
+};
+pub use dummy::{get_dummy_parameters, DummyModel};
 pub use fp32_gradient_accumulator::Fp32GradientAccumulator;
 pub use matformer_c2::{
-    DistillationConfig, MatformerStabilizationConfig, NormTierGainConfig, ResidualScaleConfig,
-    SuffixGateConfig, SuffixGateSchedule, distillation_beta,
+    distillation_beta, DistillationCombineMode, DistillationConfig, MatformerStabilizationConfig,
+    NormTierGainConfig, ResidualScaleConfig, SuffixGateConfig, SuffixGateSchedule,
 };
 pub use models::*;
-pub use optimizer::Optimizer;
+pub use optimizer::{
+    DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig,
+    DistroRawMissingSidecarPolicy, DistroRawNormMode, DistroSignErrorFeedbackConfig,
+    DistroTierProxConfig, DistroValueMode, Optimizer,
+};
 pub use parallelism::{
-    AllReduce, ColumnParallelLinear, Communicator, CommunicatorId, CudaSynchronize,
-    ParallelExpandHeads, ParallelismConfig, ReduceType, RowParallelLinear, unsharded_cpu_variables,
+    unsharded_cpu_variables, AllReduce, ColumnParallelLinear, Communicator, CommunicatorId,
+    CudaSynchronize, ParallelExpandHeads, ParallelismConfig, ReduceType, RowParallelLinear,
 };
 #[cfg(feature = "python")]
 pub use python_causal_lm::{PythonCausalLM, PythonCausalLMError, PythonModelConfig};
@@ -66,10 +72,10 @@ pub use python_distributed_trainer::{
     NopBarrier, PythonDistributedTrainer, PythonDistributedTrainerError,
 };
 pub use rms_norm::RMSNorm;
-pub use rope::{RoPECache, RoPEConfig, RoPEType, default_rope, rotate_half, yarn_get_mscale};
+pub use rope::{default_rope, rotate_half, yarn_get_mscale, RoPECache, RoPEConfig, RoPEType};
 pub use safetensor_utils::{
-    LoadSafetensorsError, SaveSafetensorsError, load_safetensors_into_variables,
-    save_tensors_into_safetensors,
+    load_safetensors_into_variables, save_tensors_into_safetensors, LoadSafetensorsError,
+    SaveSafetensorsError,
 };
 pub use sampling::{LogitsProcessor, Sampling};
 pub use token_output_stream::TokenOutputStream;

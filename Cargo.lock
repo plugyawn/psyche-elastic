@@ -6941,6 +6941,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "half",
  "hex",
  "hf-hub",
  "iroh",

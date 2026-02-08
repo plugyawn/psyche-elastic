@@ -29,6 +29,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use tch::IndexOp;
 use tch::{
     nn::{self, Module},
     Device, Kind, Tensor,
@@ -52,6 +53,14 @@ pub struct NanoGPTConfig {
     // Core dimensions
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Optional base (tier-0) intermediate size for tier-sliced checkpoints.
+    ///
+    /// For sliced checkpoints, `intermediate_size` is already the active width (e.g. 512),
+    /// while `matformer_base_intermediate_size` stores the original tier-0 width (e.g. 1024).
+    /// This allows tier-conditioned stabilization knobs (norm gain / residual scaling) to be
+    /// computed consistently across sliced and universal checkpoints.
+    #[serde(default)]
+    pub matformer_base_intermediate_size: Option<usize>,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -167,10 +176,29 @@ impl NanoGPTConfig {
         self.hidden_size / self.num_attention_heads
     }
 
+    fn matformer_intermediate_sizes(&self) -> (i64, i64) {
+        let base = self
+            .matformer_base_intermediate_size
+            .unwrap_or(self.intermediate_size) as i64;
+        let active = match self.matformer_tier {
+            // For tier-sliced checkpoints we force `matformer_tier=0` (effective tier) to avoid
+            // double-slicing, but `intermediate_size` is already the active width. Use it.
+            0 => self.intermediate_size as i64,
+            tier => {
+                let divisor = 1_i64
+                    .checked_shl(tier as u32)
+                    .expect("matformer_tier too large");
+                base / divisor
+            }
+        };
+        (base, active)
+    }
+
     pub fn dummy() -> Self {
         Self {
             hidden_size: 64,
             intermediate_size: 128,
+            matformer_base_intermediate_size: None,
             vocab_size: 1000,
             num_hidden_layers: 2,
             num_attention_heads: 4,
@@ -230,6 +258,7 @@ impl NanoGPTConfig {
 impl ModelConfig for NanoGPTConfig {
     fn get_parameter_names(&self) -> Vec<String> {
         let mut variables = Vec::new();
+        let gates_cfg = self.matformer_stabilization.residual_gates.as_ref();
 
         // Embeddings
         variables.push("model.embed_tokens.weight".to_string());
@@ -290,6 +319,24 @@ impl ModelConfig for NanoGPTConfig {
             // Norms
             variables.push(format!("{}.input_layernorm.weight", prefix));
             variables.push(format!("{}.post_attention_layernorm.weight", prefix));
+
+            if let Some(cfg) = gates_cfg {
+                if cfg.apply_to_mlp {
+                    variables.push(format!("{}.matformer_resid_gate_mlp_log", prefix));
+                }
+                if cfg.apply_to_attn {
+                    variables.push(format!("{}.matformer_resid_gate_attn_log", prefix));
+                }
+            }
+
+            if self
+                .matformer_stabilization
+                .suffix_gate
+                .as_ref()
+                .is_some_and(|cfg| cfg.learnable)
+            {
+                variables.push(format!("{}.mlp.matformer_suffix_gate_logit", prefix));
+            }
 
             // Residual lambdas
             if self.use_x0_lambdas {
@@ -378,6 +425,11 @@ struct NanoGPTMlp {
     matformer_hidden_size: Option<i64>,
     /// Full intermediate size for helper index generation
     full_intermediate_size: i64,
+    /// Base (tier-0) intermediate size, even when this model is loaded from a sliced checkpoint.
+    ///
+    /// This is used to avoid applying tier-0 suffix gating logic to already-sliced models
+    /// (which have no "missing" suffix capacity relative to the base model).
+    matformer_base_intermediate_size: i64,
     /// Layer index for deterministic helper sampling
     layer_idx: usize,
     /// Helper config (None = no helper mode)
@@ -389,6 +441,9 @@ struct NanoGPTMlp {
     width_rescale_mlp_output: bool,
     width_rescale_power: f64,
     suffix_gate: Option<SuffixGateConfig>,
+    /// Optional learnable scalar for suffix gate: `sigmoid(logit)` in (0,1).
+    /// Present on all tiers when enabled to keep model schema consistent.
+    suffix_gate_logit: Option<Tensor>,
 }
 
 impl NanoGPTMlp {
@@ -396,6 +451,7 @@ impl NanoGPTMlp {
         vs: nn::Path,
         hidden_size: i64,
         intermediate_size: i64,
+        matformer_base_intermediate_size: i64,
         bias: bool,
         comm: Option<Arc<Communicator>>,
         use_relu_squared: bool,
@@ -437,10 +493,32 @@ impl NanoGPTMlp {
             if config.helper_fraction > 0.0 {
                 eprintln!(
                     "[NanoGPT MLP layer {}] Helper mode enabled: fraction={}, rotation_interval={}, matformer_hidden={}",
-                    layer_idx, config.helper_fraction, config.rotation_interval, matformer_hidden_size.unwrap_or(intermediate_size)
+                    layer_idx,
+                    config.helper_fraction,
+                    config.rotation_interval,
+                    matformer_hidden_size.unwrap_or(intermediate_size)
                 );
             }
         }
+
+        let suffix_gate_logit = match matformer_stabilization.suffix_gate.as_ref() {
+            Some(cfg) if cfg.learnable => {
+                // Keep the gate logit in fp32 even when the rest of the model is fp16/bf16.
+                //
+                // This avoids "stuck" gates where the LR step (e.g. 1e-3) is smaller than the
+                // fp16 ULP at larger logits (e.g. logit=2 => ULP~1.95e-3).
+                let mut logit = vs.var(
+                    "matformer_suffix_gate_logit",
+                    &[1],
+                    nn::Init::Const(cfg.learnable_init_logit),
+                );
+                if logit.kind() != Kind::Float {
+                    logit.set_data(&logit.to_kind(Kind::Float));
+                }
+                Some(logit)
+            }
+            _ => None,
+        };
 
         Self {
             gate_proj: ColumnParallelLinear::new(
@@ -470,6 +548,7 @@ impl NanoGPTMlp {
             use_relu_squared,
             matformer_hidden_size,
             full_intermediate_size: intermediate_size,
+            matformer_base_intermediate_size,
             layer_idx,
             helper_config,
             current_round,
@@ -477,6 +556,7 @@ impl NanoGPTMlp {
             width_rescale_mlp_output: matformer_stabilization.width_rescale_mlp_output,
             width_rescale_power: matformer_stabilization.width_rescale_power,
             suffix_gate: matformer_stabilization.suffix_gate,
+            suffix_gate_logit,
         }
     }
 }
@@ -497,11 +577,42 @@ impl Module for NanoGPTMlp {
             // Suffix gate only supported for non-TP tier-0.
             if !self.is_tensor_parallel {
                 if let Some(ref cfg) = self.suffix_gate {
+                    // Do not apply the suffix gate to already-sliced checkpoints: they have no
+                    // "missing suffix" relative to the base model. We still "touch" the learnable
+                    // scalar (if present) later so gradients are defined and DisTrO does not panic.
+                    let can_gate =
+                        self.matformer_base_intermediate_size == self.full_intermediate_size;
+                    if !can_gate {
+                        let mut out = self.down_proj.forward(&hidden);
+                        if let Some(ref logit) = self.suffix_gate_logit {
+                            // Ensure grad is defined (but zero) on tiers where the gate is inactive.
+                            let out_kind = out.kind();
+                            let noop = logit.sum(Kind::Float).to_kind(out_kind) * 0.0;
+                            out = out + noop;
+                        }
+                        return out;
+                    }
+
                     let step = crate::matformer_c2::current_step();
                     let beta = crate::matformer_c2::suffix_beta(cfg, step);
-                    if beta < 1.0 {
-                        let prefix_len =
-                            crate::matformer_c2::gate_prefix_len(self.full_intermediate_size, cfg.gate_tier);
+                    let suffix_alpha = if cfg.learnable {
+                        let alpha = self
+                            .suffix_gate_logit
+                            .as_ref()
+                            .expect("suffix_gate_logit must be present when learnable=true")
+                            .sigmoid();
+                        // Cast to activation dtype to avoid promoting large tensors to fp32.
+                        Some(alpha.to_kind(hidden.kind()))
+                    } else {
+                        None
+                    };
+                    // If the gate is learnable, always take the split path so gradients can flow
+                    // through `suffix_alpha` even after the schedule saturates (beta=1).
+                    if beta < 1.0 || suffix_alpha.is_some() {
+                        let prefix_len = crate::matformer_c2::gate_prefix_len(
+                            self.full_intermediate_size,
+                            cfg.gate_tier,
+                        );
                         let suffix_len = self.full_intermediate_size - prefix_len;
                         if suffix_len > 0 {
                             let hidden_prefix = hidden.narrow(2, 0, prefix_len);
@@ -511,10 +622,14 @@ impl Module for NanoGPTMlp {
                             let down_w_suffix =
                                 self.down_proj.linear.ws.narrow(1, prefix_len, suffix_len);
 
-                            let mut out = hidden_prefix.matmul(&down_w_prefix.transpose(0, 1))
-                                + hidden_suffix
-                                    .matmul(&down_w_suffix.transpose(0, 1))
-                                    .multiply_scalar(beta);
+                            let prefix_out = hidden_prefix.matmul(&down_w_prefix.transpose(0, 1));
+                            let suffix_out = hidden_suffix.matmul(&down_w_suffix.transpose(0, 1));
+                            let mut out = if let Some(alpha) = suffix_alpha {
+                                // beta is a schedule scalar; alpha is a learned scalar tensor.
+                                prefix_out + suffix_out * alpha.multiply_scalar(beta)
+                            } else {
+                                prefix_out + suffix_out.multiply_scalar(beta)
+                            };
                             if let Some(ref bias) = self.down_proj.linear.bs {
                                 out = out + bias;
                             }
@@ -524,7 +639,15 @@ impl Module for NanoGPTMlp {
                 }
             }
 
-            return self.down_proj.forward(&hidden);
+            let mut out = self.down_proj.forward(&hidden);
+            if let Some(ref logit) = self.suffix_gate_logit {
+                // When the gate is configured but the split path isn't taken, make sure the
+                // logit still participates (no-op) so its grad is defined.
+                let out_kind = out.kind();
+                let noop = logit.sum(Kind::Float).to_kind(out_kind) * 0.0;
+                out = out + noop;
+            }
+            return out;
         };
 
         // MatFormer: use narrowed weights for sliced FFN
@@ -591,6 +714,11 @@ impl Module for NanoGPTMlp {
                     out = out.multiply_scalar(scale);
                 }
             }
+            if let Some(ref logit) = self.suffix_gate_logit {
+                let out_kind = out.kind();
+                let noop = logit.sum(Kind::Float).to_kind(out_kind) * 0.0;
+                out = out + noop;
+            }
             if let Some(ref bias) = self.down_proj.linear.bs {
                 out + bias
             } else {
@@ -638,6 +766,11 @@ impl Module for NanoGPTMlp {
                 if (scale - 1.0).abs() > f64::EPSILON {
                     out = out.multiply_scalar(scale);
                 }
+            }
+            if let Some(ref logit) = self.suffix_gate_logit {
+                let out_kind = out.kind();
+                let noop = logit.sum(Kind::Float).to_kind(out_kind) * 0.0;
+                out = out + noop;
             }
             if let Some(ref bias) = self.down_proj.linear.bs {
                 out + bias
@@ -1056,6 +1189,16 @@ struct NanoGPTBlock {
     attn: NanoGPTAttention,
     post_attn_norm: RMSNorm,
     mlp: NanoGPTMlp,
+    /// Per-tier residual scaling for MLP output (plain f64, NOT in VarStore).
+    residual_scale_mlp: Option<f64>,
+    /// Per-tier residual scaling for attention output (plain f64, NOT in VarStore).
+    residual_scale_attn: Option<f64>,
+    /// Learnable per-tier residual gate for MLP output: `alpha = exp(log_alpha[tier])`.
+    residual_gate_mlp_log: Option<Tensor>,
+    /// Learnable per-tier residual gate for attention output: `alpha = exp(log_alpha[tier])`.
+    residual_gate_attn_log: Option<Tensor>,
+    /// Tier index used to select a gate element (derived from base/active widths; works for slices).
+    residual_gate_tier_idx: i64,
     // Residual enhancement
     x0_lambda: Option<Tensor>,
     resid_lambda: Option<Tensor>,
@@ -1075,6 +1218,106 @@ impl NanoGPTBlock {
     ) -> Self {
         let hidden_size = config.hidden_size as i64;
         let intermediate_size = config.intermediate_size as i64;
+
+        // Compute MatFormer width ratio for stabilization knobs.
+        // Note: for tier-sliced checkpoints, `matformer_tier` is forced to 0 (effective tier),
+        // but `matformer_base_intermediate_size` lets us still compute (active/base) correctly.
+        let (full_intermediate, active_intermediate) = config.matformer_intermediate_sizes();
+        let residual_gate_tier_idx =
+            crate::matformer_c2::infer_matformer_tier_from_intermediate_sizes(
+                full_intermediate,
+                active_intermediate,
+            ) as i64;
+
+        // Compute tier gain for RMSNorm (if configured)
+        let norm_tier_gain = config
+            .matformer_stabilization
+            .norm_tier_gain
+            .as_ref()
+            .and_then(|cfg| {
+                let gain = crate::matformer_c2::residual_scale_factor(
+                    full_intermediate,
+                    active_intermediate,
+                    cfg.power,
+                );
+                if (gain - 1.0).abs() > f64::EPSILON {
+                    Some(gain)
+                } else {
+                    None
+                }
+            });
+
+        // Compute per-tier residual scaling factors
+        let (residual_scale_mlp, residual_scale_attn) =
+            match &config.matformer_stabilization.residual_scale {
+                Some(rs_cfg) => {
+                    let mlp_alpha = if rs_cfg.apply_to_mlp {
+                        let alpha = crate::matformer_c2::residual_scale_factor(
+                            full_intermediate,
+                            active_intermediate,
+                            rs_cfg.power,
+                        );
+                        if (alpha - 1.0).abs() > f64::EPSILON {
+                            Some(alpha)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    // Attention residual scaling: uses the same width ratio.
+                    // Typically disabled (attention is full-width), but available for experiments.
+                    let attn_alpha = if rs_cfg.apply_to_attn {
+                        let alpha = crate::matformer_c2::residual_scale_factor(
+                            full_intermediate,
+                            active_intermediate,
+                            rs_cfg.power,
+                        );
+                        if (alpha - 1.0).abs() > f64::EPSILON {
+                            Some(alpha)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (mlp_alpha, attn_alpha)
+                }
+                None => (None, None),
+            };
+
+        // Learnable per-tier residual gates (log-space, exp in forward).
+        // These are real parameters (included in DisTrO updates).
+        let (residual_gate_mlp_log, residual_gate_attn_log) =
+            match &config.matformer_stabilization.residual_gates {
+                Some(cfg) => {
+                    let init_logs =
+                        crate::matformer_c2::residual_gates_init_log_alphas(cfg.init_power);
+                    let mk_gate = |name: &str| {
+                        let mut gate = vs.var(
+                            name,
+                            &[crate::matformer_c2::RESIDUAL_GATES_MAX_TIERS],
+                            nn::Init::Const(0.0),
+                        );
+                        if cfg.init_power != 0.0 {
+                            let init = Tensor::f_from_slice(&init_logs)
+                                .expect("failed to build residual gate init tensor")
+                                .to_device(gate.device())
+                                .to_kind(gate.kind());
+                            gate.f_copy_(&init).expect("failed to init residual gate");
+                        }
+                        gate
+                    };
+                    let mlp_gate = cfg
+                        .apply_to_mlp
+                        .then(|| mk_gate("matformer_resid_gate_mlp_log"));
+                    let attn_gate = cfg
+                        .apply_to_attn
+                        .then(|| mk_gate("matformer_resid_gate_attn_log"));
+                    (mlp_gate, attn_gate)
+                }
+                None => (None, None),
+            };
 
         // x0_lambda - learnable scalar for x0 residual contribution
         let x0_lambda = if config.use_x0_lambdas {
@@ -1098,22 +1341,29 @@ impl NanoGPTBlock {
         };
 
         Self {
-            input_norm: RMSNorm::new(&vs / "input_layernorm", hidden_size, config.rms_norm_eps),
+            input_norm: RMSNorm::new_with_tier_gain(
+                &vs / "input_layernorm",
+                hidden_size,
+                config.rms_norm_eps,
+                norm_tier_gain,
+            ),
             attn: NanoGPTAttention::new(
                 &vs / "self_attn",
                 config,
                 attn_implementation,
                 comm.clone(),
             ),
-            post_attn_norm: RMSNorm::new(
+            post_attn_norm: RMSNorm::new_with_tier_gain(
                 &vs / "post_attention_layernorm",
                 hidden_size,
                 config.rms_norm_eps,
+                norm_tier_gain,
             ),
             mlp: NanoGPTMlp::new(
                 &vs / "mlp",
                 hidden_size,
                 intermediate_size,
+                full_intermediate,
                 config.mlp_bias,
                 comm,
                 config.use_relu_squared_mlp,
@@ -1123,6 +1373,11 @@ impl NanoGPTBlock {
                 current_round,
                 config.matformer_stabilization.clone(),
             ),
+            residual_scale_mlp,
+            residual_scale_attn,
+            residual_gate_mlp_log,
+            residual_gate_attn_log,
+            residual_gate_tier_idx,
             x0_lambda,
             resid_lambda,
             smear_gate,
@@ -1139,18 +1394,34 @@ impl NanoGPTBlock {
         rope_cache: &RoPECache,
     ) -> Tensor {
         // Pre-norm + attention + residual
-        let h = self.attn.forward(
+        let attn_out = self.attn.forward(
             &self.input_norm.forward(x),
             value_embed_sum,
             position_ids,
             sequence_lengths,
             rope_cache,
         );
-        let x = x + h;
+        let mut attn_scaled = match self.residual_scale_attn {
+            Some(alpha) => attn_out * alpha,
+            None => attn_out,
+        };
+        if let Some(ref log_gates) = self.residual_gate_attn_log {
+            let alpha = log_gates.i(self.residual_gate_tier_idx).exp();
+            attn_scaled = attn_scaled * alpha;
+        }
+        let x = x + attn_scaled;
 
         // Pre-norm + MLP + residual
-        let h = self.mlp.forward(&self.post_attn_norm.forward(&x));
-        let mut out = x + h;
+        let mlp_out = self.mlp.forward(&self.post_attn_norm.forward(&x));
+        let mut mlp_scaled = match self.residual_scale_mlp {
+            Some(alpha) => mlp_out * alpha,
+            None => mlp_out,
+        };
+        if let Some(ref log_gates) = self.residual_gate_mlp_log {
+            let alpha = log_gates.i(self.residual_gate_tier_idx).exp();
+            mlp_scaled = mlp_scaled * alpha;
+        }
+        let mut out = x + mlp_scaled;
 
         // Apply resid_lambda
         if let Some(ref resid_lambda) = self.resid_lambda {
@@ -1239,10 +1510,28 @@ impl NanoGPT {
             .collect();
 
         // Final layer norm
-        let ln_f = RMSNorm::new(
+        let (full_intermediate, active_intermediate) = config.matformer_intermediate_sizes();
+        let ln_f_tier_gain = config
+            .matformer_stabilization
+            .norm_tier_gain
+            .as_ref()
+            .and_then(|cfg| {
+                let gain = crate::matformer_c2::residual_scale_factor(
+                    full_intermediate,
+                    active_intermediate,
+                    cfg.power,
+                );
+                if (gain - 1.0).abs() > f64::EPSILON {
+                    Some(gain)
+                } else {
+                    None
+                }
+            });
+        let ln_f = RMSNorm::new_with_tier_gain(
             &model_vs / "norm",
             config.hidden_size as i64,
             config.rms_norm_eps,
+            ln_f_tier_gain,
         );
 
         // RoPE cache - combine rope_scaling with half_truncate setting
@@ -1436,6 +1725,31 @@ impl NanoGPTForCausalLM {
         )
     }
 
+    /// Load a pretrained model while applying caller-provided config overrides.
+    ///
+    /// This is useful for runtime MatFormer knobs (suffix gate / distillation scheduling)
+    /// that should not require editing a checkpoint's `config.json`.
+    pub fn from_pretrained_with_config_overrides<F: FnOnce(&mut NanoGPTConfig)>(
+        source: &PretrainedSource<NanoGPTConfig>,
+        kind: Option<Kind>,
+        attn_implementation: Option<AttentionImplementation>,
+        device: Option<Device>,
+        tensor_parallelism_world: Option<(CommunicatorId, usize, usize)>,
+        override_max_position_embeddings: Option<usize>,
+        config_overrides: F,
+    ) -> Result<Self, ModelLoadError> {
+        Self::from_builder_with_config_overrides(
+            Self::builder,
+            source,
+            kind,
+            attn_implementation,
+            device,
+            tensor_parallelism_world,
+            override_max_position_embeddings,
+            config_overrides,
+        )
+    }
+
     pub fn from_pretrained_with_matformer_tier(
         source: &PretrainedSource<NanoGPTConfig>,
         kind: Option<Kind>,
@@ -1568,6 +1882,40 @@ mod tests {
     }
 
     #[test]
+    fn test_nanogpt_residual_gate_mlp_gets_gradient() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let mut config = NanoGPTConfig::dummy();
+        config.matformer_tier = 1;
+        config.matformer_stabilization.residual_gates =
+            Some(crate::matformer_c2::ResidualGatesConfig {
+                apply_to_mlp: true,
+                apply_to_attn: false,
+                init_power: 0.0,
+            });
+
+        let model = NanoGPT::new(vs.root(), &config, AttentionImplementation::Eager, None);
+        let input = Tensor::randint(
+            config.vocab_size as i64,
+            [2, 16],
+            (Kind::Int64, Device::Cpu),
+        );
+        let output = model.forward(&input, None, None, true);
+        let loss = output.sum(Kind::Float);
+        loss.backward();
+
+        // Tier-1 => width ratio is 2 => inferred tier index is 1.
+        let vars = vs.variables();
+        let gate = vars
+            .get("model.layers.0.matformer_resid_gate_mlp_log")
+            .expect("missing matformer_resid_gate_mlp_log variable")
+            .shallow_clone();
+        let grad = gate.grad();
+        assert!(grad.defined(), "expected gate grad to be defined");
+        let g = grad.double_value(&[1]);
+        assert!(g.abs() > 0.0, "expected non-zero grad for tier index 1");
+    }
+
+    #[test]
     fn test_nanogpt_mlp_relu_squared() {
         use std::sync::{atomic::AtomicU64, Arc};
         let vs = nn::VarStore::new(Device::Cpu);
@@ -1577,6 +1925,7 @@ mod tests {
         let mlp_silu = NanoGPTMlp::new(
             vs.root() / "silu",
             64,
+            128,
             128,
             false,
             None,
@@ -1592,6 +1941,7 @@ mod tests {
         let mlp_relu = NanoGPTMlp::new(
             vs.root() / "relu",
             64,
+            128,
             128,
             false,
             None,
@@ -2147,7 +2497,9 @@ mod tests {
         let improvement = (initial_loss - final_loss) / initial_loss;
         eprintln!(
             "Residual enhancement test: initial loss = {:.4}, final loss = {:.4}, improvement = {:.1}%",
-            initial_loss, final_loss, improvement * 100.0
+            initial_loss,
+            final_loss,
+            improvement * 100.0
         );
 
         assert!(
@@ -2460,7 +2812,9 @@ mod tests {
         let improvement = (initial_loss - final_loss) / initial_loss;
         eprintln!(
             "Learnable attn scale test: initial loss = {:.4}, final loss = {:.4}, improvement = {:.1}%",
-            initial_loss, final_loss, improvement * 100.0
+            initial_loss,
+            final_loss,
+            improvement * 100.0
         );
 
         assert!(
@@ -2680,6 +3034,7 @@ mod tests {
         let config = NanoGPTConfig {
             hidden_size: 768,
             intermediate_size: 3072,
+            matformer_base_intermediate_size: None,
             vocab_size: 50257,
             num_hidden_layers: 11,
             num_attention_heads: 6,
@@ -2828,6 +3183,7 @@ mod tests {
             vs.root(),
             hidden_size,
             intermediate_size,
+            intermediate_size,
             false, // no bias
             None,  // no comm
             false, // SiLU, not ReLU²
@@ -2886,6 +3242,114 @@ mod tests {
     }
 
     #[test]
+    fn test_nanogpt_suffix_gate_logit_grad_defined_on_matformer_tier() {
+        use std::sync::{atomic::AtomicU64, Arc};
+        let vs = nn::VarStore::new(Device::Cpu);
+        let current_round = Arc::new(AtomicU64::new(0));
+
+        // Configure a learnable suffix gate, but construct a MatFormer-tier MLP path
+        // (matformer_hidden_size = Some). The forward path should "touch" the logit as a no-op
+        // so its gradient is defined (zero) and DisTrO won't panic on `.grad()`.
+        let mut stab = MatformerStabilizationConfig::default();
+        stab.suffix_gate = Some(SuffixGateConfig {
+            gate_tier: 1,
+            start_step: 0,
+            warmup_steps: 0,
+            schedule: crate::matformer_c2::SuffixGateSchedule::Linear,
+            learnable: true,
+            learnable_init_logit: 0.0,
+        });
+
+        let mlp = NanoGPTMlp::new(
+            vs.root(),
+            1, // hidden_size
+            2, // intermediate_size
+            2, // base_intermediate_size
+            false,
+            None,
+            false,
+            Some(1), // MatFormer tier path
+            0,
+            None,
+            current_round,
+            stab,
+        );
+
+        let x = Tensor::ones([1, 1, 1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let y = mlp.forward(&x);
+        y.sum(Kind::Float).backward();
+
+        let logit = mlp
+            .suffix_gate_logit
+            .as_ref()
+            .expect("expected matformer_suffix_gate_logit to exist");
+        let grad = logit.grad(); // should not panic (must be defined)
+        let gabs = grad.abs().max().double_value(&[]);
+        assert!(gabs <= 1e-8, "expected near-zero grad, got {}", gabs);
+    }
+
+    #[test]
+    fn test_nanogpt_suffix_gate_logit_gets_gradient_on_tier0_full() {
+        use std::sync::{atomic::AtomicU64, Arc};
+        let vs = nn::VarStore::new(Device::Cpu);
+        let current_round = Arc::new(AtomicU64::new(0));
+
+        let mut stab = MatformerStabilizationConfig::default();
+        stab.suffix_gate = Some(SuffixGateConfig {
+            gate_tier: 1,
+            start_step: 0,
+            warmup_steps: 0,
+            schedule: crate::matformer_c2::SuffixGateSchedule::Linear,
+            learnable: true,
+            learnable_init_logit: 0.0,
+        });
+
+        let mut mlp = NanoGPTMlp::new(
+            vs.root(),
+            1, // hidden_size
+            2, // intermediate_size
+            2, // base_intermediate_size (full model, so suffix gate is active)
+            false,
+            None,
+            false,
+            None, // tier-0 path
+            0,
+            None,
+            current_round,
+            stab,
+        );
+
+        // Make the branch outputs deterministic and nonzero so the gate logit gets a gradient.
+        {
+            let _no_grad = tch::no_grad_guard();
+            mlp.gate_proj
+                .linear
+                .ws
+                .copy_(&Tensor::ones_like(&mlp.gate_proj.linear.ws));
+            mlp.up_proj
+                .linear
+                .ws
+                .copy_(&Tensor::ones_like(&mlp.up_proj.linear.ws));
+            mlp.down_proj
+                .linear
+                .ws
+                .copy_(&Tensor::ones_like(&mlp.down_proj.linear.ws));
+        }
+
+        let x = Tensor::ones([1, 1, 1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let y = mlp.forward(&x);
+        y.sum(Kind::Float).backward();
+
+        let logit = mlp
+            .suffix_gate_logit
+            .as_ref()
+            .expect("expected matformer_suffix_gate_logit to exist");
+        let grad = logit.grad();
+        let gsum = grad.abs().sum(Kind::Float).double_value(&[]);
+        assert!(gsum > 0.0, "expected non-zero grad for gate logit");
+    }
+
+    #[test]
     #[should_panic(expected = "mlp_bias is not supported with MatFormer tiers")]
     fn test_nanogpt_matformer_mlp_bias_not_supported() {
         use std::sync::{atomic::AtomicU64, Arc};
@@ -2898,6 +3362,7 @@ mod tests {
         let _ = NanoGPTMlp::new(
             vs.root(),
             hidden_size,
+            intermediate_size,
             intermediate_size,
             true,  // bias enabled
             None,  // no comm
@@ -2923,6 +3388,7 @@ mod tests {
         let mlp = NanoGPTMlp::new(
             vs.root(),
             hidden_size,
+            intermediate_size,
             intermediate_size,
             false,
             None,
@@ -2960,6 +3426,7 @@ mod tests {
         let config = NanoGPTConfig {
             hidden_size: 64,
             intermediate_size: 128,
+            matformer_base_intermediate_size: None,
             vocab_size: 100,
             num_hidden_layers: 2,
             num_attention_heads: 4,
@@ -3080,6 +3547,7 @@ mod tests {
         let config = NanoGPTConfig {
             hidden_size: 64,
             intermediate_size: 128,
+            matformer_base_intermediate_size: None,
             vocab_size: 100,
             num_hidden_layers: 2,
             num_attention_heads: 4,
@@ -3200,6 +3668,7 @@ mod tests {
         let config = NanoGPTConfig {
             hidden_size: 32,
             intermediate_size: 64,
+            matformer_base_intermediate_size: None,
             vocab_size: 50,
             num_hidden_layers: 1,
             num_attention_heads: 2,

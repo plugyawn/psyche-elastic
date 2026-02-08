@@ -1,5 +1,5 @@
 use anchor_client::solana_sdk::pubkey::Pubkey;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

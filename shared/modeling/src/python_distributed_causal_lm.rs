@@ -1,17 +1,17 @@
 use crate::{
+    python_causal_lm::{PythonCausalLMError, PythonModelConfig, WrappedPythonCausalLM},
     AttentionImplementation, Batch, BatchData, BatchDataGPU, CausalLM, Communicator,
     ParallelismConfig, PretrainedSource, PythonCausalLM, ReduceType, StableVariableIterator,
-    python_causal_lm::{PythonCausalLMError, PythonModelConfig, WrappedPythonCausalLM},
 };
 
 use psyche_core::BatchId;
-use pyo3::{PyErr, PyResult, Python, prelude::*, types::PyDict};
+use pyo3::{prelude::*, types::PyDict, PyErr, PyResult, Python};
 use pyo3_tch::PyTensor;
 use std::{
     process::{Child, Command},
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     thread::JoinHandle,
     time::Duration,
@@ -405,7 +405,8 @@ impl CausalLM for PythonDistributedCausalLM {
         if world_size > 1 {
             trace!(
                 "Checking batch padding: original batch size = {}, world_size = {}",
-                original_batch_size, world_size
+                original_batch_size,
+                world_size
             );
 
             batch.pad(world_size);
@@ -414,7 +415,9 @@ impl CausalLM for PythonDistributedCausalLM {
             if new_size != original_batch_size {
                 trace!(
                     "FSDP: Padded batch from {} to {} samples (world_size={})",
-                    original_batch_size, new_size, world_size
+                    original_batch_size,
+                    new_size,
+                    world_size
                 );
             }
         }

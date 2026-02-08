@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use psyche_core::{BatchId, Shuffle, TokenSize};
 use psyche_data_provider::{
-    TokenizedDataProvider, WeightedDataProvider, WeightedHttpProvidersConfig,
     http::{FileURLs, HttpDataProvider},
+    TokenizedDataProvider, WeightedDataProvider, WeightedHttpProvidersConfig,
 };
 use std::path::PathBuf;
 use tokenizers::Tokenizer;

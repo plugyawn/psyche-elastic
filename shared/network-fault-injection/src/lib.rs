@@ -425,8 +425,9 @@ impl FaultConfigBuilder {
     ///
     /// Returns None if no fault injection is configured.
     pub fn build(self) -> Option<FaultConfig> {
-        let has_faults =
-            self.latency_str.is_some() || self.packet_loss.is_some() || self.bandwidth_limit.is_some();
+        let has_faults = self.latency_str.is_some()
+            || self.packet_loss.is_some()
+            || self.bandwidth_limit.is_some();
 
         if !has_faults {
             return None;
@@ -499,7 +500,11 @@ mod tests {
         // Sample should be within range
         for _ in 0..100 {
             let sample = config.sample(&mut rng);
-            assert!(sample >= 90 && sample <= 110, "Sample {} out of range", sample);
+            assert!(
+                sample >= 90 && sample <= 110,
+                "Sample {} out of range",
+                sample
+            );
         }
     }
 
@@ -559,7 +564,11 @@ mod tests {
         let elapsed = start.elapsed().as_millis();
 
         assert_eq!(latency, 10);
-        assert!(elapsed >= 10 && elapsed < 50, "Elapsed {} not in range", elapsed);
+        assert!(
+            elapsed >= 10 && elapsed < 50,
+            "Elapsed {} not in range",
+            elapsed
+        );
         assert_eq!(config.metrics().latency_events(), 1);
     }
 
@@ -578,9 +587,7 @@ mod tests {
         assert!(config.unwrap().is_active());
 
         // With packet loss
-        let config = FaultConfigBuilder::new()
-            .packet_loss(Some(0.1))
-            .build();
+        let config = FaultConfigBuilder::new().packet_loss(Some(0.1)).build();
         assert!(config.is_some());
     }
 }

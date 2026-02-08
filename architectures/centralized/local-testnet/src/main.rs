@@ -1,18 +1,136 @@
-use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser};
+use anyhow::{bail, Context, Result};
+use clap::{ArgAction, Parser, ValueEnum};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
 use time::macros::format_description;
+use time::OffsetDateTime;
 
 #[derive(Parser, Debug)]
 struct Args {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum GateScheduleArg {
+    Linear,
+    Cosine,
+}
+
+impl GateScheduleArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            GateScheduleArg::Linear => "linear",
+            GateScheduleArg::Cosine => "cosine",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistillationCombineModeArg {
+    Mix,
+    Add,
+}
+
+impl DistillationCombineModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistillationCombineModeArg::Mix => "mix",
+            DistillationCombineModeArg::Add => "add",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistroApplyModeArg {
+    Sign,
+    Raw,
+}
+
+impl DistroApplyModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroApplyModeArg::Sign => "sign",
+            DistroApplyModeArg::Raw => "raw",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistroAggregateModeArg {
+    Legacy,
+    DilocoLite,
+}
+
+impl DistroAggregateModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroAggregateModeArg::Legacy => "legacy",
+            DistroAggregateModeArg::DilocoLite => "diloco-lite",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistroValueModeArg {
+    Auto,
+    Sign,
+    Raw,
+}
+
+impl DistroValueModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroValueModeArg::Auto => "auto",
+            DistroValueModeArg::Sign => "sign",
+            DistroValueModeArg::Raw => "raw",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistroRawNormModeArg {
+    Off,
+    MatchPreL2,
+    MatchSignEquivalent,
+    MatchSignEquivalentNnz,
+}
+
+impl DistroRawNormModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroRawNormModeArg::Off => "off",
+            DistroRawNormModeArg::MatchPreL2 => "match-pre-l2",
+            DistroRawNormModeArg::MatchSignEquivalent => "match-sign-equivalent",
+            DistroRawNormModeArg::MatchSignEquivalentNnz => "match-sign-equivalent-nnz",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[clap(rename_all = "kebab-case")]
+enum DistroRawMissingSidecarPolicyArg {
+    WarnOff,
+    Fail,
+}
+
+impl DistroRawMissingSidecarPolicyArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DistroRawMissingSidecarPolicyArg::WarnOff => "warn-off",
+            DistroRawMissingSidecarPolicyArg::Fail => "fail",
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)] // it's only used for generating the docs correctly.
@@ -115,6 +233,116 @@ struct StartArgs {
     #[clap(long, value_delimiter = ',')]
     client_matformer_helper_rotation_intervals: Vec<u64>,
 
+    /// DisTrO apply mode for spawned clients.
+    #[clap(long, value_enum, default_value_t = DistroApplyModeArg::Sign)]
+    distro_apply_mode: DistroApplyModeArg,
+
+    /// DisTrO aggregation mode for spawned clients.
+    #[clap(long, value_enum, default_value_t = DistroAggregateModeArg::Legacy)]
+    distro_aggregate_mode: DistroAggregateModeArg,
+
+    /// DisTrO transmitted value mode for spawned clients.
+    #[clap(long, value_enum, default_value_t = DistroValueModeArg::Auto)]
+    distro_value_mode: DistroValueModeArg,
+
+    /// Experimental: pass `--distro-apply-only-trainer-index` to spawned clients.
+    ///
+    /// Use this to run "L+S minus S (no redistribution)" style controls: keep multiple
+    /// clients connected (so batch partitioning is unchanged), but apply only one trainer slot.
+    #[clap(long)]
+    client_distro_apply_only_trainer_index: Option<u16>,
+
+    /// Enable raw-v2 scaling guardrails.
+    #[clap(long, default_value_t = false)]
+    distro_raw_v2_enabled: bool,
+
+    /// Raw-v2 normalization mode.
+    #[clap(long, value_enum, default_value_t = DistroRawNormModeArg::Off)]
+    distro_raw_norm_mode: DistroRawNormModeArg,
+
+    /// Raw-v2 extra scale multiplier.
+    #[clap(long, default_value_t = 1.0)]
+    distro_raw_scale_multiplier: f64,
+
+    /// Raw-v2 max scale cap.
+    ///
+    /// For match-sign-equivalent, early training often needs very large scale factors.
+    /// Keep this high and use abs clipping as the main guardrail.
+    #[clap(long, default_value_t = 1.0e9)]
+    distro_raw_scale_max: f64,
+
+    /// Raw-v2 abs clip multiplier.
+    #[clap(long, default_value_t = 8.0)]
+    distro_raw_abs_clip_mult: f64,
+
+    /// Raw-v2 sign-equivalent target multiplier used by `match-sign-equivalent`.
+    #[clap(long, default_value_t = 1.0)]
+    distro_raw_sign_equiv_mult: f64,
+
+    /// Raw-v2 sidecar policy.
+    #[clap(long, value_enum, default_value_t = DistroRawMissingSidecarPolicyArg::WarnOff)]
+    distro_raw_missing_sidecar_policy: DistroRawMissingSidecarPolicyArg,
+
+    /// DiLoCo-lite outer momentum beta.
+    #[clap(long, default_value_t = 0.9)]
+    distro_diloco_outer_momentum: f64,
+
+    /// DiLoCo-lite outer LR multiplier.
+    #[clap(long, default_value_t = 1.0)]
+    distro_diloco_outer_lr_multiplier: f64,
+
+    /// DiLoCo-lite trust-region target.
+    #[clap(long, default_value_t = 0.02)]
+    distro_diloco_trust_region_target: f64,
+
+    /// DiLoCo-lite trust-region max scale clamp.
+    #[clap(long, default_value_t = 1.0)]
+    distro_diloco_trust_region_max_scale: f64,
+
+    /// DiLoCo-lite per-peer tier weight cap.
+    #[clap(long, default_value_t = 2.0)]
+    distro_diloco_tier_weight_cap: f64,
+
+    /// Tier-0 suffix gate warmup steps (0 = disabled).
+    #[clap(long, default_value_t = 0)]
+    matformer_suffix_gate_warmup_steps: u32,
+
+    /// Tier-0 suffix gate start step (used only if warmup steps > 0).
+    #[clap(long, default_value_t = 0)]
+    matformer_suffix_gate_start_step: u32,
+
+    /// Which MatFormer tier's prefix defines the "core" width for the suffix gate.
+    ///
+    /// Example: for tiers 0 and 1, set this to 1 (core = intermediate/2).
+    #[clap(long, default_value_t = 1)]
+    matformer_suffix_gate_tier: u8,
+
+    /// Suffix gate schedule shape for ramping beta (linear or cosine).
+    #[clap(long, value_enum, default_value_t = GateScheduleArg::Linear)]
+    matformer_suffix_gate_schedule: GateScheduleArg,
+
+    /// If true, additionally scale the scheduled suffix beta by a learned per-layer scalar
+    /// `sigmoid(logit)` (in (0,1)).
+    #[clap(long, default_value_t = false)]
+    matformer_suffix_gate_learnable: bool,
+
+    /// Initial logit for the learned suffix gate scalar (higher => closer to 1.0).
+    #[clap(long, default_value_t = 6.0)]
+    matformer_suffix_gate_learnable_init_logit: f64,
+
+    /// Convenience: coupled "prefix-only warmup" + "ramp" schedule for both suffix gate and distillation.
+    ///
+    /// Passed through to clients as:
+    /// - `--matformer-synergy-phase-a-steps`
+    /// - `--matformer-synergy-ramp-steps`
+    #[clap(long, default_value_t = 0)]
+    matformer_synergy_phase_a_steps: u32,
+
+    /// Coupled ramp length for `--matformer-synergy-phase-a-steps`.
+    /// Must be > 0 when synergy is enabled.
+    #[clap(long, default_value_t = 0)]
+    matformer_synergy_ramp_steps: u32,
+
     /// MatFormer distillation beta_max (0 = disabled). Set > 0 to enable distillation.
     #[clap(long, default_value_t = 0.0)]
     matformer_distillation_beta_max: f64,
@@ -128,12 +356,35 @@ struct StartArgs {
     matformer_distillation_start_step: u32,
 
     /// MatFormer distillation top-k logits.
-    #[clap(long, default_value_t = 32)]
+    #[clap(long, default_value_t = 64)]
     matformer_distillation_top_k: u16,
 
     /// MatFormer distillation temperature.
-    #[clap(long, default_value_t = 2.0)]
+    #[clap(long, default_value_t = 1.0)]
     matformer_distillation_temperature: f32,
+
+    /// Distillation objective combine mode.
+    #[clap(long, value_enum, default_value_t = DistillationCombineModeArg::Add)]
+    matformer_distillation_combine_mode: DistillationCombineModeArg,
+
+    /// If set, distill only on the last N token positions (teacher transmits only that suffix).
+    /// Must be >= 2.
+    #[clap(long)]
+    matformer_distillation_logits_to_keep: Option<u16>,
+
+    /// Optional confidence gate: if mean teacher top-k mass is below this threshold,
+    /// disable KD for that step (β_eff = 0).
+    #[clap(long)]
+    matformer_distillation_min_teacher_topk_mass: Option<f64>,
+
+    /// Optional KD scaling to avoid "KD vanishes when the teacher is high-entropy".
+    ///
+    /// If > 0, KD is multiplied by:
+    /// `1 / clamp(mean_q_topk_mass, floor, 1.0)`.
+    ///
+    /// Set to 0 to disable.
+    #[clap(long, default_value_t = 0.05)]
+    matformer_distillation_kd_q_topk_mass_floor: f64,
 
     /// What discovery mode to use for spawned clients (`local` or `n0`).
     #[clap(long, default_value = "local")]
@@ -206,6 +457,16 @@ struct StartArgs {
     /// Random seed for fault injection (for reproducibility)
     #[clap(long, env)]
     fault_seed: Option<u64>,
+
+    /// Align per-step batch assignment across separate runs (stable client ordering + deterministic per-round seeds).
+    ///
+    /// This reduces "false regressions" when comparing loss curves between two experiment runs.
+    #[clap(long, default_value_t = false)]
+    aligned_batches: bool,
+
+    /// Optional base seed for `--aligned-batches` (if omitted, derived from coordinator `run_id`).
+    #[clap(long)]
+    aligned_batches_seed: Option<u64>,
 }
 
 fn validate_num_clients(s: &str) -> Result<usize> {
@@ -418,6 +679,12 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(&log_dir).unwrap();
                 server_cmd.push_str(&format!(" --write-log {log_dir}/server.txt"));
             }
+            if start_args.aligned_batches {
+                server_cmd.push_str(" --aligned-batches");
+                if let Some(seed) = start_args.aligned_batches_seed {
+                    server_cmd.push_str(&format!(" --aligned-batches-seed {seed}"));
+                }
+            }
 
             println!("starting server: {server_cmd:?}");
 
@@ -464,7 +731,7 @@ fn main() -> Result<()> {
 
             // Start clients
             for i in 2..=start_args.num_clients + 1 {
-                start_client(&start_args, i, &run_id, true, start_time);
+                start_client(&start_args, i, &run_id, true, start_time)?;
             }
 
             // // Attach to tmux session
@@ -512,7 +779,7 @@ fn main() -> Result<()> {
                                 .and_then(|s| s.success().then_some(()))
                                 .expect("Failed to kill client");
                             // restart client
-                            start_client(&start_args, kill, &run_id, false, start_time);
+                            start_client(&start_args, kill, &run_id, false, start_time)?;
                         }
                     }
 
@@ -561,7 +828,12 @@ fn ensure_tmux_available() -> Result<()> {
     }
 }
 
-fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run_id: &str) -> Result<()> {
+fn run_headless(
+    args: &StartArgs,
+    state_path: &PathBuf,
+    data_path: &PathBuf,
+    run_id: &str,
+) -> Result<()> {
     if let Some(exit_after) = args.headless_exit_after_secs {
         if exit_after == 0 {
             bail!("--headless-exit-after-secs must be > 0");
@@ -590,19 +862,21 @@ fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run
     }
 
     let start_time = OffsetDateTime::now_utc();
-    let mut processes = ChildProcesses { children: Vec::new() };
+    let mut processes = ChildProcesses {
+        children: Vec::new(),
+    };
 
     // Start server
     let mut server_cmd = Command::new(&server_bin);
-    server_cmd
-        .env("RUST_LOG", &args.log);
+    server_cmd.env("RUST_LOG", &args.log);
 
     // Propagate DYLD_LIBRARY_PATH for torch library loading on macOS
     if let Ok(dyld_path) = std::env::var("DYLD_LIBRARY_PATH") {
         server_cmd.env("DYLD_LIBRARY_PATH", dyld_path);
     }
 
-    server_cmd.args([
+    server_cmd
+        .args([
             "run",
             "--state",
             state_path.to_str().unwrap(),
@@ -627,6 +901,12 @@ fn run_headless(args: &StartArgs, state_path: &PathBuf, data_path: &PathBuf, run
         );
         std::fs::create_dir_all(&log_dir)?;
         server_cmd.args(["--write-log", &format!("{log_dir}/server.txt")]);
+    }
+    if args.aligned_batches {
+        server_cmd.arg("--aligned-batches");
+        if let Some(seed) = args.aligned_batches_seed {
+            server_cmd.args(["--aligned-batches-seed", &seed.to_string()]);
+        }
     }
 
     println!("starting server: {server_cmd:?}");
@@ -732,30 +1012,99 @@ fn spawn_client_headless(
         cmd.env("DYLD_LIBRARY_PATH", dyld_path);
     }
 
-    cmd
-        .args([
-            "train",
-            "--run-id",
-            run_id,
-            "--server-addr",
-            &format!("localhost:{}", args.server_port),
-            "--logs",
-            logs_mode,
-            "--device",
-            &args.client_device,
-            "--matformer-tier",
-            &matformer_tier.to_string(),
-            "--matformer-helper-fraction",
-            &helper_fraction.to_string(),
-            "--matformer-helper-rotation-interval",
-            &rotation_interval.to_string(),
-            "--iroh-discovery",
-            &args.client_iroh_discovery,
-            "--iroh-relay",
-            &args.client_iroh_relay,
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    cmd.args([
+        "train",
+        "--run-id",
+        run_id,
+        "--server-addr",
+        &format!("localhost:{}", args.server_port),
+        "--logs",
+        logs_mode,
+        "--device",
+        &args.client_device,
+        "--matformer-tier",
+        &matformer_tier.to_string(),
+        "--matformer-helper-fraction",
+        &helper_fraction.to_string(),
+        "--matformer-helper-rotation-interval",
+        &rotation_interval.to_string(),
+        "--iroh-discovery",
+        &args.client_iroh_discovery,
+        "--iroh-relay",
+        &args.client_iroh_relay,
+        "--distro-apply-mode",
+        args.distro_apply_mode.as_str(),
+        "--distro-aggregate-mode",
+        args.distro_aggregate_mode.as_str(),
+        "--distro-value-mode",
+        args.distro_value_mode.as_str(),
+        "--distro-raw-norm-mode",
+        args.distro_raw_norm_mode.as_str(),
+        "--distro-raw-scale-multiplier",
+        &args.distro_raw_scale_multiplier.to_string(),
+        "--distro-raw-scale-max",
+        &args.distro_raw_scale_max.to_string(),
+        "--distro-raw-abs-clip-mult",
+        &args.distro_raw_abs_clip_mult.to_string(),
+        "--distro-raw-sign-equiv-mult",
+        &args.distro_raw_sign_equiv_mult.to_string(),
+        "--distro-raw-missing-sidecar-policy",
+        args.distro_raw_missing_sidecar_policy.as_str(),
+        "--distro-diloco-outer-momentum",
+        &args.distro_diloco_outer_momentum.to_string(),
+        "--distro-diloco-outer-lr-multiplier",
+        &args.distro_diloco_outer_lr_multiplier.to_string(),
+        "--distro-diloco-trust-region-target",
+        &args.distro_diloco_trust_region_target.to_string(),
+        "--distro-diloco-trust-region-max-scale",
+        &args.distro_diloco_trust_region_max_scale.to_string(),
+        "--distro-diloco-tier-weight-cap",
+        &args.distro_diloco_tier_weight_cap.to_string(),
+    ])
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit());
+
+    if let Some(idx) = args.client_distro_apply_only_trainer_index {
+        cmd.args(["--distro-apply-only-trainer-index", &idx.to_string()]);
+    }
+
+    if args.distro_raw_v2_enabled {
+        cmd.arg("--distro-raw-v2-enabled");
+    }
+
+    if args.matformer_synergy_phase_a_steps > 0 || args.matformer_synergy_ramp_steps > 0 {
+        if args.matformer_synergy_phase_a_steps == 0 || args.matformer_synergy_ramp_steps == 0 {
+            bail!(
+                "MatFormer synergy schedule requires both --matformer-synergy-phase-a-steps and --matformer-synergy-ramp-steps to be > 0"
+            );
+        }
+        cmd.args([
+            "--matformer-synergy-phase-a-steps",
+            &args.matformer_synergy_phase_a_steps.to_string(),
+            "--matformer-synergy-ramp-steps",
+            &args.matformer_synergy_ramp_steps.to_string(),
+        ]);
+    }
+
+    if args.matformer_suffix_gate_warmup_steps > 0 || args.matformer_suffix_gate_learnable {
+        cmd.args([
+            "--matformer-suffix-gate-warmup-steps",
+            &args.matformer_suffix_gate_warmup_steps.to_string(),
+            "--matformer-suffix-gate-start-step",
+            &args.matformer_suffix_gate_start_step.to_string(),
+            "--matformer-suffix-gate-tier",
+            &args.matformer_suffix_gate_tier.to_string(),
+            "--matformer-suffix-gate-schedule",
+            args.matformer_suffix_gate_schedule.as_str(),
+        ]);
+        if args.matformer_suffix_gate_learnable {
+            cmd.args([
+                "--matformer-suffix-gate-learnable",
+                "--matformer-suffix-gate-learnable-init-logit",
+                &args.matformer_suffix_gate_learnable_init_logit.to_string(),
+            ]);
+        }
+    }
 
     if args.matformer_distillation_beta_max > 0.0 {
         cmd.args([
@@ -769,6 +1118,21 @@ fn spawn_client_headless(
             &args.matformer_distillation_top_k.to_string(),
             "--matformer-distillation-temperature",
             &args.matformer_distillation_temperature.to_string(),
+            "--matformer-distillation-combine-mode",
+            args.matformer_distillation_combine_mode.as_str(),
+        ]);
+        if let Some(n) = args.matformer_distillation_logits_to_keep {
+            cmd.args(["--matformer-distillation-logits-to-keep", &n.to_string()]);
+        }
+        if let Some(min_q) = args.matformer_distillation_min_teacher_topk_mass {
+            cmd.args([
+                "--matformer-distillation-min-teacher-topk-mass",
+                &min_q.to_string(),
+            ]);
+        }
+        cmd.args([
+            "--matformer-distillation-kd-q-topk-mass-floor",
+            &args.matformer_distillation_kd_q_topk_mass_floor.to_string(),
         ]);
     }
 
@@ -848,7 +1212,9 @@ fn spawn_client_headless(
     }
 
     println!("starting client {i}: {cmd:?}");
-    let child = cmd.spawn().with_context(|| format!("Failed to start client {i}"))?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to start client {i}"))?;
     Ok(child)
 }
 
@@ -881,7 +1247,7 @@ fn start_client(
     run_id: &String,
     print: bool,
     start_time: OffsetDateTime,
-) {
+) -> Result<()> {
     // hex 1, 2, 3, etc.
     let raw_key = format!("{:0>64x}", i - 1);
     let client_idx = i.saturating_sub(2);
@@ -905,7 +1271,7 @@ fn start_client(
     let metrics_local_port = 6269 + i - 1;
 
     cmd.push(format!(
-        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {} --device {} --matformer-tier {} --matformer-helper-fraction {} --matformer-helper-rotation-interval {} --iroh-discovery {} --iroh-relay {}",
+        "METRICS_LOCAL_PORT={metrics_local_port} RUST_LOG={} RUST_BACKTRACE=1 RAW_IDENTITY_SECRET_KEY={} cargo run -p psyche-centralized-client train --run-id {} --server-addr localhost:{} --logs {} --device {} --matformer-tier {} --matformer-helper-fraction {} --matformer-helper-rotation-interval {} --iroh-discovery {} --iroh-relay {} --distro-apply-mode {} --distro-aggregate-mode {} --distro-value-mode {} --distro-raw-norm-mode {} --distro-raw-scale-multiplier {} --distro-raw-scale-max {} --distro-raw-abs-clip-mult {} --distro-raw-sign-equiv-mult {} --distro-raw-missing-sidecar-policy {} --distro-diloco-outer-momentum {} --distro-diloco-outer-lr-multiplier {} --distro-diloco-trust-region-target {} --distro-diloco-trust-region-max-scale {} --distro-diloco-tier-weight-cap {}",
         args.log,
         raw_key,
         run_id,
@@ -921,16 +1287,77 @@ fn start_client(
         rotation_interval,
         args.client_iroh_discovery,
         args.client_iroh_relay,
+        args.distro_apply_mode.as_str(),
+        args.distro_aggregate_mode.as_str(),
+        args.distro_value_mode.as_str(),
+        args.distro_raw_norm_mode.as_str(),
+        args.distro_raw_scale_multiplier,
+        args.distro_raw_scale_max,
+        args.distro_raw_abs_clip_mult,
+        args.distro_raw_sign_equiv_mult,
+        args.distro_raw_missing_sidecar_policy.as_str(),
+        args.distro_diloco_outer_momentum,
+        args.distro_diloco_outer_lr_multiplier,
+        args.distro_diloco_trust_region_target,
+        args.distro_diloco_trust_region_max_scale,
+        args.distro_diloco_tier_weight_cap,
     ));
+    if args.distro_raw_v2_enabled {
+        cmd.push(" --distro-raw-v2-enabled");
+    }
+    if let Some(idx) = args.client_distro_apply_only_trainer_index {
+        cmd.push(format!(" --distro-apply-only-trainer-index {idx}"));
+    }
+
+    if args.matformer_synergy_phase_a_steps > 0 || args.matformer_synergy_ramp_steps > 0 {
+        if args.matformer_synergy_phase_a_steps == 0 || args.matformer_synergy_ramp_steps == 0 {
+            bail!(
+                "MatFormer synergy schedule requires both --matformer-synergy-phase-a-steps and --matformer-synergy-ramp-steps to be > 0"
+            );
+        }
+        cmd.push(format!(
+            " --matformer-synergy-phase-a-steps {} --matformer-synergy-ramp-steps {}",
+            args.matformer_synergy_phase_a_steps, args.matformer_synergy_ramp_steps
+        ));
+    }
+
+    if args.matformer_suffix_gate_warmup_steps > 0 || args.matformer_suffix_gate_learnable {
+        cmd.push(format!(
+            " --matformer-suffix-gate-warmup-steps {} --matformer-suffix-gate-start-step {} --matformer-suffix-gate-tier {} --matformer-suffix-gate-schedule {}",
+            args.matformer_suffix_gate_warmup_steps,
+            args.matformer_suffix_gate_start_step,
+            args.matformer_suffix_gate_tier,
+            args.matformer_suffix_gate_schedule.as_str(),
+        ));
+        if args.matformer_suffix_gate_learnable {
+            cmd.push(format!(
+                " --matformer-suffix-gate-learnable --matformer-suffix-gate-learnable-init-logit {}",
+                args.matformer_suffix_gate_learnable_init_logit
+            ));
+        }
+    }
 
     if args.matformer_distillation_beta_max > 0.0 {
         cmd.push(format!(
-            " --matformer-distillation-beta-max {} --matformer-distillation-warmup-steps {} --matformer-distillation-start-step {} --matformer-distillation-top-k {} --matformer-distillation-temperature {}",
+            " --matformer-distillation-beta-max {} --matformer-distillation-warmup-steps {} --matformer-distillation-start-step {} --matformer-distillation-top-k {} --matformer-distillation-temperature {} --matformer-distillation-combine-mode {}",
             args.matformer_distillation_beta_max,
             args.matformer_distillation_warmup_steps,
             args.matformer_distillation_start_step,
             args.matformer_distillation_top_k,
             args.matformer_distillation_temperature,
+            args.matformer_distillation_combine_mode.as_str(),
+        ));
+        if let Some(n) = args.matformer_distillation_logits_to_keep {
+            cmd.push(format!(" --matformer-distillation-logits-to-keep {n}"));
+        }
+        if let Some(min_q) = args.matformer_distillation_min_teacher_topk_mass {
+            cmd.push(format!(
+                " --matformer-distillation-min-teacher-topk-mass {min_q}"
+            ));
+        }
+        cmd.push(format!(
+            " --matformer-distillation-kd-q-topk-mass-floor {}",
+            args.matformer_distillation_kd_q_topk_mass_floor
         ));
     }
 
@@ -986,7 +1413,11 @@ fn start_client(
     }
 
     if let Some(dir) = &args.client_checkpoint_dir {
-        cmd.push(format!(" --checkpoint-dir {} --keep-steps {}", dir.display(), args.client_keep_steps));
+        cmd.push(format!(
+            " --checkpoint-dir {} --keep-steps {}",
+            dir.display(),
+            args.client_keep_steps
+        ));
     }
 
     // Fault injection flags
@@ -1014,6 +1445,7 @@ fn start_client(
         .ok()
         .and_then(|s| s.success().then_some(()))
         .expect("Failed to send server command");
+    Ok(())
 }
 
 fn client_matformer_tier(args: &StartArgs, client_zero_based_index: usize) -> u8 {

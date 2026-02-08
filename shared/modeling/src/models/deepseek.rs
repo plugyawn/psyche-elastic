@@ -1,19 +1,20 @@
 #![allow(clippy::manual_is_multiple_of)]
 
 use crate::{
-    AttentionImplementation, AutoConfig, CausalLanguageModel, ColumnParallelLinear, Communicator,
-    CommunicatorId, EosToks, LanguageModelConfig, LanguageModelForward, ModelConfig,
-    ModelLoadError, ParallelExpandHeads, PretrainedSource, RMSNorm, RoPECache, RoPEConfig,
-    RoPEType, RowParallelLinear, rotate_half, yarn_get_mscale,
+    rotate_half, yarn_get_mscale, AttentionImplementation, AutoConfig, CausalLanguageModel,
+    ColumnParallelLinear, Communicator, CommunicatorId, EosToks, LanguageModelConfig,
+    LanguageModelForward, ModelConfig, ModelLoadError, ParallelExpandHeads, PretrainedSource,
+    RMSNorm, RoPECache, RoPEConfig, RoPEType, RowParallelLinear,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
 use tch::{
-    Device, Kind, Tensor,
     nn::{
-        self, Init, Module,
+        self,
         init::{FanInOut, NonLinearity, NormalOrUniform},
+        Init, Module,
     },
+    Device, Kind, Tensor,
 };
 use torch_sys::IntList;
 

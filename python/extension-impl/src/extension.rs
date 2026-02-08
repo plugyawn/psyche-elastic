@@ -1,10 +1,12 @@
 use psyche_core::{Barrier, BatchId, ClosedInterval, LearningRateSchedule, OptimizerDefinition};
 use psyche_modeling::{
-    Batch, BatchData, BatchDataGPU, CausalLM, NopBarrier, ParallelModels, PythonCausalLM,
+    Batch, BatchData, BatchDataGPU, CausalLM, DistroAggregateMode, DistroApplyMode,
+    DistroDilocoLiteConfig, DistroRawConfig, DistroSignErrorFeedbackConfig, DistroTierProxConfig,
+    DistroValueMode, NopBarrier, ParallelModels, PythonCausalLM,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3_tch::{PyTensor, wrap_tch_err};
+use pyo3_tch::{wrap_tch_err, PyTensor};
 use std::{
     ops::Deref,
     sync::{Arc, RwLock},
@@ -22,17 +24,15 @@ fn add_one(tensor: PyTensor) -> PyResult<PyTensor> {
 
 #[pyfunction]
 fn start_process_watcher(pid: usize, duration: Duration) -> PyResult<()> {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(duration);
-            let mut system = System::new_all();
-            if !system.refresh_process(Pid::from(pid)) {
-                println!("Parent process {pid} gone, exiting");
-                system
-                    .process(Pid::from_u32(std::process::id()))
-                    .unwrap()
-                    .kill();
-            }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(duration);
+        let mut system = System::new_all();
+        if !system.refresh_process(Pid::from(pid)) {
+            println!("Parent process {pid} gone, exiting");
+            system
+                .process(Pid::from_u32(std::process::id()))
+                .unwrap()
+                .kill();
         }
     });
     Ok(())
@@ -89,6 +89,8 @@ impl DistroResult {
                             sparse_val: sparse_val.0,
                             xshape: borrowed.xshape.clone(),
                             totalk: borrowed.totalk,
+                            norm_sidecar: None,
+                            peer_metadata: None,
                             stats: None,
                         });
                     }
@@ -133,6 +135,13 @@ impl Trainer {
             },
             lr_scheduler,
             optimizer,
+            DistroApplyMode::Sign,
+            DistroAggregateMode::Legacy,
+            DistroValueMode::Auto,
+            DistroRawConfig::default(),
+            DistroDilocoLiteConfig::default(),
+            DistroSignErrorFeedbackConfig::default(),
+            DistroTierProxConfig::default(),
             micro_batch_size,
             None,
             grad_accum_in_fp32,

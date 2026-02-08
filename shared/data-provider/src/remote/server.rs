@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::{
-    TokenizedData,
     traits::{LengthKnownDataProvider, TokenizedDataProvider},
+    TokenizedData,
 };
 
 use super::shared::{ClientToServerMessage, RejectionReason, ServerToClientMessage};

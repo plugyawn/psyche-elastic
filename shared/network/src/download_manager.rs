@@ -1,23 +1,23 @@
 use crate::{
-    ModelRequestType, Networkable,
     p2p_model_sharing::{TransmittableModelConfig, TransmittableModelParameter},
     serialized_distro::TransmittableDistroResult,
+    ModelRequestType, Networkable,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_util::future::select_all;
 use iroh::PublicKey;
 use iroh_blobs::api::Tag;
 use iroh_blobs::ticket::BlobTicket;
-use iroh_blobs::{Hash, api::downloader::DownloadProgressItem};
+use iroh_blobs::{api::downloader::DownloadProgressItem, Hash};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap, fmt::Debug, future::Future, marker::PhantomData, pin::Pin, sync::Arc,
     time::Instant,
 };
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
 };
 use tracing::{error, info, trace, warn};

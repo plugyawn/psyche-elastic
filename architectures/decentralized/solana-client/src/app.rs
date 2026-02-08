@@ -140,11 +140,20 @@ pub async fn build_app(
             tensor_parallelism: p.tensor_parallelism,
             micro_batch_size: p.micro_batch_size,
             same_batch_warmup_steps: p.same_batch_warmup_steps,
+            same_batch_calibration_every_steps: p.same_batch_calibration_every_steps,
+            same_batch_calibration_start_step: p.same_batch_calibration_start_step,
+            same_batch_calibration_no_apply: p.same_batch_calibration_no_apply,
             matformer_local_inner_steps: p.matformer_local_inner_steps,
             write_gradients_dir: p.write_gradients_dir,
             eval_tasks,
             eval_task_max_docs: p.eval_task_max_docs,
             prompt_task: p.prompt_task,
+            heldout_eval_config: (p.heldout_eval_batches > 0).then_some(
+                psyche_client::HeldoutEvalConfig {
+                    batches: p.heldout_eval_batches,
+                    batch_size: p.heldout_eval_batch_size,
+                },
+            ),
             checkpoint_config,
             hub_read_token,
             hub_max_concurrent_downloads: p.hub_max_concurrent_downloads,
@@ -199,7 +208,9 @@ pub async fn build_app(
                             psyche_modeling::DistillationCombineMode::Add
                         }
                     },
-                    min_teacher_topk_mass: p.matformer_distillation_min_teacher_topk_mass,
+                    min_teacher_topk_mass: p
+                        .matformer_distillation_min_teacher_topk_mass
+                        .or(p.matformer_distill_confidence_threshold),
                     kd_q_topk_mass_floor: p.matformer_distillation_kd_q_topk_mass_floor,
                     ..Default::default()
                 })
@@ -209,6 +220,14 @@ pub async fn build_app(
             distro_apply_mode: match p.distro_apply_mode {
                 psyche_client::DistroApplyMode::Sign => psyche_modeling::DistroApplyMode::Sign,
                 psyche_client::DistroApplyMode::Raw => psyche_modeling::DistroApplyMode::Raw,
+            },
+            distro_aggregate_mode: match p.distro_aggregate_mode {
+                psyche_client::DistroAggregateMode::Legacy => {
+                    psyche_modeling::DistroAggregateMode::Legacy
+                }
+                psyche_client::DistroAggregateMode::DilocoLite => {
+                    psyche_modeling::DistroAggregateMode::DilocoLite
+                }
             },
             distro_value_mode: match p.distro_value_mode {
                 psyche_client::DistroValueMode::Auto => psyche_modeling::DistroValueMode::Auto,
@@ -244,6 +263,21 @@ pub async fn build_app(
                         psyche_modeling::DistroRawMissingSidecarPolicy::Fail
                     }
                 },
+            },
+            distro_diloco_lite_config: psyche_modeling::DistroDilocoLiteConfig {
+                outer_momentum: p.distro_diloco_outer_momentum,
+                outer_lr_multiplier: p.distro_diloco_outer_lr_multiplier,
+                trust_region_target: p.distro_diloco_trust_region_target,
+                trust_region_max_scale: p.distro_diloco_trust_region_max_scale,
+                tier_weight_cap: p.distro_diloco_tier_weight_cap,
+            },
+            distro_sign_error_feedback_config: psyche_modeling::DistroSignErrorFeedbackConfig {
+                enabled: p.distro_error_feedback,
+                decay: p.distro_ef_decay,
+            },
+            distro_tier_prox_config: psyche_modeling::DistroTierProxConfig {
+                mu: p.matformer_prox_mu,
+                prefix_only: p.matformer_prox_prefix_only,
             },
         };
     let app = App {

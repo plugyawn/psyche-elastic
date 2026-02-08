@@ -45,6 +45,7 @@ external/
 libtorch*
 slurm*
 *.key
+*.pem
 node_modules/
 bindings
 .pre-commit-config.yaml
@@ -61,6 +62,9 @@ txt/
 config/testing/dolma/
 **/devnet_funded_accounts
 config/solana-test/test-config.toml
+
+### Local keys ###
+/keys/
 
 ### Solana ###
 test-ledger

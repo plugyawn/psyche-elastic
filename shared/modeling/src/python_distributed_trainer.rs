@@ -1,8 +1,10 @@
 use crate::{
-    ApplyDistroResultError, Batch, BatchData, CausalLM, Communicator, EosToks, LocalTrainer,
-    ParallelModels, PythonDistributedCausalLM, ReduceType, StableVariableIterator,
-    TorchDistributedCommunicator, TrainOutput, Trainer, TrainerThreadCommunicationError,
-    python_causal_lm::WrappedPythonCausalLM, trainer::DistroResults,
+    python_causal_lm::WrappedPythonCausalLM, trainer::DistroResults, ApplyDistroResultError, Batch,
+    BatchData, CausalLM, Communicator, DistroAggregateMode, DistroApplyMode,
+    DistroDilocoLiteConfig, DistroRawConfig, DistroSignErrorFeedbackConfig, DistroTierProxConfig,
+    DistroValueMode, EosToks, LocalTrainer, ParallelModels, PythonDistributedCausalLM, ReduceType,
+    StableVariableIterator, TorchDistributedCommunicator, TrainOutput, Trainer,
+    TrainerThreadCommunicationError,
 };
 
 use psyche_core::{Barrier, CancelledBarrier, LearningRateSchedule, OptimizerDefinition};
@@ -10,8 +12,8 @@ use pyo3::{PyErr, PyResult};
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 use tch::{Device, Kind, Tensor};
@@ -71,6 +73,13 @@ impl PythonDistributedTrainer {
         model: PythonDistributedCausalLM,
         lr_scheduler: LearningRateSchedule,
         optimizer: OptimizerDefinition,
+        distro_apply_mode: DistroApplyMode,
+        distro_aggregate_mode: DistroAggregateMode,
+        distro_value_mode: DistroValueMode,
+        distro_raw_config: DistroRawConfig,
+        distro_diloco_lite_config: DistroDilocoLiteConfig,
+        distro_sign_error_feedback_config: DistroSignErrorFeedbackConfig,
+        distro_tier_prox_config: DistroTierProxConfig,
         mut micro_batch_size: usize,
         stats: Option<u32>,
         grad_accum_in_fp32: bool,
@@ -98,6 +107,13 @@ impl PythonDistributedTrainer {
             "operation": "hyperparameters",
             "lr_scheduler": lr_scheduler,
             "optimizer": optimizer,
+            "distro_apply_mode": distro_apply_mode,
+            "distro_aggregate_mode": distro_aggregate_mode,
+            "distro_value_mode": distro_value_mode,
+            "distro_raw_config": distro_raw_config,
+            "distro_diloco_lite_config": distro_diloco_lite_config,
+            "distro_sign_error_feedback_config": distro_sign_error_feedback_config,
+            "distro_tier_prox_config": distro_tier_prox_config,
             "micro_batch_size": micro_batch_size,
             "grad_accum_in_fp32": grad_accum_in_fp32
         });
@@ -125,6 +141,13 @@ impl PythonDistributedTrainer {
             },
             lr_scheduler,
             optimizer,
+            distro_apply_mode,
+            distro_aggregate_mode,
+            distro_value_mode,
+            distro_raw_config,
+            distro_diloco_lite_config,
+            distro_sign_error_feedback_config,
+            distro_tier_prox_config,
             micro_batch_size,
             stats,
             grad_accum_in_fp32,
@@ -159,7 +182,8 @@ impl PythonDistributedTrainer {
         if world_size > 1 {
             trace!(
                 "Checking batch padding: original batch size = {}, world_size = {}",
-                original_batch_size, world_size
+                original_batch_size,
+                world_size
             );
 
             data.pad(world_size);

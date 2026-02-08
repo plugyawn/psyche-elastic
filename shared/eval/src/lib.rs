@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use psyche_data_provider::{Dataset, Split};
 
 mod harness;
@@ -6,11 +6,11 @@ mod tasks;
 mod traits;
 
 pub use harness::{
-    EvalTaskOptions, PROGRESS_BAR_TEMPLATE, PreparedTask, PreparedTaskResult, Task, TaskType,
-    progress_bar_template_with_task,
+    progress_bar_template_with_task, EvalTaskOptions, PreparedTask, PreparedTaskResult, Task,
+    TaskType, PROGRESS_BAR_TEMPLATE,
 };
 pub use tasks::{
-    ArcChallenge, ArcEasy, BoolQ, CEval, Hellaswag, MMLU, MMLUCF, MMLUPro, OpenbookQA, PIQA,
+    ArcChallenge, ArcEasy, BoolQ, CEval, Hellaswag, MMLUPro, OpenbookQA, MMLU, MMLUCF, PIQA,
 };
 
 pub const ASCII_UPPERCASE: [&str; 26] = [

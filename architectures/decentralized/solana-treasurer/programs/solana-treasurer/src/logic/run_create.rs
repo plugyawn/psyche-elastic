@@ -9,8 +9,8 @@ use psyche_solana_coordinator::cpi::init_coordinator;
 use psyche_solana_coordinator::logic::InitCoordinatorParams;
 use psyche_solana_coordinator::program::PsycheSolanaCoordinator;
 
-use crate::ProgramError;
 use crate::state::Run;
+use crate::ProgramError;
 
 #[derive(Accounts)]
 #[instruction(params: RunCreateParams)]

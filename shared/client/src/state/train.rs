@@ -369,6 +369,11 @@ pub struct TrainingStepMetadata<T: NodeIdentity, A: AuthenticatableIdentity> {
     /// Experimental: number of local inner updates per outer coordinator step for
     /// smaller MatFormer tiers.
     pub matformer_local_inner_steps: u32,
+
+    /// Periodic same-batch calibration schedule.
+    pub same_batch_calibration_every_steps: u32,
+    pub same_batch_calibration_start_step: u32,
+    pub same_batch_calibration_no_apply: bool,
 }
 
 #[derive(Debug)]
@@ -1028,6 +1033,15 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                     }
 
                     while let Some(data) = next_sample.recv().await {
+                        let tokens_processed_for_batch: u32 = match &data.data {
+                            BatchData::CPU(items) => items
+                                .iter()
+                                .map(|item| item.input_ids.len() as u64)
+                                .sum::<u64>()
+                                .min(u32::MAX as u64)
+                                as u32,
+                            BatchData::GPU(_) => 0,
+                        };
                         let mut in_progress = FuturesUnordered::new();
 
                         // reset the DP barriers
@@ -1194,7 +1208,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 distro_results,
                                 cancelled,
                                 nonce,
-                                grad_norm: _,
+                                grad_norm,
                                 teacher_logits: _raw_teacher_logits,
                             } = completed_trainer.map_err(|_| TrainError::TrainCrashed)??;
 
@@ -1219,6 +1233,20 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 let write_gradients_dir = write_gradients_dir.clone();
                                 let tx_distro_result = tx_distro_result.clone();
                                 let parameter_names = parameter_names.clone();
+                                let aggregation_metadata =
+                                    psyche_network::SerializedDistroAggregationMetadata {
+                                        inner_steps_used: local_inner_steps.min(u16::MAX as u32)
+                                            as u16,
+                                        // Inner loop currently reuses outer step LR; use the
+                                        // effective count as the LR-sum normalizer.
+                                        sum_local_lr: local_inner_steps as f32,
+                                        tokens_processed: tokens_processed_for_batch,
+                                        delta_l2_preclip: grad_norm,
+                                        // Post-clip norm is not currently surfaced by trainer
+                                        // thread; keep equal to pre-clip until available.
+                                        delta_l2_postclip: grad_norm,
+                                        matformer_tier,
+                                    };
                                 let res: Result<(), TrainError> = tokio::task::spawn_blocking(move || {
                                     if cancelled {
                                         trace!("However, we were cancelled, so we're throwing away this result.");
@@ -1238,6 +1266,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                     let transmittable_distro_result = TransmittableDistroResult {
                                         step,
                                         batch_id,
+                                        aggregation_metadata,
                                         distro_results: to_transmit
                                             .into_iter()
                                             .zip(parameter_names.iter())
@@ -1345,6 +1374,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
 
         let apply_start = Instant::now();
         let step = state.progress.step;
+        let calibration_start = self.same_batch_calibration_start_step.max(1);
+        let calibration_active = self.same_batch_calibration_every_steps > 0
+            && step >= calibration_start
+            && (step - calibration_start) % self.same_batch_calibration_every_steps == 0;
+        let calibration_no_apply = self.same_batch_calibration_no_apply;
+        let calibration_every_steps = self.same_batch_calibration_every_steps;
         let witness_quorum = state.witness_quorum(
             state
                 .previous_round()
@@ -1519,6 +1554,18 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                         kept_batches_for_apply,
                         "Apply-time trainer-slot filter summary"
                     );
+                }
+
+                if calibration_active && calibration_no_apply {
+                    info!(
+                        step = step,
+                        every_steps = calibration_every_steps,
+                        start_step = calibration_start,
+                        dropped_batches_for_apply,
+                        kept_batches_for_apply,
+                        "Skipping distributed apply for same-batch calibration step"
+                    );
+                    return Ok(trainers);
                 }
 
                 let futures: Vec<JoinHandle<std::result::Result<Trainer, ApplyDistroResultError>>> =

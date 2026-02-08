@@ -8,18 +8,18 @@
 use std::{sync::Arc, time::Duration};
 
 use bollard::container::StartContainerOptions;
-use bollard::{Docker, container::KillContainerOptions};
+use bollard::{container::KillContainerOptions, Docker};
 use psyche_client::IntegrationTestLogMarker;
-use psyche_coordinator::{RunState, model::Checkpoint};
+use psyche_coordinator::{model::Checkpoint, RunState};
 use psyche_decentralized_testing::docker_setup::e2e_testing_setup_subscription;
 use psyche_decentralized_testing::{
-    CLIENT_CONTAINER_PREFIX, NGINX_PROXY_PREFIX,
     chaos::{ChaosAction, ChaosScheduler},
     docker_setup::{
         e2e_testing_setup, kill_all_clients, spawn_new_client, spawn_new_client_with_monitoring,
     },
     docker_watcher::{DockerWatcher, Response},
     utils::SolanaTestClient,
+    CLIENT_CONTAINER_PREFIX, NGINX_PROXY_PREFIX,
 };
 use rstest::*;
 use serial_test::serial;

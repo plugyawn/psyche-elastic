@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use parquet::{
     errors::ParquetError,
     file::reader::{FileReader, SerializedFileReader},

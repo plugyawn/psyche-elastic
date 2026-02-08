@@ -1,50 +1,49 @@
 use crate::app::build_app;
-use crate::command::can_join::CommandCanJoinParams;
 use crate::command::can_join::command_can_join_execute;
-use crate::command::checkpoint::CommandCheckpointParams;
+use crate::command::can_join::CommandCanJoinParams;
 use crate::command::checkpoint::command_checkpoint_execute;
-use crate::command::close_run::CommandCloseRunParams;
+use crate::command::checkpoint::CommandCheckpointParams;
 use crate::command::close_run::command_close_run_execute;
-use crate::command::create_run::CommandCreateRunParams;
+use crate::command::close_run::CommandCloseRunParams;
 use crate::command::create_run::command_create_run_execute;
-use crate::command::json_dump_run::CommandJsonDumpRunParams;
+use crate::command::create_run::CommandCreateRunParams;
 use crate::command::json_dump_run::command_json_dump_run_execute;
-use crate::command::json_dump_user::CommandJsonDumpUserParams;
+use crate::command::json_dump_run::CommandJsonDumpRunParams;
 use crate::command::json_dump_user::command_json_dump_user_execute;
-use crate::command::set_future_epoch_rates::CommandSetFutureEpochRatesParams;
+use crate::command::json_dump_user::CommandJsonDumpUserParams;
 use crate::command::set_future_epoch_rates::command_set_future_epoch_rates_execute;
-use crate::command::set_paused::CommandSetPausedParams;
+use crate::command::set_future_epoch_rates::CommandSetFutureEpochRatesParams;
 use crate::command::set_paused::command_set_paused_execute;
-use crate::command::tick::CommandTickParams;
+use crate::command::set_paused::CommandSetPausedParams;
 use crate::command::tick::command_tick_execute;
-use crate::command::treasurer_claim_rewards::CommandTreasurerClaimRewardsParams;
+use crate::command::tick::CommandTickParams;
 use crate::command::treasurer_claim_rewards::command_treasurer_claim_rewards_execute;
-use crate::command::treasurer_top_up_rewards::CommandTreasurerTopUpRewardsParams;
+use crate::command::treasurer_claim_rewards::CommandTreasurerClaimRewardsParams;
 use crate::command::treasurer_top_up_rewards::command_treasurer_top_up_rewards_execute;
-use crate::command::update_config::CommandUpdateConfigParams;
+use crate::command::treasurer_top_up_rewards::CommandTreasurerTopUpRewardsParams;
 use crate::command::update_config::command_update_config_execute;
+use crate::command::update_config::CommandUpdateConfigParams;
 use crate::{
-    app::{AppParams, TAB_NAMES, Tabs},
+    app::{AppParams, Tabs, TAB_NAMES},
     backend::SolanaBackend,
 };
 
 use anchor_client::{
-    Cluster,
     solana_sdk::{
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::{EncodableKey, Keypair},
         signer::Signer,
     },
+    Cluster,
 };
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use psyche_client::{TrainArgs, print_identity_keys};
+use psyche_client::{print_identity_keys, TrainArgs};
 use psyche_network::SecretKey;
 use psyche_tui::{
-    LogOutput, ServiceInfo,
     logging::{MetricsDestination, OpenTelemetry, RemoteLogsDestination, TraceDestination},
-    maybe_start_render_loop,
+    maybe_start_render_loop, LogOutput, ServiceInfo,
 };
 use std::sync::Arc;
 use std::{io::Cursor, path::PathBuf, time::Duration};

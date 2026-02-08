@@ -4,7 +4,6 @@ use anchor_client::solana_sdk::hash::hash;
 use anchor_client::solana_sdk::instruction::Instruction;
 use anchor_client::solana_sdk::program_pack::Pack;
 use anchor_client::{
-    Client, Cluster, Program,
     anchor_lang::system_program,
     solana_client::{
         nonblocking::pubsub_client::PubsubClient,
@@ -16,12 +15,13 @@ use anchor_client::{
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
     },
+    Client, Cluster, Program,
 };
 use anchor_spl::token;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use psyche_client::IntegrationTestLogMarker;
-use psyche_coordinator::{CommitteeProof, Coordinator, HealthChecks, model::HubRepo};
+use psyche_coordinator::{model::HubRepo, CommitteeProof, Coordinator, HealthChecks};
 use psyche_watcher::{Backend as WatcherBackend, OpportunisticData};
 use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
 use solana_transaction_status_client_types::UiTransactionEncoding;

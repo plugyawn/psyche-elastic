@@ -1,17 +1,25 @@
-use crate::{Finished, TrainingResult, fetch_data::BatchIdSet};
+use crate::{fetch_data::BatchIdSet, Finished, TrainingResult};
 
 use psyche_coordinator::{
     Commitment, CommitteeProof, CommitteeSelection, WitnessBloom, WitnessProof,
 };
 use psyche_core::{BatchId, NodeIdentity};
 use psyche_modeling::DistroResult;
-use psyche_network::TransmittableTeacherLogits;
+use psyche_network::{Hash, TransmittableTeacherLogits};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
 use super::types::PayloadState;
+
+#[derive(Debug)]
+pub struct TeacherLogitsDownloadState<T: NodeIdentity> {
+    pub from: T,
+    pub batch_id: BatchId,
+    /// Expected payload hash from the broadcast commitment (`Commitment.data_hash`).
+    pub expected_commitment_hash: [u8; 32],
+}
 
 pub struct RoundState<T: NodeIdentity> {
     pub height: u32,
@@ -29,8 +37,10 @@ pub struct RoundState<T: NodeIdentity> {
     pub batch_ids_not_yet_trained_on: Arc<Mutex<Option<BatchIdSet>>>,
     pub self_distro_results: Vec<Vec<DistroResult>>,
     /// Teacher logits received from tier-0 clients, keyed by batch ID.
-    /// Students use these for distillation loss in subsequent rounds.
-    pub teacher_logits: HashMap<BatchId, TransmittableTeacherLogits>,
+    /// Students use these for in-place distillation loss in the same step.
+    pub teacher_logits: Arc<Mutex<HashMap<BatchId, Arc<TransmittableTeacherLogits>>>>,
+    /// Pending teacher-logits downloads keyed by blob hash (for commitment verification).
+    pub teacher_logits_downloads: Arc<Mutex<HashMap<Hash, TeacherLogitsDownloadState<T>>>>,
 }
 
 impl<T: NodeIdentity> RoundState<T> {
@@ -49,7 +59,8 @@ impl<T: NodeIdentity> RoundState<T> {
             committee_info: None,
             batch_ids_not_yet_trained_on: Arc::new(Mutex::new(None)),
             self_distro_results: vec![],
-            teacher_logits: HashMap::new(),
+            teacher_logits: Arc::new(Mutex::new(HashMap::new())),
+            teacher_logits_downloads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

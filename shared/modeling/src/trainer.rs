@@ -1,7 +1,8 @@
 use crate::{
-    AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
-    EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    TeacherLogitTargets, unsharded_cpu_variables,
+    unsharded_cpu_variables, AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize,
+    Distro, DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig,
+    DistroResult, DistroSignErrorFeedbackConfig, DistroTierProxConfig, DistroValueMode, EosToks,
+    Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator, TeacherLogitTargets,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
@@ -9,8 +10,8 @@ use std::{
     collections::HashMap,
     ops::ControlFlow,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Instant,
 };
@@ -149,7 +150,9 @@ impl Batch {
                     let padding_needed = world_size - remainder;
                     trace!(
                         "Batch size {} not divisible by world_size {}. Adding {} padding samples",
-                        current_batch_size, world_size, padding_needed
+                        current_batch_size,
+                        world_size,
+                        padding_needed
                     );
 
                     // Get sequence length from the first sample
@@ -185,7 +188,9 @@ impl Batch {
                     let padding_needed = world_size - remainder;
                     trace!(
                         "Batch size {} not divisible by world_size {}. Adding {} padding samples",
-                        current_batch_size, world_size, padding_needed
+                        current_batch_size,
+                        world_size,
+                        padding_needed
                     );
 
                     if current_batch_size == 0 {
@@ -338,15 +343,22 @@ impl Trainer {
                 teacher_targets,
             ),
             #[cfg(feature = "python")]
-            Trainer::PythonDistributed(python) => python.train(
-                step,
-                data,
-                warmup_lr_between,
-                zero_optim,
-                rollback,
-                prev_self_distro_results,
-                cancel_training,
-            ),
+            Trainer::PythonDistributed(python) => {
+                if produce_teacher_logits || teacher_targets.is_some() {
+                    return Err(TrainerThreadCommunicationError::DistillationUnsupported {
+                        trainer_kind: "python_distributed",
+                    });
+                }
+                python.train(
+                    step,
+                    data,
+                    warmup_lr_between,
+                    zero_optim,
+                    rollback,
+                    prev_self_distro_results,
+                    cancel_training,
+                )
+            }
         }
     }
 
@@ -408,6 +420,8 @@ impl Trainer {
                 sparse_val: Distro::quantize_nozeros_tensor_to_boolean_sign(&x.sparse_val),
                 xshape: x.xshape.clone(),
                 totalk: x.totalk,
+                norm_sidecar: x.norm_sidecar,
+                peer_metadata: x.peer_metadata,
                 stats: x.stats.clone(),
             })
             .collect()
@@ -447,6 +461,9 @@ pub enum TrainerThreadCommunicationError {
     #[error("Attempting to pad batch that's already on GPU")]
     PaddingBatch,
 
+    #[error("Distillation is not supported for trainer kind: {trainer_kind}")]
+    DistillationUnsupported { trainer_kind: &'static str },
+
     #[cfg(feature = "python")]
     #[error("Python error: {0}")]
     PythonError(#[from] pyo3::PyErr),
@@ -458,6 +475,13 @@ impl LocalTrainer {
         models: ParallelModels,
         lr_scheduler: LearningRateSchedule,
         optimizer: OptimizerDefinition,
+        distro_apply_mode: DistroApplyMode,
+        distro_aggregate_mode: DistroAggregateMode,
+        distro_value_mode: DistroValueMode,
+        distro_raw_config: DistroRawConfig,
+        distro_diloco_lite_config: DistroDilocoLiteConfig,
+        distro_sign_error_feedback_config: DistroSignErrorFeedbackConfig,
+        distro_tier_prox_config: DistroTierProxConfig,
         micro_batch_size: usize,
         stats: Option<u32>,
         grad_accum_in_fp32: bool,
@@ -492,7 +516,17 @@ impl LocalTrainer {
             let (result_tx, result_rx) = flume::unbounded();
             ret.push((assignment_tx, result_rx));
 
-            let optimizer = Optimizer::new(optimizer, model.as_ref());
+            let optimizer = Optimizer::new(
+                optimizer,
+                model.as_ref(),
+                distro_apply_mode,
+                distro_aggregate_mode,
+                distro_value_mode,
+                distro_raw_config,
+                distro_diloco_lite_config,
+                distro_sign_error_feedback_config,
+                distro_tier_prox_config,
+            );
 
             let barrier = barrier.clone();
             let data_parallel = data_parallel.clone();
@@ -644,8 +678,7 @@ impl LocalTrainer {
             );
         }
         self.barrier.reset();
-        let mut teacher_targets = teacher_targets;
-        for (i, (tx, _)) in self.models.iter().enumerate() {
+        for (tx, _) in &self.models {
             tx.send(ParallelAssignment::Train {
                 batch: data.clone(),
                 step,
@@ -656,8 +689,7 @@ impl LocalTrainer {
                 cancel_training: cancel_training.clone(),
                 produce_teacher_logits,
                 teacher_logits_top_k,
-                // Only first model gets teacher targets (avoids cloning large tensors)
-                teacher_targets: if i == 0 { teacher_targets.take() } else { None },
+                teacher_targets: teacher_targets.clone(),
             })
             .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
         }
@@ -830,6 +862,10 @@ impl LocalTrainer {
             return;
         }
         model.prepare_for_training();
+        // Forward-only use (evals / teacher-logit generation) is valid immediately after the model
+        // is initialized and put into training mode. The previous gate was mainly to protect
+        // implementations that require a warm-up step before inference; LocalTrainer does not.
+        can_do_inference.store(true, Ordering::Relaxed);
 
         let mut grad_accum: Option<Fp32GradientAccumulator> = None;
         let mut nonce = 0;
@@ -986,6 +1022,37 @@ impl LocalTrainer {
                         Optimizer::Null => {}
                     };
 
+                    // If distillation is enabled, pre-slice teacher targets to match the
+                    // per-microbatch chunking of `input_ids` (grad accumulation).
+                    let teacher_chunks = teacher_targets.as_ref().map(|(targets, beta)| {
+                        let idx_chunks = targets
+                            .top_indices
+                            .to(model.device())
+                            .to_kind(Kind::Int64)
+                            .chunk(grad_accum_steps as i64, 0);
+                        let val_chunks = targets
+                            .top_values
+                            .to(model.device())
+                            .to_kind(Kind::Float)
+                            .chunk(grad_accum_steps as i64, 0);
+                        let lse_chunks = targets
+                            .logsumexp
+                            .to(model.device())
+                            .to_kind(Kind::Float)
+                            .chunk(grad_accum_steps as i64, 0);
+                        (
+                            idx_chunks,
+                            val_chunks,
+                            lse_chunks,
+                            *beta,
+                            targets.temperature,
+                            targets.top_k,
+                            targets.combine_mode,
+                            targets.min_teacher_topk_mass,
+                            targets.kd_q_topk_mass_floor,
+                        )
+                    });
+
                     let mut loss = None;
                     let mut cancelled = false;
                     for (index, (input_ids, labels, position_ids, sequence_lengths)) in
@@ -997,7 +1064,28 @@ impl LocalTrainer {
                             warn!("Aborting training upon request");
                             break;
                         }
-                        let fb_result = if let Some((ref targets, beta)) = teacher_targets {
+                        let fb_result = if let Some((
+                            idx_chunks,
+                            val_chunks,
+                            lse_chunks,
+                            beta,
+                            temperature,
+                            top_k,
+                            combine_mode,
+                            min_teacher_topk_mass,
+                            kd_q_topk_mass_floor,
+                        )) = teacher_chunks.as_ref()
+                        {
+                            let targets = TeacherLogitTargets {
+                                top_indices: idx_chunks[index].shallow_clone(),
+                                top_values: val_chunks[index].shallow_clone(),
+                                logsumexp: lse_chunks[index].shallow_clone(),
+                                temperature: *temperature,
+                                top_k: *top_k,
+                                combine_mode: *combine_mode,
+                                min_teacher_topk_mass: *min_teacher_topk_mass,
+                                kd_q_topk_mass_floor: *kd_q_topk_mass_floor,
+                            };
                             Self::forward_backward_with_distillation(
                                 &mut *model,
                                 input_ids,
@@ -1006,8 +1094,8 @@ impl LocalTrainer {
                                 sequence_lengths,
                                 &barrier,
                                 Some(grad_accum_divisor),
-                                targets,
-                                beta,
+                                &targets,
+                                *beta,
                             )
                         } else {
                             Self::forward_backward(
@@ -1159,8 +1247,10 @@ impl LocalTrainer {
                                 let k = teacher_logits_top_k as i64;
                                 let (top_values, top_indices) = logits.topk(k, -1, true, true);
                                 // Move to CPU and convert to float for packing
-                                let top_values_cpu = top_values.to(Device::Cpu).to_kind(Kind::Float);
-                                let top_indices_cpu = top_indices.to(Device::Cpu).to_kind(Kind::Int64);
+                                let top_values_cpu =
+                                    top_values.to(Device::Cpu).to_kind(Kind::Float);
+                                let top_indices_cpu =
+                                    top_indices.to(Device::Cpu).to_kind(Kind::Int64);
                                 let size = top_values_cpu.size();
                                 trace!(
                                     batch = size[0],
@@ -1169,13 +1259,15 @@ impl LocalTrainer {
                                     "Extracted teacher logits"
                                 );
                                 // Pack indices (as float for cat) and values into single tensor along last dim
-                                Some(Tensor::cat(&[
-                                    &top_indices_cpu.to_kind(Kind::Float),
-                                    &top_values_cpu,
-                                ], -1))
+                                Some(Tensor::cat(
+                                    &[&top_indices_cpu.to_kind(Kind::Float), &top_values_cpu],
+                                    -1,
+                                ))
                             }
                             None => {
-                                warn!("Failed to extract teacher logits: no logits from forward pass");
+                                warn!(
+                                    "Failed to extract teacher logits: no logits from forward pass"
+                                );
                                 None
                             }
                         }
@@ -1219,6 +1311,9 @@ impl LocalTrainer {
                     step,
                     warmup_lr_between,
                 }) => {
+                    // Make the current step visible to MatFormer stabilization helpers and
+                    // apply-side diagnostics (e.g., DisTrO cosine mixer logging).
+                    crate::matformer_c2::set_current_step(step);
                     let lr = Trainer::get_lr(&lr_scheduler, step, warmup_lr_between);
                     if optimize_step(
                         &mut model,

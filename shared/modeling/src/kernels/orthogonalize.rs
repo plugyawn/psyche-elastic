@@ -113,10 +113,7 @@ impl Orthogonalize for CpuOrthogonalize {
     fn polar_express(&self, g: &Tensor, iterations: usize) -> Tensor {
         // Only orthogonalize 2D tensors
         if g.dim() != 2 {
-            tracing::trace!(
-                "Polar Express skipped for non-2D tensor (dim={})",
-                g.dim()
-            );
+            tracing::trace!("Polar Express skipped for non-2D tensor (dim={})", g.dim());
             return g.shallow_clone();
         }
 
@@ -173,10 +170,7 @@ impl Orthogonalize for AdaptiveOrthogonalize {
     fn polar_express(&self, g: &Tensor, iterations: usize) -> Tensor {
         // Only orthogonalize 2D tensors
         if g.dim() != 2 {
-            tracing::trace!(
-                "Polar Express skipped for non-2D tensor (dim={})",
-                g.dim()
-            );
+            tracing::trace!("Polar Express skipped for non-2D tensor (dim={})", g.dim());
             return g.shallow_clone();
         }
 
@@ -198,7 +192,12 @@ impl Orthogonalize for AdaptiveOrthogonalize {
 /// * `iterations` - Number of iterations (max 5)
 /// * `compute_kind` - Precision for internal computation (FP32, FP16, or BF16)
 /// * `original_kind` - Original tensor dtype to convert back to
-fn polar_express_impl(g: &Tensor, iterations: usize, compute_kind: Kind, original_kind: Kind) -> Tensor {
+fn polar_express_impl(
+    g: &Tensor,
+    iterations: usize,
+    compute_kind: Kind,
+    original_kind: Kind,
+) -> Tensor {
     // Initial normalization: X_0 = G / (||G|| * safety_factor)
     let g_norm = g.norm().double_value(&[]);
     if g_norm < 1e-12 {
@@ -243,6 +242,47 @@ mod tests {
     use super::*;
     use tch::Device;
 
+    fn deterministic_matrix(n: i64, device: Device) -> Tensor {
+        // Avoid global torch RNG state in tests: generate deterministic pseudo-random
+        // standard normal values locally (Box-Muller over SplitMix64).
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn uniform01(state: &mut u64) -> f64 {
+            // Use top 53 bits to form a float in [0, 1).
+            let x = splitmix64(state) >> 11;
+            (x as f64) * (1.0 / ((1u64 << 53) as f64))
+        }
+
+        let total = (n * n) as usize;
+        let mut data = Vec::<f32>::with_capacity(total);
+        let mut state = 0xD1B5_4A32_D192_ED03u64; // fixed seed
+
+        while data.len() < total {
+            // Box-Muller: generate two normals at a time.
+            let mut u1 = uniform01(&mut state);
+            let u2 = uniform01(&mut state);
+            if u1 < 1e-12 {
+                u1 = 1e-12; // avoid ln(0)
+            }
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            let z0 = r * theta.cos();
+            let z1 = r * theta.sin();
+            data.push(z0 as f32);
+            if data.len() < total {
+                data.push(z1 as f32);
+            }
+        }
+
+        Tensor::from_slice(&data).reshape([n, n]).to_device(device)
+    }
+
     #[test]
     fn test_polar_express_identity() {
         // For an orthogonal matrix, Polar Express should return ~same matrix
@@ -273,8 +313,8 @@ mod tests {
         // Result should be approximately orthogonal: Q @ Q^T ≈ I
         let ortho = CpuOrthogonalize::new();
 
-        // Create a random-ish matrix
-        let g = Tensor::randn([4, 4], (Kind::Float, tch::Device::Cpu));
+        // Create a deterministic "random-ish" matrix
+        let g = deterministic_matrix(4, Device::Cpu);
         let result = ortho.polar_express(&g, 5);
 
         // Check orthogonality: Q @ Q^T should be close to identity
@@ -293,11 +333,13 @@ mod tests {
         // Non-2D tensors should be returned unchanged
         let ortho = CpuOrthogonalize::new();
 
-        let t1d = Tensor::randn([10], (Kind::Float, tch::Device::Cpu));
+        let t1d = Tensor::arange(10, (Kind::Float, Device::Cpu)).sin();
         let result1d = ortho.polar_express(&t1d, 5);
         assert_eq!(t1d.size(), result1d.size());
 
-        let t3d = Tensor::randn([2, 3, 4], (Kind::Float, tch::Device::Cpu));
+        let t3d = Tensor::arange(2 * 3 * 4, (Kind::Float, Device::Cpu))
+            .reshape([2, 3, 4])
+            .cos();
         let result3d = ortho.polar_express(&t3d, 5);
         assert_eq!(t3d.size(), result3d.size());
     }
@@ -333,7 +375,10 @@ mod tests {
         let sizes: [(i64, i64); 3] = [(256, 256), (512, 512), (1024, 1024)];
 
         println!("\nPolar Express Latency Comparison (CPU, 5 iterations):");
-        println!("{:<12} {:>12} {:>12} {:>8}", "Shape", "BF16", "FP32", "Speedup");
+        println!(
+            "{:<12} {:>12} {:>12} {:>8}",
+            "Shape", "BF16", "FP32", "Speedup"
+        );
 
         for (m, n) in sizes {
             let g = Tensor::randn([m, n], (Kind::Float, tch::Device::Cpu));
@@ -377,7 +422,10 @@ mod tests {
         }
         let matmul_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
         println!("1024x1024 matmul: {:.1}ms", matmul_ms);
-        println!("Polar Express has ~15 matmuls, expected: {:.1}ms", matmul_ms * 15.0);
+        println!(
+            "Polar Express has ~15 matmuls, expected: {:.1}ms",
+            matmul_ms * 15.0
+        );
     }
 
     // ==================== AdaptiveOrthogonalize tests ====================
@@ -428,13 +476,16 @@ mod tests {
         let adaptive = AdaptiveOrthogonalize::new();
         let cpu = CpuOrthogonalize::new();
 
-        let g = Tensor::randn([4, 4], (Kind::Float, Device::Cpu));
+        let g = deterministic_matrix(4, Device::Cpu);
 
         let result_adaptive = adaptive.polar_express(&g, 5);
         let result_cpu = cpu.polar_express(&g, 5);
 
         // Results should be identical on CPU (both use FP32)
-        let diff = (&result_adaptive - &result_cpu).abs().max().double_value(&[]);
+        let diff = (&result_adaptive - &result_cpu)
+            .abs()
+            .max()
+            .double_value(&[]);
         assert!(
             diff < 1e-5,
             "Adaptive and CPU results differ: max diff={diff}"
@@ -459,7 +510,9 @@ mod tests {
         assert_eq!(result.device(), device);
 
         // Check orthogonality
-        let qqt = result.to_kind(Kind::Float).matmul(&result.to_kind(Kind::Float).tr());
+        let qqt = result
+            .to_kind(Kind::Float)
+            .matmul(&result.to_kind(Kind::Float).tr());
         let identity = Tensor::eye(64, (Kind::Float, device));
         let ortho_error = (&qqt - &identity).abs().max().double_value(&[]);
 
@@ -499,7 +552,7 @@ mod tests {
     #[test]
     fn test_orthogonality_fp32() {
         // Test orthogonality with FP32 computation
-        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let g = deterministic_matrix(16, Device::Cpu);
         let result = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
 
         // Allow 0.3 tolerance (matches existing tests, random matrices have variance)
@@ -519,7 +572,7 @@ mod tests {
     #[test]
     fn test_orthogonality_fp16() {
         // Test orthogonality with FP16 computation (used on V100)
-        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let g = deterministic_matrix(16, Device::Cpu);
         let result = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
 
         // FP16 has less precision, allow 0.35 tolerance
@@ -539,7 +592,7 @@ mod tests {
     fn test_orthogonality_bf16() {
         // Test orthogonality with BF16 computation (used on A100+)
         // Note: BF16 is slow on CPU (emulated) but we test correctness
-        let g = Tensor::randn([8, 8], (Kind::Float, Device::Cpu)); // Smaller for speed
+        let g = deterministic_matrix(8, Device::Cpu); // Smaller for speed
 
         let result = polar_express_impl(&g, 5, Kind::BFloat16, Kind::Float);
 
@@ -562,7 +615,7 @@ mod tests {
     fn test_cross_precision_consistency() {
         // Results from different precisions should be broadly consistent
         // (not identical due to precision differences, but similar)
-        let g = Tensor::randn([8, 8], (Kind::Float, Device::Cpu));
+        let g = deterministic_matrix(8, Device::Cpu);
 
         let result_fp32 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
         let result_fp16 = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
@@ -599,7 +652,7 @@ mod tests {
     fn test_cross_precision_preserves_scale() {
         // Regardless of precision, output should have similar Frobenius norm
         // (orthogonal matrices have norm = sqrt(min(m,n)))
-        let g = Tensor::randn([16, 16], (Kind::Float, Device::Cpu));
+        let g = deterministic_matrix(16, Device::Cpu);
 
         let result_fp32 = polar_express_impl(&g, 5, Kind::Float, Kind::Float);
         let result_fp16 = polar_express_impl(&g, 5, Kind::Half, Kind::Float);
