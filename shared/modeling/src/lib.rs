@@ -45,7 +45,10 @@ pub use device_utils::{Devices, get_optimal_devices};
 pub use distro::{CompressDCT, Distro, DistroResult, TransformDCT};
 pub use dummy::{DummyModel, get_dummy_parameters};
 pub use fp32_gradient_accumulator::Fp32GradientAccumulator;
-pub use matformer_c2::{MatformerStabilizationConfig, SuffixGateConfig, SuffixGateSchedule};
+pub use matformer_c2::{
+    MatformerStabilizationConfig, NormTierGainConfig, ResidualScaleConfig, SuffixGateConfig,
+    SuffixGateSchedule,
+};
 pub use models::*;
 pub use optimizer::Optimizer;
 pub use parallelism::{
