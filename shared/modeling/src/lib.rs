@@ -46,8 +46,8 @@ pub use distro::{CompressDCT, Distro, DistroResult, TransformDCT};
 pub use dummy::{DummyModel, get_dummy_parameters};
 pub use fp32_gradient_accumulator::Fp32GradientAccumulator;
 pub use matformer_c2::{
-    MatformerStabilizationConfig, NormTierGainConfig, ResidualScaleConfig, SuffixGateConfig,
-    SuffixGateSchedule,
+    DistillationConfig, MatformerStabilizationConfig, NormTierGainConfig, ResidualScaleConfig,
+    SuffixGateConfig, SuffixGateSchedule, distillation_beta,
 };
 pub use models::*;
 pub use optimizer::Optimizer;
