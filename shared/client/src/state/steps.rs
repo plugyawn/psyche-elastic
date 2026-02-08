@@ -9,6 +9,7 @@ use psyche_core::{MerkleRoot, MerkleTree, NodeIdentity, sha256};
 use psyche_modeling::{DistroResult, Trainer};
 use psyche_network::{
     AuthenticatableIdentity, BlobTicket, Hash, P2PEndpointInfo, TransmittableDistroResult,
+    TransmittableTeacherLogits,
 };
 use psyche_watcher::OpportunisticData;
 use std::{
@@ -375,7 +376,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
         };
 
         let is_warmup_broadcast = match &broadcast.data {
-            BroadcastType::TrainingResult(_) => false,
+            BroadcastType::TrainingResult(_) | BroadcastType::TeacherLogits(_) => false,
             BroadcastType::Finished(finished) => finished.warmup,
         };
 
@@ -499,6 +500,45 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                         .send((ticket, Tag::from(tag_name)))
                         .map_err(|_| ApplyMessageError::StartDownloadBlob)?;
                 }
+            }
+            BroadcastType::TeacherLogits(teacher_logits_result) => {
+                // Teacher logits are informational (for distillation), not verified via witnesses.
+                // Students download them and store for use in subsequent training steps.
+                let ticket = teacher_logits_result.ticket.clone();
+                let hash = ticket.hash();
+                if round_state.downloads.lock().unwrap().contains_key(&hash) {
+                    trace!(
+                        "Already downloading teacher logits for batch {}, ignoring",
+                        teacher_logits_result.batch_id
+                    );
+                    return Ok(ApplyMessageOutcome::Ignored);
+                }
+
+                // Store download state
+                let download_state = PayloadState::Downloading((
+                    from_client_id,
+                    teacher_logits_result.batch_id,
+                    ticket.clone(),
+                ));
+                round_state
+                    .downloads
+                    .lock()
+                    .unwrap()
+                    .insert(hash, download_state);
+
+                // Start download if from another client
+                let tag_name =
+                    format!("teacher-logits-{from_client_id}_{result_step}");
+                if from_client_id != self.identity {
+                    self.tx_request_download
+                        .send((ticket, Tag::from(tag_name)))
+                        .map_err(|_| ApplyMessageError::StartDownloadBlob)?;
+                }
+                trace!(
+                    "Received teacher logits announcement for batch {} from {}",
+                    teacher_logits_result.batch_id,
+                    from_client_id
+                );
             }
             BroadcastType::Finished(finished) => {
                 if round_state.clients_finished.contains_key(&from_client_id) {
@@ -743,6 +783,39 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                 .metrics
                 .record_result_downloaded(downloads.len() as u64, current_round, hash, batch_id);
         });
+    }
+
+    /// Store received teacher logits for distillation.
+    /// Students use these when training on the corresponding batch.
+    pub fn apply_teacher_logits(
+        &mut self,
+        hash: Hash,
+        teacher_logits: TransmittableTeacherLogits,
+    ) {
+        let round_state = if self.current_round.downloads.lock().unwrap().contains_key(&hash) {
+            &mut self.current_round
+        } else if self
+            .previous_round
+            .downloads
+            .lock()
+            .unwrap()
+            .contains_key(&hash)
+        {
+            &mut self.previous_round
+        } else {
+            warn!("Unknown teacher logits download {}", hash);
+            return;
+        };
+
+        trace!(
+            "Storing teacher logits for batch {} step {} (hash {})",
+            teacher_logits.batch_id,
+            teacher_logits.step,
+            hash
+        );
+        round_state
+            .teacher_logits
+            .insert(teacher_logits.batch_id.clone(), teacher_logits);
     }
 
     async fn apply_state(&mut self, state: Coordinator<T>) -> Result<(), StepError> {
@@ -1076,6 +1149,21 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunManager<T, A> {
         match &mut self.0 {
             InitStage::Running(state_machine) => {
                 state_machine.apply_distro_result(hash, distro_result, self_result);
+            }
+            _ => {
+                // not yet warmed up, ignore any p2p messages.
+            }
+        }
+    }
+
+    pub fn apply_teacher_logits(
+        &mut self,
+        hash: psyche_network::Hash,
+        teacher_logits: TransmittableTeacherLogits,
+    ) {
+        match &mut self.0 {
+            InitStage::Running(state_machine) => {
+                state_machine.apply_teacher_logits(hash, teacher_logits);
             }
             _ => {
                 // not yet warmed up, ignore any p2p messages.

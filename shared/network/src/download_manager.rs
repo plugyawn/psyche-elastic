@@ -232,6 +232,8 @@ pub enum TransmittableDownload {
     DistroResult(TransmittableDistroResult),
     ModelParameter(TransmittableModelParameter),
     ModelConfig(TransmittableModelConfig),
+    /// Compressed teacher logits for in-place distillation.
+    TeacherLogits(crate::teacher_logits::TransmittableTeacherLogits),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -240,6 +242,8 @@ pub enum DownloadType {
     DistroResult(Vec<PublicKey>),
     // Model sharing variant containing the specific type wether be the model config or a parameter
     ModelSharing(ModelRequestType),
+    // Teacher logits for in-place distillation (from tier-0 clients)
+    TeacherLogits(Vec<PublicKey>),
 }
 
 impl DownloadType {
@@ -247,6 +251,7 @@ impl DownloadType {
         match self {
             Self::DistroResult(..) => "distro_result",
             Self::ModelSharing(..) => "model_sharing",
+            Self::TeacherLogits(..) => "teacher_logits",
         }
     }
 }

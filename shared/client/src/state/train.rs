@@ -267,6 +267,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
             committee_info: Some((committee_proof, witness_proof, committee_selection)),
             batch_ids_not_yet_trained_on,
             self_distro_results: vec![],
+            teacher_logits: Default::default(),
         };
 
         let warmup_lr_between = state.get_cold_start_warmup_bounds();

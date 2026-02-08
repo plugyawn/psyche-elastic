@@ -5,6 +5,7 @@ use psyche_coordinator::{
 };
 use psyche_core::{BatchId, NodeIdentity};
 use psyche_modeling::DistroResult;
+use psyche_network::TransmittableTeacherLogits;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
@@ -27,6 +28,9 @@ pub struct RoundState<T: NodeIdentity> {
     pub committee_info: Option<(CommitteeProof, WitnessProof, CommitteeSelection)>,
     pub batch_ids_not_yet_trained_on: Arc<Mutex<Option<BatchIdSet>>>,
     pub self_distro_results: Vec<Vec<DistroResult>>,
+    /// Teacher logits received from tier-0 clients, keyed by batch ID.
+    /// Students use these for distillation loss in subsequent rounds.
+    pub teacher_logits: HashMap<BatchId, TransmittableTeacherLogits>,
 }
 
 impl<T: NodeIdentity> RoundState<T> {
@@ -45,6 +49,7 @@ impl<T: NodeIdentity> RoundState<T> {
             committee_info: None,
             batch_ids_not_yet_trained_on: Arc::new(Mutex::new(None)),
             self_distro_results: vec![],
+            teacher_logits: HashMap::new(),
         }
     }
 
