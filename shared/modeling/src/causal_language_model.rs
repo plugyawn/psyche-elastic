@@ -520,3 +520,121 @@ impl EosToks {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kd_loss_identical_distributions() {
+        // When student and teacher have the same distribution, KL should be ~0
+        let logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+        let log_probs = logits.log_softmax(-1, Kind::Float);
+        let loss = kd_loss(&logits, &log_probs, 1.0);
+        let loss_val = loss.double_value(&[]);
+        assert!(
+            loss_val.abs() < 1e-4,
+            "KD loss with identical distributions should be ~0, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_kd_loss_different_distributions() {
+        // When student and teacher differ, KL should be > 0
+        let student_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+        let teacher_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+        let teacher_log_probs = teacher_logits.log_softmax(-1, Kind::Float);
+        let loss = kd_loss(&student_logits, &teacher_log_probs, 1.0);
+        let loss_val = loss.double_value(&[]);
+        assert!(
+            loss_val > 0.0,
+            "KD loss with different distributions should be > 0, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_kd_loss_temperature_scaling() {
+        // Higher temperature should soften the distribution, reducing KL
+        let student_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+        let teacher_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+
+        let teacher_log_probs_t1 = teacher_logits.log_softmax(-1, Kind::Float);
+        let loss_t1 = kd_loss(&student_logits, &teacher_log_probs_t1, 1.0).double_value(&[]);
+
+        // For T=2, we need to compute teacher log probs at that temperature
+        let teacher_log_probs_t2 = (&teacher_logits / 2.0).log_softmax(-1, Kind::Float);
+        let loss_t2 = kd_loss(&student_logits, &teacher_log_probs_t2, 2.0).double_value(&[]);
+
+        // Both should be positive
+        assert!(loss_t1 > 0.0);
+        assert!(loss_t2 > 0.0);
+    }
+
+    #[test]
+    fn test_teacher_logit_targets_reconstruction() {
+        let batch = 2;
+        let seq = 4;
+        let top_k = 3;
+        let vocab_size = 10;
+
+        // Create known top-k targets
+        let top_indices = Tensor::from_slice(&[
+            0i64, 1, 2, // token 0
+            3, 4, 5, // token 1
+            6, 7, 8, // token 2
+            0, 3, 6, // token 3
+            1, 4, 7, // token 0 (batch 2)
+            2, 5, 8, // token 1
+            0, 1, 2, // token 2
+            3, 4, 5, // token 3
+        ])
+        .reshape([batch, seq, top_k]);
+
+        let top_values = Tensor::from_slice(&[
+            5.0f32, 3.0, 1.0, // token 0
+            4.0, 2.0, 0.5, // token 1
+            6.0, 4.0, 2.0, // token 2
+            3.0, 2.0, 1.0, // token 3
+            5.0, 3.0, 1.0, // token 0 (batch 2)
+            4.0, 2.0, 0.5, // token 1
+            6.0, 4.0, 2.0, // token 2
+            3.0, 2.0, 1.0, // token 3
+        ])
+        .reshape([batch, seq, top_k]);
+
+        let targets = TeacherLogitTargets {
+            top_indices,
+            top_values,
+            temperature: 2.0,
+            top_k,
+            vocab_size,
+        };
+
+        let log_probs = targets.to_shifted_log_probs(Device::Cpu);
+        // Should be [batch * (seq-1), vocab_size]
+        assert_eq!(log_probs.size(), vec![batch * (seq - 1), vocab_size]);
+
+        // All log probs should be <= 0
+        let max_lp = log_probs.max().double_value(&[]);
+        assert!(
+            max_lp <= 0.0 + 1e-6,
+            "log probs should be <= 0, got max {}",
+            max_lp
+        );
+
+        // Exponentiated probs should sum to ~1
+        let probs = log_probs.exp();
+        let sums = probs.sum_dim_intlist(-1, false, Kind::Float);
+        for i in 0..sums.size()[0] {
+            let s = sums.double_value(&[i]);
+            assert!(
+                (s - 1.0).abs() < 0.01,
+                "probs should sum to ~1, got {} at position {}",
+                s,
+                i
+            );
+        }
+    }
+}
