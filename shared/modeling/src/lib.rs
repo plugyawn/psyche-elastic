@@ -39,7 +39,7 @@ pub use auto_tokenizer::{AutoTokenizerError, auto_tokenizer};
 pub use batcher::Batcher;
 pub use causal_language_model::{
     CausalLM, CausalLanguageModel, EosToks, LanguageModelBuilder, LanguageModelConfig,
-    LanguageModelForward,
+    LanguageModelForward, TeacherLogitTargets, kd_loss,
 };
 pub use device_utils::{Devices, get_optimal_devices};
 pub use distro::{CompressDCT, Distro, DistroResult, TransformDCT};
