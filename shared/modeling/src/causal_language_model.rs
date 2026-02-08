@@ -9,6 +9,7 @@ use tch::{
     nn::{self, Module},
     Device, Kind, Tensor,
 };
+use tracing::trace;
 
 #[cfg(feature = "parallelism")]
 use tch::CNCCL;
@@ -50,6 +51,96 @@ pub trait CausalLM: Send {
     fn matformer_tail_grad_stats(&self) -> Option<MatformerTailGradSummary> {
         None
     }
+
+    /// Forward pass with knowledge distillation loss.
+    ///
+    /// Computes: `(1 - β) * CE(student, labels) + β * KL(student/T, teacher/T) * T²`
+    ///
+    /// Default impl falls back to regular forward (ignores teacher targets).
+    fn forward_with_distillation(
+        &self,
+        x: &Tensor,
+        labels: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        sequence_lengths: Option<&Vec<Vec<i32>>>,
+        loss_scale: Option<f64>,
+        _teacher_targets: &TeacherLogitTargets,
+        _distillation_beta: f64,
+    ) -> (Option<Tensor>, Option<Tensor>) {
+        // Default: ignore distillation, just do regular forward
+        self.forward(x, labels, position_ids, sequence_lengths, None, loss_scale)
+    }
+}
+
+/// Reconstructed teacher logit targets for knowledge distillation.
+///
+/// Created from `CompressedTeacherLogits` on the student side.
+/// The teacher distribution is stored as sparse top-k + uniform remainder.
+#[derive(Debug)]
+pub struct TeacherLogitTargets {
+    /// Top-k vocabulary indices: [batch, seq, top_k]
+    pub top_indices: Tensor,
+    /// Top-k logit values: [batch, seq, top_k]
+    pub top_values: Tensor,
+    /// Temperature used for softening
+    pub temperature: f32,
+    /// Number of top-k entries per token
+    pub top_k: i64,
+    /// Vocab size for reconstructing full distribution
+    pub vocab_size: i64,
+}
+
+impl TeacherLogitTargets {
+    /// Reconstruct a full teacher log-probability distribution from sparse top-k.
+    ///
+    /// For tokens where we have top-k logits, the remaining probability mass
+    /// is distributed uniformly across the (vocab_size - top_k) remaining tokens.
+    ///
+    /// Returns: [batch * (seq-1), vocab_size] log-probabilities (shifted to match CE convention).
+    pub fn to_shifted_log_probs(&self, device: Device) -> Tensor {
+        let top_indices = self.top_indices.to(device);
+        let top_values = self.top_values.to(device).to_kind(Kind::Float);
+
+        // Apply temperature scaling
+        let scaled = &top_values / (self.temperature as f64);
+
+        // Compute softmax over top-k to get the "known" probability mass
+        let top_probs = scaled.softmax(-1, Kind::Float);
+
+        // Allocate full distribution with a small floor (uniform over remaining vocab)
+        let (batch, seq, _k) = top_indices.size3().unwrap();
+        let floor_val = 1e-8_f64 / (self.vocab_size as f64);
+        let mut full_log_probs =
+            Tensor::full([batch, seq, self.vocab_size], floor_val, (Kind::Float, device)).log();
+
+        // Scatter top-k probabilities into the full distribution
+        let top_probs_adjusted = &top_probs * (1.0 - 1e-8); // leave floor for remaining
+        let log_top_probs = top_probs_adjusted.log();
+        let _ = full_log_probs.scatter_(-1, &top_indices.to_kind(Kind::Int64), &log_top_probs);
+
+        // Shift by 1 to match causal LM convention: token[i] predicts token[i+1]
+        // Same shift as CE loss: take positions [0..seq-1]
+        full_log_probs.slice(1, 0, -1, 1).contiguous().view([-1, self.vocab_size])
+    }
+}
+
+/// Compute KD loss: `β * KL(student/T || teacher/T) * T²`.
+///
+/// - `student_logits`: raw student logits [batch*(seq-1), vocab_size]
+/// - `teacher_log_probs`: teacher log-probs [batch*(seq-1), vocab_size]
+/// - `temperature`: softening temperature
+///
+/// Returns a scalar loss tensor.
+pub fn kd_loss(student_logits: &Tensor, teacher_log_probs: &Tensor, temperature: f32) -> Tensor {
+    let t = temperature as f64;
+    let student_log_probs = (student_logits / t).log_softmax(-1, Kind::Float);
+    // KL(student || teacher) = sum(teacher * (log(teacher) - log(student)))
+    // = sum(exp(teacher_log_probs) * (teacher_log_probs - student_log_probs))
+    let teacher_probs = teacher_log_probs.exp();
+    let kl = (&teacher_probs * (teacher_log_probs - &student_log_probs))
+        .sum_dim_intlist(-1, false, Kind::Float)
+        .mean(Kind::Float);
+    kl * (t * t)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -269,6 +360,70 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguag
                     loss /= loss_scale;
                 }
                 Some(loss)
+            }
+            None => None,
+        };
+        (Some(logits), loss)
+    }
+
+    fn forward_with_distillation(
+        &self,
+        x: &Tensor,
+        labels: Option<&Tensor>,
+        position_ids: Option<&Tensor>,
+        sequence_lengths: Option<&Vec<Vec<i32>>>,
+        loss_scale: Option<f64>,
+        teacher_targets: &TeacherLogitTargets,
+        distillation_beta: f64,
+    ) -> (Option<Tensor>, Option<Tensor>) {
+        let x = self.model.forward(
+            x,
+            position_ids,
+            sequence_lengths,
+            self.training.load(Ordering::Relaxed),
+        );
+        let mut logits = self.lm_head.forward(&x);
+
+        if let Some(scale) = self.config.logit_softcap_scale() {
+            logits = (logits / (scale / 4.0)).sigmoid() * scale;
+        }
+
+        let loss = match labels {
+            Some(labels) => {
+                logits = logits.to_kind(Kind::Float);
+                let shift_logits = logits.slice(1, 0, -1, 1).contiguous();
+                let shift_labels = labels.slice(1, 1, None, 1).contiguous();
+                let vocab_size = self.config.vocab_size() as i64;
+                let shift_logits_flat = shift_logits.view([-1i64, vocab_size]);
+                let shift_targets = shift_labels.view(-1).to_kind(Kind::Int64);
+
+                // CE loss
+                let ce_loss = shift_logits_flat.cross_entropy_loss::<Tensor>(
+                    &shift_targets,
+                    None,
+                    tch::Reduction::Mean,
+                    -100,
+                    0.0,
+                );
+
+                // KD loss from teacher targets
+                let teacher_log_probs = teacher_targets.to_shifted_log_probs(self.device);
+                let kd = kd_loss(&shift_logits_flat, &teacher_log_probs, teacher_targets.temperature);
+
+                // Combined: (1 - β) * CE + β * KD
+                let beta = distillation_beta;
+                let mut combined = &ce_loss * (1.0 - beta) + &kd * beta;
+                trace!(
+                    ce = ce_loss.double_value(&[]),
+                    kd = kd.double_value(&[]),
+                    beta = beta,
+                    "distillation loss"
+                );
+
+                if let Some(loss_scale) = loss_scale {
+                    combined /= loss_scale;
+                }
+                Some(combined)
             }
             None => None,
         };
