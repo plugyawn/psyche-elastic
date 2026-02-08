@@ -115,6 +115,26 @@ struct StartArgs {
     #[clap(long, value_delimiter = ',')]
     client_matformer_helper_rotation_intervals: Vec<u64>,
 
+    /// MatFormer distillation beta_max (0 = disabled). Set > 0 to enable distillation.
+    #[clap(long, default_value_t = 0.0)]
+    matformer_distillation_beta_max: f64,
+
+    /// MatFormer distillation warmup steps.
+    #[clap(long, default_value_t = 100)]
+    matformer_distillation_warmup_steps: u32,
+
+    /// MatFormer distillation start step.
+    #[clap(long, default_value_t = 0)]
+    matformer_distillation_start_step: u32,
+
+    /// MatFormer distillation top-k logits.
+    #[clap(long, default_value_t = 32)]
+    matformer_distillation_top_k: u16,
+
+    /// MatFormer distillation temperature.
+    #[clap(long, default_value_t = 2.0)]
+    matformer_distillation_temperature: f32,
+
     /// What discovery mode to use for spawned clients (`local` or `n0`).
     #[clap(long, default_value = "local")]
     client_iroh_discovery: String,
@@ -737,6 +757,21 @@ fn spawn_client_headless(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    if args.matformer_distillation_beta_max > 0.0 {
+        cmd.args([
+            "--matformer-distillation-beta-max",
+            &args.matformer_distillation_beta_max.to_string(),
+            "--matformer-distillation-warmup-steps",
+            &args.matformer_distillation_warmup_steps.to_string(),
+            "--matformer-distillation-start-step",
+            &args.matformer_distillation_start_step.to_string(),
+            "--matformer-distillation-top-k",
+            &args.matformer_distillation_top_k.to_string(),
+            "--matformer-distillation-temperature",
+            &args.matformer_distillation_temperature.to_string(),
+        ]);
+    }
+
     if let Some(token) = &args.hf_token {
         cmd.env("HF_TOKEN", token);
     }
@@ -887,6 +922,17 @@ fn start_client(
         args.client_iroh_discovery,
         args.client_iroh_relay,
     ));
+
+    if args.matformer_distillation_beta_max > 0.0 {
+        cmd.push(format!(
+            " --matformer-distillation-beta-max {} --matformer-distillation-warmup-steps {} --matformer-distillation-start-step {} --matformer-distillation-top-k {} --matformer-distillation-temperature {}",
+            args.matformer_distillation_beta_max,
+            args.matformer_distillation_warmup_steps,
+            args.matformer_distillation_start_step,
+            args.matformer_distillation_top_k,
+            args.matformer_distillation_temperature,
+        ));
+    }
 
     if let Some(dir) = &args.write_distro_data {
         cmd.push(" --write-gradients-dir ");

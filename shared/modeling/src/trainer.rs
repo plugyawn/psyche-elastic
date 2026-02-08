@@ -1,7 +1,7 @@
 use crate::{
     AllReduce, CausalLM, Communicator, CommunicatorId, CudaSynchronize, Distro, DistroResult,
     EosToks, Fp32GradientAccumulator, Optimizer, ReduceType, StableVariableIterator,
-    unsharded_cpu_variables,
+    TeacherLogitTargets, unsharded_cpu_variables,
 };
 use anyhow::{Error, Result};
 use psyche_core::{Barrier, BatchId, LearningRateSchedule, OptimizerDefinition};
@@ -238,6 +238,8 @@ pub struct TrainOutput {
     pub cancelled: bool,
     /// Global gradient L2 norm (computed after DP reduction, before clipping)
     pub grad_norm: f32,
+    /// Teacher logits extracted from the forward pass (tier-0 only, for distillation).
+    pub teacher_logits: Option<Tensor>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +260,12 @@ enum ParallelAssignment {
         rollback: Vec<(u32, Vec<DistroResults>)>,
         cancel_training: CancellationToken,
         prev_self_distro_results: Option<Vec<DistroResults>>,
+        /// If true, extract top-k logits after training for teacher broadcast.
+        produce_teacher_logits: bool,
+        /// Top-k value for teacher logit extraction.
+        teacher_logits_top_k: u16,
+        /// If set, use distillation loss (student side).
+        teacher_targets: Option<(TeacherLogitTargets, f64)>,
     },
     Optimize {
         distro_results: Option<Vec<DistroResults>>,
@@ -283,6 +291,7 @@ enum ParallelResult {
         cancelled: bool,
         distro_results: Option<DistroResults>,
         grad_norm: f32,
+        teacher_logits: Option<Tensor>,
     },
     Optimize,
     Forward {
@@ -311,6 +320,9 @@ impl Trainer {
         rollback: Vec<(u32, Vec<DistroResults>)>,
         prev_self_distro_results: Option<Vec<DistroResults>>,
         cancel_training: CancellationToken,
+        produce_teacher_logits: bool,
+        teacher_logits_top_k: u16,
+        teacher_targets: Option<(TeacherLogitTargets, f64)>,
     ) -> Result<TrainOutput, TrainerThreadCommunicationError> {
         match self {
             Trainer::Local(local_trainer) => local_trainer.train(
@@ -321,6 +333,9 @@ impl Trainer {
                 rollback,
                 prev_self_distro_results,
                 cancel_training,
+                produce_teacher_logits,
+                teacher_logits_top_k,
+                teacher_targets,
             ),
             #[cfg(feature = "python")]
             Trainer::PythonDistributed(python) => python.train(
@@ -542,6 +557,39 @@ impl LocalTrainer {
         Ok(Some(loss.detach()))
     }
 
+    fn forward_backward_with_distillation(
+        model: &mut dyn CausalLM,
+        inputs: Tensor,
+        labels: Option<Tensor>,
+        position_ids: Option<Tensor>,
+        sequence_lengths: Option<Vec<Vec<i32>>>,
+        barrier: &Arc<dyn Barrier>,
+        loss_scale: Option<f64>,
+        teacher_targets: &TeacherLogitTargets,
+        distillation_beta: f64,
+    ) -> Result<Option<Tensor>> {
+        let labels = labels.unwrap_or_else(|| inputs.copy());
+        if barrier.wait().is_err() {
+            return Ok(None);
+        }
+        let device = inputs.device();
+        let (_, loss) = model.forward_with_distillation(
+            &inputs,
+            Some(&labels),
+            position_ids.as_ref(),
+            sequence_lengths.as_ref(),
+            loss_scale,
+            teacher_targets,
+            distillation_beta,
+        );
+        let loss = loss.ok_or(Error::msg("No distillation loss"))?;
+        loss.backward();
+        if device.is_cuda() {
+            device.cuda_synchronize();
+        }
+        Ok(Some(loss.detach()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward(
         model: &mut dyn CausalLM,
@@ -585,6 +633,9 @@ impl LocalTrainer {
         rollback: Vec<(u32, Vec<DistroResults>)>,
         prev_self_distro_results: Option<Vec<DistroResults>>,
         cancel_training: CancellationToken,
+        produce_teacher_logits: bool,
+        teacher_logits_top_k: u16,
+        teacher_targets: Option<(TeacherLogitTargets, f64)>,
     ) -> Result<TrainOutput, TrainerThreadCommunicationError> {
         if !rollback.is_empty() {
             error!(
@@ -593,7 +644,8 @@ impl LocalTrainer {
             );
         }
         self.barrier.reset();
-        for (tx, _) in &self.models {
+        let mut teacher_targets = teacher_targets;
+        for (i, (tx, _)) in self.models.iter().enumerate() {
             tx.send(ParallelAssignment::Train {
                 batch: data.clone(),
                 step,
@@ -602,6 +654,10 @@ impl LocalTrainer {
                 rollback: rollback.clone(),
                 prev_self_distro_results: prev_self_distro_results.clone(),
                 cancel_training: cancel_training.clone(),
+                produce_teacher_logits,
+                teacher_logits_top_k,
+                // Only first model gets teacher targets (avoids cloning large tensors)
+                teacher_targets: if i == 0 { teacher_targets.take() } else { None },
             })
             .map_err(|_| TrainerThreadCommunicationError::SendCommand)?;
         }
@@ -611,6 +667,7 @@ impl LocalTrainer {
         let mut final_cancelled = false;
         let mut final_nonce = 0;
         let mut final_grad_norm = 0.0f32;
+        let mut final_teacher_logits = None;
         for (_, rx) in &self.models {
             match rx
                 .recv()
@@ -622,11 +679,15 @@ impl LocalTrainer {
                     cancelled,
                     nonce,
                     grad_norm,
+                    teacher_logits,
                 } => {
                     if final_distro_results.is_none() {
                         final_distro_results = distro_results;
                         final_nonce = nonce;
                         final_grad_norm = grad_norm;
+                    }
+                    if final_teacher_logits.is_none() {
+                        final_teacher_logits = teacher_logits;
                     }
                     final_cancelled = cancelled;
                     final_loss += loss;
@@ -648,6 +709,7 @@ impl LocalTrainer {
             cancelled: final_cancelled,
             nonce: final_nonce,
             grad_norm: final_grad_norm,
+            teacher_logits: final_teacher_logits,
         })
     }
 
@@ -781,6 +843,9 @@ impl LocalTrainer {
                     rollback: _,
                     prev_self_distro_results,
                     cancel_training,
+                    produce_teacher_logits,
+                    teacher_logits_top_k,
+                    teacher_targets,
                 }) => {
                     // this needs even more work for overlapped
                     // for (step, result) in rollback.iter().rev() {
@@ -809,12 +874,29 @@ impl LocalTrainer {
                     let grad_accum_divisor = grad_accum_steps as f64;
 
                     // collate data for batch
+                    let batch_gpu = batch.data.gpu(model.device());
+                    // Save references for teacher logit extraction (before chunking)
+                    let batch_input_ids = if produce_teacher_logits {
+                        Some(batch_gpu.input_ids.shallow_clone())
+                    } else {
+                        None
+                    };
+                    let batch_position_ids = if produce_teacher_logits {
+                        batch_gpu.position_ids.as_ref().map(|p| p.shallow_clone())
+                    } else {
+                        None
+                    };
+                    let batch_sequence_lengths = if produce_teacher_logits {
+                        batch_gpu.sequence_lengths.clone()
+                    } else {
+                        None
+                    };
                     let BatchDataGPU {
                         input_ids,
                         labels,
                         position_ids,
                         sequence_lengths,
-                    } = batch.data.gpu(model.device());
+                    } = batch_gpu;
                     // note: torch chunk argument is total number of chunks,
                     // rust iter chunk is number of elements per chunk
                     let input_ids = input_ids.chunk(grad_accum_steps as i64, 0);
@@ -915,15 +997,30 @@ impl LocalTrainer {
                             warn!("Aborting training upon request");
                             break;
                         }
-                        match Self::forward_backward(
-                            &mut *model,
-                            input_ids,
-                            labels,
-                            position_ids,
-                            sequence_lengths,
-                            &barrier,
-                            Some(grad_accum_divisor),
-                        ) {
+                        let fb_result = if let Some((ref targets, beta)) = teacher_targets {
+                            Self::forward_backward_with_distillation(
+                                &mut *model,
+                                input_ids,
+                                labels,
+                                position_ids,
+                                sequence_lengths,
+                                &barrier,
+                                Some(grad_accum_divisor),
+                                targets,
+                                beta,
+                            )
+                        } else {
+                            Self::forward_backward(
+                                &mut *model,
+                                input_ids,
+                                labels,
+                                position_ids,
+                                sequence_lengths,
+                                &barrier,
+                                Some(grad_accum_divisor),
+                            )
+                        };
+                        match fb_result {
                             Ok(Some(batch_loss)) => {
                                 if batch_loss.double_value(&[]).is_finite() {
                                     match loss.as_mut() {
@@ -1043,6 +1140,49 @@ impl LocalTrainer {
                         },
                         true => None,
                     };
+                    // Extract teacher logits if requested (tier-0 for distillation)
+                    let extracted_teacher_logits = if produce_teacher_logits && !cancelled {
+                        let _guard = tch::no_grad_guard();
+                        // Re-run forward on the original input_ids to get logits
+                        let saved_input_ids = batch_input_ids.as_ref().unwrap();
+                        let (logits, _) = model.forward(
+                            saved_input_ids,
+                            None,
+                            batch_position_ids.as_ref(),
+                            batch_sequence_lengths.as_ref(),
+                            None,
+                            None,
+                        );
+                        match logits {
+                            Some(logits) => {
+                                // Extract top-k: logits is [batch, seq, vocab]
+                                let k = teacher_logits_top_k as i64;
+                                let (top_values, top_indices) = logits.topk(k, -1, true, true);
+                                // Move to CPU and convert to float for packing
+                                let top_values_cpu = top_values.to(Device::Cpu).to_kind(Kind::Float);
+                                let top_indices_cpu = top_indices.to(Device::Cpu).to_kind(Kind::Int64);
+                                let size = top_values_cpu.size();
+                                trace!(
+                                    batch = size[0],
+                                    seq = size[1],
+                                    top_k = size[2],
+                                    "Extracted teacher logits"
+                                );
+                                // Pack indices (as float for cat) and values into single tensor along last dim
+                                Some(Tensor::cat(&[
+                                    &top_indices_cpu.to_kind(Kind::Float),
+                                    &top_values_cpu,
+                                ], -1))
+                            }
+                            None => {
+                                warn!("Failed to extract teacher logits: no logits from forward pass");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     // with Python FSDP we need to do a full forward/backward correctly before we can do inference
                     can_do_inference.store(true, Ordering::Relaxed);
                     if submission
@@ -1055,6 +1195,7 @@ impl LocalTrainer {
                             cancelled,
                             nonce,
                             grad_norm,
+                            teacher_logits: extracted_teacher_logits,
                         })
                         .is_err()
                     {

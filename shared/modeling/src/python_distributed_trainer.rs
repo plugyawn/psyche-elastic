@@ -235,6 +235,9 @@ impl PythonDistributedTrainer {
             rollback,
             prev_self_distro_results,
             cancel_training,
+            false, // produce_teacher_logits: not supported in Python distributed
+            32,    // teacher_logits_top_k: unused
+            None,  // teacher_targets: no distillation in Python distributed
         )?;
 
         // reduce the loss across all shards

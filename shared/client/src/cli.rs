@@ -257,6 +257,27 @@ pub struct TrainArgs {
 
     #[clap(long, default_value_t = 3, env)]
     pub keep_steps: u32,
+
+    /// Enable MatFormer distillation: tier-0 broadcasts teacher logits, tier>0 uses them.
+    /// Set beta-max > 0 to enable. All distillation args are optional with sane defaults.
+    #[clap(long, env, default_value_t = 0.0)]
+    pub matformer_distillation_beta_max: f64,
+
+    /// Number of top logits to transmit per token for distillation.
+    #[clap(long, env, default_value_t = 32)]
+    pub matformer_distillation_top_k: u16,
+
+    /// Temperature for KL divergence softening in distillation.
+    #[clap(long, env, default_value_t = 2.0)]
+    pub matformer_distillation_temperature: f32,
+
+    /// Step at which distillation begins (teacher is garbage early).
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_distillation_start_step: u32,
+
+    /// Steps to ramp distillation β from 0 to beta_max.
+    #[clap(long, env, default_value_t = 100)]
+    pub matformer_distillation_warmup_steps: u32,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
