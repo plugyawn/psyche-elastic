@@ -253,6 +253,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                                     BroadcastType::Finished(_) => {
                                                         trace!("Got finished gossip message from {from}: step {}", broadcast.step);
                                                     }
+                                                    BroadcastType::TeacherLogits(tl) => {
+                                                        trace!("Got teacher logits gossip message from {from}: step {} batch id {}", broadcast.step, tl.batch_id);
+                                                    }
                                                 }
                                                 let apply_result = run.apply_message(client.id, broadcast)?;
                                                 match apply_result {
@@ -307,6 +310,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                                 sharable_model.add_config(config)?;
                                                 sharable_model.send_config()?;
                                             },
+                                            TransmittableDownload::TeacherLogits(teacher_logits) => {
+                                                debug!("Download complete: teacher logits for step {} batch {}", teacher_logits.step, teacher_logits.batch_id);
+                                                run.apply_teacher_logits(hash, teacher_logits);
+                                            },
                                         }
                                     }
                                     NetworkEvent::DownloadFailed(dl) => {
@@ -352,10 +359,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                                     });
                                             });
                                         }
-                                            DownloadType::DistroResult(_) => {
+                                            DownloadType::DistroResult(_) | DownloadType::TeacherLogits(_) => {
                                                 if retries >= MAX_DOWNLOAD_RETRIES {
                                                     metrics.record_download_perma_failed();
-                                                    warn!("Distro result download failed (not retrying): {}", dl.error);
+                                                    warn!("Download failed (not retrying): {}", dl.error);
                                                     retried_downloads.remove(hash).await;
                                                 } else {
                                                     metrics.record_download_failed();
@@ -363,7 +370,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                                     let retry_time = Some(std::time::Instant::now() + backoff_duration);
 
                                                     info!(
-                                                        "Distro result download failed (will retry in {:?}): {}",
+                                                        "Download failed (will retry in {:?}): {}",
                                                         backoff_duration,
                                                         dl.error
                                                     );
@@ -478,6 +485,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                     match &broadcast.data {
                                         BroadcastType::TrainingResult(training_result) => trace!(client_id = %identity, step = broadcast.step, nonce = broadcast.nonce, batch_id = %training_result.batch_id, "Rebroadcasting training result"),
                                         BroadcastType::Finished(finished) => trace!(client_id = %identity, step = broadcast.step, nonce = broadcast.nonce, warmup = finished.warmup, "Rebroadcasting finished"),
+                                        BroadcastType::TeacherLogits(teacher_logits) => trace!(client_id = %identity, step = broadcast.step, nonce = broadcast.nonce, batch_id = %teacher_logits.batch_id, "Rebroadcasting teacher logits"),
                                     }
                                     p2p.broadcast(broadcast)?;
                                 }
@@ -499,8 +507,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                                     metrics.record_download_retry(hash);
                                     // We check the type of the failed download and send it to the appropriate channel to retry it
                                     match download_type {
-                                        DownloadType::DistroResult(_) => {
-                                            info!("Retrying download for distro result, (attempt {})", retries);
+                                        DownloadType::DistroResult(_) | DownloadType::TeacherLogits(_) => {
+                                            info!("Retrying download for distro result / teacher logits, (attempt {})", retries);
                                             let _ = tx_request_download.send((ticket, tag));
                                         },
                                         DownloadType::ModelSharing(inner) => {

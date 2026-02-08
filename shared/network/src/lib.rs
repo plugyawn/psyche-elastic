@@ -456,7 +456,7 @@ where
         let provider_endpoint_id = ticket.addr().clone();
         let ticket_hash = ticket.hash();
         let additional_peers_to_try = match download_type.clone() {
-            DownloadType::DistroResult(peers) => peers,
+            DownloadType::DistroResult(peers) | DownloadType::TeacherLogits(peers) => peers,
             DownloadType::ModelSharing(_) => {
                 vec![]
             }
