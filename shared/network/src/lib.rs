@@ -66,6 +66,7 @@ mod serialized_distro;
 mod signed_message;
 mod state;
 mod tcp;
+pub mod teacher_logits;
 mod tui;
 mod util;
 
@@ -89,6 +90,7 @@ pub use serialized_distro::{
     distro_results_from_reader, distro_results_to_bytes,
 };
 pub use signed_message::SignedMessage;
+pub use teacher_logits::{CompressedTeacherLogits, TeacherLogitsError, TransmittableTeacherLogits};
 pub use tcp::{ClientNotification, TcpClient, TcpServer};
 pub use tui::{NetworkTUIState, NetworkTui};
 use url::Url;
