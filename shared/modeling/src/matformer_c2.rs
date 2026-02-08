@@ -20,6 +20,16 @@ pub struct MatformerStabilizationConfig {
     /// Optional tier-0 suffix gate schedule (progressive growth).
     #[serde(default)]
     pub suffix_gate: Option<SuffixGateConfig>,
+
+    /// Per-tier MLP/attn residual scaling: α = (active/full)^power.
+    /// Tier-0 (active==full) always gets α=1.0 (no change).
+    #[serde(default)]
+    pub residual_scale: Option<ResidualScaleConfig>,
+
+    /// Per-tier RMSNorm gain scalar: gain = (active/full)^power.
+    /// Tier-0 (active==full) always gets gain=1.0 (no change).
+    #[serde(default)]
+    pub norm_tier_gain: Option<NormTierGainConfig>,
 }
 
 fn default_width_rescale_power() -> f64 {
@@ -32,6 +42,71 @@ impl Default for MatformerStabilizationConfig {
             width_rescale_mlp_output: false,
             width_rescale_power: default_width_rescale_power(),
             suffix_gate: None,
+            residual_scale: None,
+            norm_tier_gain: None,
+        }
+    }
+}
+
+/// Per-tier residual scaling for MLP and/or attention outputs.
+///
+/// When a smaller tier uses fewer FFN neurons, the MLP output has a different
+/// magnitude than the full-width tier-0. This scales the residual contribution
+/// by `(active_width / full_width)^power` to calibrate activation statistics.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ResidualScaleConfig {
+    /// Exponent applied to (active/full) ratio. Default 0.5 (sqrt).
+    #[serde(default = "default_residual_scale_power")]
+    pub power: f64,
+
+    /// Apply residual scaling to MLP output. Default true.
+    #[serde(default = "default_true")]
+    pub apply_to_mlp: bool,
+
+    /// Apply residual scaling to attention output. Default false
+    /// (attention is full-width, no slicing).
+    #[serde(default)]
+    pub apply_to_attn: bool,
+}
+
+fn default_residual_scale_power() -> f64 {
+    0.5
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ResidualScaleConfig {
+    fn default() -> Self {
+        Self {
+            power: default_residual_scale_power(),
+            apply_to_mlp: true,
+            apply_to_attn: false,
+        }
+    }
+}
+
+/// Per-tier RMSNorm gain scalar.
+///
+/// Different FFN widths produce different activation magnitudes flowing through
+/// shared RMSNorm layers. A per-tier gain `(active/full)^power` gently
+/// calibrates the norm output without adding learnable parameters outside DisTrO.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct NormTierGainConfig {
+    /// Exponent applied to (active/full) ratio. Default 0.25 (gentler than residual scaling).
+    #[serde(default = "default_norm_tier_gain_power")]
+    pub power: f64,
+}
+
+fn default_norm_tier_gain_power() -> f64 {
+    0.25
+}
+
+impl Default for NormTierGainConfig {
+    fn default() -> Self {
+        Self {
+            power: default_norm_tier_gain_power(),
         }
     }
 }
@@ -140,6 +215,26 @@ pub(crate) fn gate_prefix_len(full_intermediate_size: i64, gate_tier: u8) -> i64
     prefix
 }
 
+/// Compute residual/norm scaling factor: `(active / full) ^ power`.
+///
+/// - Tier-0 (active == full): returns 1.0 (identity).
+/// - Tier-1 (active = full/2, power=0.5): returns ~0.707.
+/// - Tier-2 (active = full/4, power=0.5): returns 0.5.
+pub(crate) fn residual_scale_factor(
+    full_intermediate_size: i64,
+    active_intermediate_size: i64,
+    power: f64,
+) -> f64 {
+    assert!(
+        full_intermediate_size > 0 && active_intermediate_size > 0,
+        "invalid intermediate sizes: full={}, active={}",
+        full_intermediate_size,
+        active_intermediate_size
+    );
+    let ratio = (active_intermediate_size as f64) / (full_intermediate_size as f64);
+    ratio.powf(power)
+}
+
 pub(crate) fn width_rescale_factor(
     full_intermediate_size: i64,
     active_intermediate_size: i64,
@@ -197,5 +292,32 @@ mod tests {
     fn test_mlp_width_rescale_factor_default_sqrt() {
         // full/active = 4 -> sqrt = 2
         assert!((width_rescale_factor(3072, 768, 0.5) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_scale_factor_tier0_identity() {
+        // Tier-0: active == full → always 1.0
+        assert!((residual_scale_factor(3072, 3072, 0.5) - 1.0).abs() < 1e-12);
+        assert!((residual_scale_factor(3072, 3072, 0.25) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_scale_factor_tier1_sqrt() {
+        // Tier-1: active = full/2, power=0.5 → sqrt(0.5) ≈ 0.7071
+        let factor = residual_scale_factor(3072, 1536, 0.5);
+        assert!((factor - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_scale_factor_tier2_sqrt() {
+        // Tier-2: active = full/4, power=0.5 → sqrt(0.25) = 0.5
+        assert!((residual_scale_factor(3072, 768, 0.5) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_scale_factor_quarter_power() {
+        // Tier-1: active = full/2, power=0.25 → (0.5)^0.25 ≈ 0.8409
+        let factor = residual_scale_factor(3072, 1536, 0.25);
+        assert!((factor - 0.5_f64.powf(0.25)).abs() < 1e-12);
     }
 }

@@ -319,6 +319,10 @@ struct Block {
     attn: CausalSelfAttention,
     rms_2: RMSNorm,
     mlp: Mlp,
+    /// Per-tier residual scaling for MLP output (plain f64, NOT in VarStore).
+    residual_scale_mlp: Option<f64>,
+    /// Per-tier residual scaling for attention output (plain f64, NOT in VarStore).
+    residual_scale_attn: Option<f64>,
 }
 
 impl Block {
@@ -330,10 +334,41 @@ impl Block {
         attn_implementation: AttentionImplementation,
         comm: Option<Arc<Communicator>>,
     ) -> Self {
-        let rms_1 = RMSNorm::new(
+        // Compute matformer active intermediate size for this tier
+        let full_intermediate = config.intermediate_size as i64;
+        let active_intermediate = match config.matformer_tier {
+            0 => full_intermediate,
+            tier => {
+                let divisor = 1_i64
+                    .checked_shl(tier as u32)
+                    .expect("matformer_tier too large");
+                full_intermediate / divisor
+            }
+        };
+
+        // Compute tier gain for RMSNorm (if configured)
+        let norm_tier_gain = config
+            .matformer_stabilization
+            .norm_tier_gain
+            .as_ref()
+            .and_then(|cfg| {
+                let gain = crate::matformer_c2::residual_scale_factor(
+                    full_intermediate,
+                    active_intermediate,
+                    cfg.power,
+                );
+                if (gain - 1.0).abs() > f64::EPSILON {
+                    Some(gain)
+                } else {
+                    None
+                }
+            });
+
+        let rms_1 = RMSNorm::new_with_tier_gain(
             &vs / "input_layernorm",
             config.hidden_size as i64,
             config.rms_norm_eps,
+            norm_tier_gain,
         );
         let attn = CausalSelfAttention::new(
             &vs / "self_attn",
@@ -347,10 +382,11 @@ impl Block {
             comm.clone(),
             config.sliding_window,
         );
-        let rms_2 = RMSNorm::new(
+        let rms_2 = RMSNorm::new_with_tier_gain(
             &vs / "post_attention_layernorm",
             config.hidden_size as i64,
             config.rms_norm_eps,
+            norm_tier_gain,
         );
         let mlp = Mlp::new(
             &vs / "mlp",
@@ -371,11 +407,55 @@ impl Block {
             config.matformer_stabilization.clone(),
             comm,
         );
+
+        // Compute per-tier residual scaling factors
+        let (residual_scale_mlp, residual_scale_attn) = match &config
+            .matformer_stabilization
+            .residual_scale
+        {
+            Some(rs_cfg) => {
+                let mlp_alpha = if rs_cfg.apply_to_mlp {
+                    let alpha = crate::matformer_c2::residual_scale_factor(
+                        full_intermediate,
+                        active_intermediate,
+                        rs_cfg.power,
+                    );
+                    if (alpha - 1.0).abs() > f64::EPSILON {
+                        Some(alpha)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // Attention residual scaling: uses the same width ratio.
+                // Typically disabled (attention is full-width), but available for experiments.
+                let attn_alpha = if rs_cfg.apply_to_attn {
+                    let alpha = crate::matformer_c2::residual_scale_factor(
+                        full_intermediate,
+                        active_intermediate,
+                        rs_cfg.power,
+                    );
+                    if (alpha - 1.0).abs() > f64::EPSILON {
+                        Some(alpha)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (mlp_alpha, attn_alpha)
+            }
+            None => (None, None),
+        };
+
         Self {
             rms_1,
             attn,
             rms_2,
             mlp,
+            residual_scale_mlp,
+            residual_scale_attn,
         }
     }
 
@@ -386,13 +466,21 @@ impl Block {
         sequence_lengths: Option<&(Tensor, i32)>,
         cache: &RoPECache,
     ) -> Tensor {
-        let x = self.attn.forward(
+        let attn_out = self.attn.forward(
             &self.rms_1.forward(x),
             position_ids,
             sequence_lengths,
             cache,
-        ) + x;
-        self.mlp.forward(&self.rms_2.forward(&x)) + x
+        );
+        let x = match self.residual_scale_attn {
+            Some(alpha) => attn_out * alpha + x,
+            None => attn_out + x,
+        };
+        let mlp_out = self.mlp.forward(&self.rms_2.forward(&x));
+        match self.residual_scale_mlp {
+            Some(alpha) => mlp_out * alpha + x,
+            None => mlp_out + x,
+        }
     }
 }
 
