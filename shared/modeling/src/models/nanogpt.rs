@@ -19,6 +19,7 @@ use crate::{
     causal_language_model::{
         CausalLanguageModel, EosToks, LanguageModelConfig, LanguageModelForward,
     },
+    matformer_c2::{MatformerStabilizationConfig, SuffixGateConfig},
     matformer_helper::HelperConfig,
     parallelism::{ColumnParallelLinear, Communicator, CommunicatorId, RowParallelLinear},
     rms_norm::RMSNorm,
@@ -147,6 +148,10 @@ pub struct NanoGPTConfig {
     /// Rounds to keep helper indices fixed before rotating.
     #[serde(default = "default_helper_rotation_interval")]
     pub matformer_helper_rotation_interval: u64,
+
+    /// MatFormer stabilization knobs (C2): width-rescale and optional tier-0 suffix gate.
+    #[serde(default)]
+    pub matformer_stabilization: MatformerStabilizationConfig,
 }
 
 fn default_helper_rotation_interval() -> u64 {
@@ -205,6 +210,7 @@ impl NanoGPTConfig {
             matformer_tier: 0,
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
         }
     }
 
@@ -379,6 +385,10 @@ struct NanoGPTMlp {
     /// Shared reference to current round number
     current_round: Arc<AtomicU64>,
     is_tensor_parallel: bool,
+    // MatFormer stabilization knobs
+    width_rescale_mlp_output: bool,
+    width_rescale_power: f64,
+    suffix_gate: Option<SuffixGateConfig>,
 }
 
 impl NanoGPTMlp {
@@ -393,6 +403,7 @@ impl NanoGPTMlp {
         layer_idx: usize,
         helper_config: Option<HelperConfig>,
         current_round: Arc<AtomicU64>,
+        matformer_stabilization: MatformerStabilizationConfig,
     ) -> Self {
         let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
         let tp_size = comm.as_ref().map(|x| x.size()).unwrap_or(1);
@@ -463,6 +474,9 @@ impl NanoGPTMlp {
             helper_config,
             current_round,
             is_tensor_parallel,
+            width_rescale_mlp_output: matformer_stabilization.width_rescale_mlp_output,
+            width_rescale_power: matformer_stabilization.width_rescale_power,
+            suffix_gate: matformer_stabilization.suffix_gate,
         }
     }
 }
@@ -471,17 +485,46 @@ impl Module for NanoGPTMlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
         // Tier 0 (full width): use standard forward
         let Some(matformer_hidden_size) = self.matformer_hidden_size else {
-            // No MatFormer: use standard forward
-            return if self.use_relu_squared {
-                // ReLU² activation: relu(x)²
-                let gate = self.gate_proj.forward(xs).relu().square();
-                let up = self.up_proj.forward(xs);
-                self.down_proj.forward(&(gate * up))
+            // No MatFormer: use standard forward (optionally with a tier-0 suffix gate).
+            let gate = self.gate_proj.forward(xs);
+            let up = self.up_proj.forward(xs);
+            let hidden = if self.use_relu_squared {
+                gate.relu().square() * up
             } else {
-                // Standard SiLU (SwiGLU) activation
-                self.down_proj
-                    .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)))
+                gate.silu() * up
             };
+
+            // Suffix gate only supported for non-TP tier-0.
+            if !self.is_tensor_parallel {
+                if let Some(ref cfg) = self.suffix_gate {
+                    let step = crate::matformer_c2::current_step();
+                    let beta = crate::matformer_c2::suffix_beta(cfg, step);
+                    if beta < 1.0 {
+                        let prefix_len =
+                            crate::matformer_c2::gate_prefix_len(self.full_intermediate_size, cfg.gate_tier);
+                        let suffix_len = self.full_intermediate_size - prefix_len;
+                        if suffix_len > 0 {
+                            let hidden_prefix = hidden.narrow(2, 0, prefix_len);
+                            let hidden_suffix = hidden.narrow(2, prefix_len, suffix_len);
+
+                            let down_w_prefix = self.down_proj.linear.ws.narrow(1, 0, prefix_len);
+                            let down_w_suffix =
+                                self.down_proj.linear.ws.narrow(1, prefix_len, suffix_len);
+
+                            let mut out = hidden_prefix.matmul(&down_w_prefix.transpose(0, 1))
+                                + hidden_suffix
+                                    .matmul(&down_w_suffix.transpose(0, 1))
+                                    .multiply_scalar(beta);
+                            if let Some(ref bias) = self.down_proj.linear.bs {
+                                out = out + bias;
+                            }
+                            return out;
+                        }
+                    }
+                }
+            }
+
+            return self.down_proj.forward(&hidden);
         };
 
         // MatFormer: use narrowed weights for sliced FFN
@@ -536,7 +579,18 @@ impl Module for NanoGPTMlp {
                 gate.silu() * up
             };
 
-            let out = hidden.matmul(&down_w.transpose(0, 1));
+            let mut out = hidden.matmul(&down_w.transpose(0, 1));
+            if self.width_rescale_mlp_output {
+                let active = indices.len() as i64;
+                let scale = crate::matformer_c2::width_rescale_factor(
+                    self.full_intermediate_size,
+                    active,
+                    self.width_rescale_power,
+                );
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    out = out.multiply_scalar(scale);
+                }
+            }
             if let Some(ref bias) = self.down_proj.linear.bs {
                 out + bias
             } else {
@@ -574,7 +628,17 @@ impl Module for NanoGPTMlp {
                 gate.silu() * up
             };
 
-            let out = hidden.matmul(&down_w.transpose(0, 1));
+            let mut out = hidden.matmul(&down_w.transpose(0, 1));
+            if self.width_rescale_mlp_output {
+                let scale = crate::matformer_c2::width_rescale_factor(
+                    self.full_intermediate_size,
+                    matformer_hidden_size,
+                    self.width_rescale_power,
+                );
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    out = out.multiply_scalar(scale);
+                }
+            }
             if let Some(ref bias) = self.down_proj.linear.bs {
                 out + bias
             } else {
@@ -1057,6 +1121,7 @@ impl NanoGPTBlock {
                 layer_idx,
                 config.helper_config(),
                 current_round,
+                config.matformer_stabilization.clone(),
             ),
             x0_lambda,
             resid_lambda,
@@ -1520,6 +1585,7 @@ mod tests {
             0,
             None,
             current_round.clone(),
+            Default::default(),
         );
 
         // ReLU² MLP
@@ -1534,6 +1600,7 @@ mod tests {
             0,
             None,
             current_round,
+            Default::default(),
         );
 
         let input = Tensor::randn([2, 16, 64], (Kind::Float, Device::Cpu));
@@ -2652,6 +2719,7 @@ mod tests {
             matformer_tier: 0,
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
         };
 
         let vs = nn::VarStore::new(device);
@@ -2767,6 +2835,7 @@ mod tests {
             0,    // layer_idx
             None, // no helper mode
             current_round,
+            Default::default(),
         );
 
         // Forward + backward
@@ -2837,6 +2906,7 @@ mod tests {
             0,    // layer_idx
             None, // no helper mode
             current_round,
+            Default::default(),
         );
     }
 
@@ -2861,6 +2931,7 @@ mod tests {
             0,    // layer_idx
             None, // no helper mode
             current_round,
+            Default::default(),
         );
 
         let x =
@@ -2927,6 +2998,7 @@ mod tests {
             matformer_tier: 1, // Half FFN width (128 -> 64)
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
         };
 
         let vs = nn::VarStore::new(device);
@@ -3046,6 +3118,7 @@ mod tests {
             matformer_tier: 2, // Quarter FFN width (128 -> 32)
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
         };
 
         let vs = nn::VarStore::new(device);
@@ -3165,6 +3238,7 @@ mod tests {
             matformer_tier: 0, // Full width
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
         };
 
         let vs = nn::VarStore::new(device);

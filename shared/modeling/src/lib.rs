@@ -9,6 +9,7 @@ mod distro;
 mod dummy;
 mod fp32_gradient_accumulator;
 pub mod kernels;
+pub mod matformer_c2;
 pub mod matformer_helper;
 pub mod metrics;
 mod models;
@@ -44,6 +45,7 @@ pub use device_utils::{Devices, get_optimal_devices};
 pub use distro::{CompressDCT, Distro, DistroResult, TransformDCT};
 pub use dummy::{DummyModel, get_dummy_parameters};
 pub use fp32_gradient_accumulator::Fp32GradientAccumulator;
+pub use matformer_c2::{MatformerStabilizationConfig, SuffixGateConfig, SuffixGateSchedule};
 pub use models::*;
 pub use optimizer::Optimizer;
 pub use parallelism::{
