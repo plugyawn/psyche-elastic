@@ -4,6 +4,7 @@ use crate::{
     ColumnParallelLinear, CommunicatorId, EosToks, LanguageModelConfig, LanguageModelForward,
     ModelConfig, ModelLoadError, PretrainedSource, RMSNorm, RoPECache, RoPEConfig,
     RowParallelLinear,
+    matformer_c2::{MatformerStabilizationConfig, SuffixGateConfig},
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -26,6 +27,9 @@ pub struct LlamaConfig {
     /// Rounds to keep helper indices fixed before rotating.
     #[serde(default = "default_helper_rotation_interval")]
     pub matformer_helper_rotation_interval: u64,
+    /// MatFormer stabilization knobs (C2): width-rescale and optional tier-0 suffix gate.
+    #[serde(default)]
+    pub matformer_stabilization: MatformerStabilizationConfig,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -62,6 +66,7 @@ impl LlamaConfig {
             matformer_tier: 0,
             matformer_helper_fraction: 0.0,
             matformer_helper_rotation_interval: 16,
+            matformer_stabilization: Default::default(),
             vocab_size: 1,
             num_hidden_layers: 1,
             num_attention_heads: 1,
@@ -107,6 +112,10 @@ struct Mlp {
     /// Shared reference to current round number
     current_round: Arc<AtomicU64>,
     is_tensor_parallel: bool,
+    // MatFormer stabilization knobs
+    width_rescale_mlp_output: bool,
+    width_rescale_power: f64,
+    suffix_gate: Option<SuffixGateConfig>,
 }
 
 impl Mlp {
@@ -118,6 +127,7 @@ impl Mlp {
         layer_idx: usize,
         helper_config: Option<HelperConfig>,
         current_round: Arc<AtomicU64>,
+        matformer_stabilization: MatformerStabilizationConfig,
         comm: Option<Arc<Communicator>>,
     ) -> Self {
         let is_tensor_parallel = comm.as_ref().map(|x| x.size()).unwrap_or(1) > 1;
@@ -185,6 +195,9 @@ impl Mlp {
             helper_config,
             current_round,
             is_tensor_parallel,
+            width_rescale_mlp_output: matformer_stabilization.width_rescale_mlp_output,
+            width_rescale_power: matformer_stabilization.width_rescale_power,
+            suffix_gate: matformer_stabilization.suffix_gate,
         }
     }
 }
@@ -193,9 +206,37 @@ impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Tensor {
         // Tier 0 (full width): use standard forward
         let Some(matformer_hidden_size) = self.matformer_hidden_size else {
-            return self
-                .down_proj
-                .forward(&(self.gate_proj.forward(xs).silu() * self.up_proj.forward(xs)));
+            let gate = self.gate_proj.forward(xs);
+            let up = self.up_proj.forward(xs);
+            let hidden = gate.silu() * up;
+
+            // Suffix gate only supported for non-TP tier-0.
+            if !self.is_tensor_parallel {
+                if let Some(ref cfg) = self.suffix_gate {
+                    let step = crate::matformer_c2::current_step();
+                    let beta = crate::matformer_c2::suffix_beta(cfg, step);
+                    if beta < 1.0 {
+                        let prefix_len =
+                            crate::matformer_c2::gate_prefix_len(self.full_intermediate_size, cfg.gate_tier);
+                        let suffix_len = self.full_intermediate_size - prefix_len;
+                        if suffix_len > 0 {
+                            let hidden_prefix = hidden.narrow(2, 0, prefix_len);
+                            let hidden_suffix = hidden.narrow(2, prefix_len, suffix_len);
+
+                            let down_w_prefix = self.down_proj.linear.ws.narrow(1, 0, prefix_len);
+                            let down_w_suffix =
+                                self.down_proj.linear.ws.narrow(1, prefix_len, suffix_len);
+
+                            return hidden_prefix.matmul(&down_w_prefix.transpose(0, 1))
+                                + hidden_suffix
+                                    .matmul(&down_w_suffix.transpose(0, 1))
+                                    .multiply_scalar(beta);
+                        }
+                    }
+                }
+            }
+
+            return self.down_proj.forward(&hidden);
         };
         assert!(
             !self.is_tensor_parallel,
@@ -231,7 +272,19 @@ impl Module for Mlp {
             let gate = xs.matmul(&gate_w.transpose(0, 1));
             let up = xs.matmul(&up_w.transpose(0, 1));
             let hidden = gate.silu() * up;
-            hidden.matmul(&down_w.transpose(0, 1))
+            let mut out = hidden.matmul(&down_w.transpose(0, 1));
+            if self.width_rescale_mlp_output {
+                let active = indices.len() as i64;
+                let scale = crate::matformer_c2::width_rescale_factor(
+                    self.full_intermediate_size,
+                    active,
+                    self.width_rescale_power,
+                );
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    out = out.multiply_scalar(scale);
+                }
+            }
+            out
         } else {
             // Standard MatFormer: use narrow for contiguous prefix (more efficient)
             // Weight shapes:
@@ -244,7 +297,18 @@ impl Module for Mlp {
             let gate = xs.matmul(&gate_w.transpose(0, 1));
             let up = xs.matmul(&up_w.transpose(0, 1));
             let hidden = gate.silu() * up;
-            hidden.matmul(&down_w.transpose(0, 1))
+            let mut out = hidden.matmul(&down_w.transpose(0, 1));
+            if self.width_rescale_mlp_output {
+                let scale = crate::matformer_c2::width_rescale_factor(
+                    self.full_intermediate_size,
+                    matformer_hidden_size,
+                    self.width_rescale_power,
+                );
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    out = out.multiply_scalar(scale);
+                }
+            }
+            out
         }
     }
 }
@@ -304,6 +368,7 @@ impl Block {
             layer_idx,
             config.helper_config(),
             current_round,
+            config.matformer_stabilization.clone(),
             comm,
         );
         Self {
@@ -649,6 +714,7 @@ mod tests {
             0,    // layer_idx
             None, // helper_config (no helper mode for this test)
             current_round,
+            Default::default(),
             None,
         );
 
@@ -697,6 +763,7 @@ mod tests {
             0,
             Some(helper_config),
             current_round,
+            Default::default(),
             None,
         );
     }

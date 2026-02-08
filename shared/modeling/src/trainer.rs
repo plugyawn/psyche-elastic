@@ -865,6 +865,8 @@ impl LocalTrainer {
                         0 => Trainer::get_lr(&lr_scheduler, 0, warmup_lr_between),
                         step => Trainer::get_lr(&lr_scheduler, step - 1, warmup_lr_between),
                     };
+                    // Make the current step visible to MatFormer stabilization helpers (suffix gate).
+                    crate::matformer_c2::set_current_step(step);
 
                     tracing::debug!(
                         lr = lr,
