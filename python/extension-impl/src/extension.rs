@@ -182,6 +182,9 @@ impl Trainer {
                     vec![],
                     prev_self_distro_results,
                     cancel,
+                    false, // produce_teacher_logits
+                    32,    // teacher_logits_top_k
+                    None,  // teacher_targets
                 )
             })
             .unwrap();

@@ -1,6 +1,6 @@
 use crate::{
     Broadcast, BroadcastType, ClientTUIState, Finished, IntegrationTestLogMarker, NC,
-    RunInitConfig, RunInitConfigAndIO, TrainingResult,
+    RunInitConfig, RunInitConfigAndIO, TeacherLogitsResult, TrainingResult,
     state::{ApplyMessageOutcome, DistroBroadcastAndPayload, FinishedBroadcast, RunManager},
 };
 use anyhow::anyhow;
@@ -101,6 +101,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                 let (tx_request_model_config, mut rx_request_model_config) =
                     mpsc::unbounded_channel();
                 let (tx_broadcast_finished, mut rx_broadcast_finished) = mpsc::unbounded_channel();
+                let (tx_teacher_logits, mut rx_teacher_logits) = mpsc::unbounded_channel();
 
                 let max_concurrent_parameter_requests =
                     init_config.max_concurrent_parameter_requests;
@@ -122,6 +123,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                     tx_request_download: tx_request_download.clone(),
                     tx_request_model_config,
                     tx_broadcast_finished,
+                    tx_teacher_logits,
                 });
 
                 let retried_downloads = RetriedDownloadsHandle::new();
@@ -470,6 +472,60 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                             // even if quantization is turned on (distro_result is quantized).
                             // this is because distro needs the unquantized version for lookahead
                             run.apply_distro_result(hash, distro_result, Some(original_distro_result));
+                        }
+
+                        Some(teacher_logits) = rx_teacher_logits.recv() => {
+                            let transmittable = TransmittableDownload::TeacherLogits(teacher_logits.clone());
+                            let tag_name = format!("teacher-logits_{}", teacher_logits.step);
+                            let ticket = p2p.add_downloadable(transmittable, Tag::from(tag_name)).await?;
+                            let hash = ticket.hash();
+                            let batch_id = teacher_logits.batch_id;
+                            let step = teacher_logits.step;
+
+                            info!(
+                                client_id = %identity, step = step,
+                                "Broadcasting teacher logits for batch {batch_id} hash 0x{}",
+                                hex::encode(hash),
+                            );
+
+                            let commitment_data_hash = teacher_logits.compute_hash();
+                            let signature = network_identity.raw_p2p_sign(&private_key, &commitment_data_hash);
+                            let commitment = Commitment { data_hash: commitment_data_hash, signature };
+
+                            // Get committee proof for this step
+                            let proof = run.coordinator_state()
+                                .and_then(|state| {
+                                    let client_index = state.epoch_state.clients.iter().position(|x| x.id == identity)?;
+                                    let round = state.current_round()?;
+                                    let cs = CommitteeSelection::new(
+                                        round.tie_breaker_tasks as usize,
+                                        state.config.witness_nodes as usize,
+                                        state.config.verification_percent,
+                                        state.epoch_state.clients.len(),
+                                        round.random_seed,
+                                    ).ok()?;
+                                    Some(cs.get_committee(client_index as u64))
+                                });
+                            if let Some(proof) = proof {
+                                let teacher_logits_broadcast = Broadcast {
+                                    step,
+                                    proof,
+                                    nonce: rand::rng().random(),
+                                    commitment,
+                                    data: BroadcastType::TeacherLogits(TeacherLogitsResult { batch_id, ticket }),
+                                };
+
+                                p2p.broadcast(&teacher_logits_broadcast)?;
+                                broadcasts.push((teacher_logits_broadcast.clone(), step));
+
+                                // Apply to self
+                                run.apply_message(identity, teacher_logits_broadcast)?;
+
+                                // Also directly apply the teacher logits data (since we produced them)
+                                run.apply_teacher_logits(hash, teacher_logits);
+                            } else {
+                                warn!("Could not get committee proof for teacher logits broadcast");
+                            }
                         }
 
                         _ = sharing_downloadable_interval.tick() => {

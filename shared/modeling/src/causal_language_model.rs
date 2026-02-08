@@ -407,7 +407,19 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguag
                 );
 
                 // KD loss from teacher targets
-                let teacher_log_probs = teacher_targets.to_shifted_log_probs(self.device);
+                // Override vocab_size if not set (0 means "infer from model")
+                let targets_with_vocab = TeacherLogitTargets {
+                    top_indices: teacher_targets.top_indices.shallow_clone(),
+                    top_values: teacher_targets.top_values.shallow_clone(),
+                    temperature: teacher_targets.temperature,
+                    top_k: teacher_targets.top_k,
+                    vocab_size: if teacher_targets.vocab_size == 0 {
+                        vocab_size
+                    } else {
+                        teacher_targets.vocab_size
+                    },
+                };
+                let teacher_log_probs = targets_with_vocab.to_shifted_log_probs(self.device);
                 let kd = kd_loss(&shift_logits_flat, &teacher_log_probs, teacher_targets.temperature);
 
                 // Combined: (1 - β) * CE + β * KD

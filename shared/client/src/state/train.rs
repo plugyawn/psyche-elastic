@@ -11,13 +11,15 @@ use psyche_coordinator::{
 };
 use psyche_core::{BatchId, Bloom, NodeIdentity, OptimizerDefinition};
 use psyche_modeling::{
-    ApplyDistroResultError, Batch, BatchData, DistroResult, TrainOutput, Trainer,
-    TrainerThreadCommunicationError,
+    ApplyDistroResultError, Batch, BatchData, DistroResult, TeacherLogitTargets, TrainOutput,
+    Trainer, TrainerThreadCommunicationError, distillation_beta,
 };
 use psyche_network::{
-    AuthenticatableIdentity, Hash, SerializeDistroResultError, SerializedDistroResult,
-    TransmittableDistroResult, distro_results_to_bytes,
+    AuthenticatableIdentity, CompressedTeacherLogits, Hash, SerializeDistroResultError,
+    SerializedDistroResult, TransmittableDistroResult, TransmittableTeacherLogits,
+    distro_results_to_bytes,
 };
+use tch::{Kind, Tensor};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -114,6 +116,12 @@ pub struct TrainingStepMetadata<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub step_logging_enabled: bool,
     /// WandB run for step-level logging (if enabled)
     pub wandb_run: Option<Arc<wandb::Run>>,
+
+    /// Channel for tier-0 to send teacher logits to the client broadcast loop.
+    pub tx_teacher_logits: mpsc::UnboundedSender<psyche_network::TransmittableTeacherLogits>,
+
+    /// Distillation config (if enabled).
+    pub distillation_config: Option<psyche_modeling::DistillationConfig>,
 }
 
 #[derive(Debug)]
@@ -327,6 +335,25 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                 let finished = finished.clone();
                 let step_logging_enabled = self.step_logging_enabled;
                 let wandb_run = self.wandb_run.clone();
+                let tx_teacher_logits = self.tx_teacher_logits.clone();
+                let distillation_config = self.distillation_config.clone();
+                let matformer_tier = self.matformer_tier;
+
+                // Determine distillation parameters for this round
+                let produce_teacher_logits =
+                    matformer_tier == 0 && distillation_config.is_some();
+                let teacher_logits_top_k = distillation_config
+                    .as_ref()
+                    .map(|c| c.top_k)
+                    .unwrap_or(32);
+                let teacher_logits_temperature = distillation_config
+                    .as_ref()
+                    .map(|c| c.temperature)
+                    .unwrap_or(2.0);
+
+                // Look up teacher logits from the previous round for student consumption
+                let previous_teacher_logits: HashMap<BatchId, TransmittableTeacherLogits> =
+                    previous_round.teacher_logits.clone();
 
                 let TrainingDataForStep {
                     step,
@@ -392,6 +419,66 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                             let batch_data = batch_data.to_vec();
                             let cancel_training = cancel_training.clone();
                             let prev_self_distro_results = prev_self_distro_results.clone();
+
+                            // Build teacher targets for student distillation (tier > 0)
+                            let teacher_targets_for_train: Option<(TeacherLogitTargets, f64)> =
+                                if matformer_tier > 0 {
+                                    if let Some(ref cfg) = distillation_config {
+                                        let beta = distillation_beta(cfg, step);
+                                        if beta > 0.0 {
+                                            // Find any teacher logits from previous round
+                                            // Students distill on their OWN batches using teacher logits
+                                            // from any previous-round tier-0 batch
+                                            let teacher = previous_teacher_logits.values().next();
+                                            if let Some(tl) = teacher {
+                                                let logits = &tl.logits;
+                                                let n = logits.expected_len();
+                                                if n > 0 {
+                                                    let indices = Tensor::from_slice(
+                                                        &logits.top_indices.iter().map(|&x| x as i64).collect::<Vec<_>>()
+                                                    ).view([logits.batch_size as i64, logits.seq_len as i64, logits.top_k as i64]);
+                                                    // Convert f16 bits (u16) back to float tensor
+                                                    // Create raw bytes buffer from u16 values
+                                                    let raw_bytes: Vec<u8> = logits.top_values_f16.iter()
+                                                        .flat_map(|v| v.to_le_bytes())
+                                                        .collect();
+                                                    let values = unsafe {
+                                                        Tensor::from_blob(
+                                                            raw_bytes.as_ptr(),
+                                                            &[n as i64],
+                                                            &[1],
+                                                            Kind::Half,
+                                                            tch::Device::Cpu,
+                                                        )
+                                                    }.to_kind(Kind::Float)
+                                                        .view([logits.batch_size as i64, logits.seq_len as i64, logits.top_k as i64]);
+                                                    // NOTE: vocab_size is needed - use a large default
+                                                    // We'll infer it from the model during training
+                                                    Some((TeacherLogitTargets {
+                                                        top_indices: indices,
+                                                        top_values: values,
+                                                        temperature: logits.temperature,
+                                                        top_k: logits.top_k as i64,
+                                                        vocab_size: 0, // Will be set by the model
+                                                    }, beta))
+                                                } else {
+                                                    trace!("Teacher logits empty, skipping distillation");
+                                                    None
+                                                }
+                                            } else {
+                                                trace!("No teacher logits available from previous round");
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
                             in_progress.push(tokio::task::spawn_blocking(move || {
                                 trainer.train(
                                     step,
@@ -404,6 +491,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                     Vec::new(),
                                     Some(prev_self_distro_results),
                                     cancel_training,
+                                    produce_teacher_logits,
+                                    teacher_logits_top_k,
+                                    teacher_targets_for_train,
                                 )
                             }));
                         }
@@ -421,9 +511,75 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> TrainingStepMetadata
                                 cancelled,
                                 nonce,
                                 grad_norm: _,
+                                teacher_logits: raw_teacher_logits,
                             } = completed_trainer.map_err(|_| TrainError::TrainCrashed)??;
 
                             debug!(step=step, loss=loss, batch_id=%batch_id, "Got training output, DisTrO results generated");
+
+                            // If tier-0 produced teacher logits, compress and send for broadcast
+                            if let Some(raw_logits) = raw_teacher_logits {
+                                let tx = tx_teacher_logits.clone();
+                                let bid = batch_id;
+                                let top_k = teacher_logits_top_k;
+                                let temperature = teacher_logits_temperature;
+                                tokio::task::spawn_blocking(move || {
+                                    // raw_logits is [batch, seq, 2*top_k]: first half = indices (i64), second half = values (f32)
+                                    let size = raw_logits.size();
+                                    let batch_size = size[0];
+                                    let seq_len = size[1];
+                                    let combined_k = size[2]; // 2 * top_k
+                                    let k = combined_k / 2;
+
+                                    let indices_tensor = raw_logits.slice(2, 0, k, 1);
+                                    let values_tensor = raw_logits.slice(2, k, combined_k, 1);
+
+                                    // Extract as flat vectors
+                                    let indices_flat: Vec<i64> = Vec::<i64>::try_from(
+                                        indices_tensor.contiguous().view([-1]).to_kind(Kind::Int64)
+                                    ).unwrap_or_default();
+                                    let top_indices: Vec<u16> = indices_flat.iter().map(|&x| x as u16).collect();
+
+                                    // Convert values to f16 bit representation (u16)
+                                    let values_f16_tensor = values_tensor.contiguous().view([-1]).to_kind(Kind::Half);
+                                    // Get raw bytes and reinterpret as u16 (IEEE 754 half-precision)
+                                    let num_values = values_f16_tensor.size()[0] as usize;
+                                    let values_f16_data = values_f16_tensor.data_ptr() as *const u16;
+                                    let top_values_f16: Vec<u16> = unsafe {
+                                        std::slice::from_raw_parts(values_f16_data, num_values).to_vec()
+                                    };
+
+                                    let compressed = CompressedTeacherLogits {
+                                        top_indices,
+                                        top_values_f16,
+                                        batch_size: batch_size as u16,
+                                        seq_len: seq_len as u16,
+                                        top_k,
+                                        temperature,
+                                    };
+
+                                    if let Err(e) = compressed.validate() {
+                                        warn!("Teacher logits validation failed: {e}");
+                                        return;
+                                    }
+
+                                    let transmittable = TransmittableTeacherLogits {
+                                        step,
+                                        batch_id: bid,
+                                        logits: compressed,
+                                    };
+
+                                    info!(
+                                        step = step,
+                                        batch_id = %bid,
+                                        size_bytes = transmittable.estimated_size(),
+                                        "Sending teacher logits for broadcast"
+                                    );
+
+                                    if tx.send(transmittable).is_err() {
+                                        warn!("Failed to send teacher logits, channel closed");
+                                    }
+                                });
+                            }
 
                             available_trainers.push(trainer);
 

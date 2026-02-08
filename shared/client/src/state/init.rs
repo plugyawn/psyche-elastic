@@ -87,6 +87,9 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub dummy_training_delay_secs: Option<u64>,
 
     pub sidecar_port: Option<u16>,
+
+    /// Distillation config: if set, tier-0 produces teacher logits, tier>0 consumes them.
+    pub distillation_config: Option<psyche_modeling::DistillationConfig>,
 }
 
 #[cfg(test)]
@@ -506,6 +509,7 @@ pub struct RunInitConfigAndIO<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub tx_request_download: UnboundedSender<(BlobTicket, Tag)>,
     pub tx_request_model_config: UnboundedSender<OneShotModelConfigSender>,
     pub tx_broadcast_finished: UnboundedSender<FinishedBroadcast>,
+    pub tx_teacher_logits: UnboundedSender<psyche_network::TransmittableTeacherLogits>,
 
     pub metrics: Arc<ClientMetrics>,
 }
@@ -538,6 +542,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             tx_request_download,
             tx_request_model_config,
             tx_broadcast_finished,
+            tx_teacher_logits,
             metrics,
         } = self;
 
@@ -1434,6 +1439,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             log_memory_usage: init_config.log_memory_usage,
             step_logging_enabled,
             wandb_run,
+            tx_teacher_logits,
+            distillation_config: init_config.distillation_config,
         };
 
         let witness = WitnessStepMetadata {

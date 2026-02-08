@@ -136,8 +136,22 @@ pub async fn build_app(
             device: p.device,
             matformer_tier: p.matformer_tier,
             matformer_load_strategy: p.matformer_load_strategy,
+            matformer_helper_fraction: p.matformer_helper_fraction,
+            matformer_helper_rotation_interval: p.matformer_helper_rotation_interval,
             log_memory_usage: p.log_memory_usage,
             sidecar_port: p.sidecar_port,
+            distillation_config: if p.matformer_distillation_beta_max > 0.0 {
+                Some(psyche_modeling::DistillationConfig {
+                    top_k: p.matformer_distillation_top_k,
+                    temperature: p.matformer_distillation_temperature,
+                    beta_max: p.matformer_distillation_beta_max,
+                    start_step: p.matformer_distillation_start_step,
+                    warmup_steps: p.matformer_distillation_warmup_steps,
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
         };
     let app = App {
         run_id: p.run_id.clone(),
