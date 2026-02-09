@@ -1,0 +1,41 @@
+run_id = "test-tiny-llama-100"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 5
+cooldown_time = 5
+max_round_train_time = 30
+round_witness_time = 2
+global_batch_size_warmup_tokens = 0
+epoch_time = 300
+total_steps = 100
+min_clients = 2
+init_min_clients = 2
+global_batch_size_start = 4
+global_batch_size_end = 4
+verification_percent = 0
+witness_nodes = 1
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfLlama"
+data_type = "Pretraining"
+max_seq_len = 64
+data_location = "Dummy"
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "./checkpoints/tiny-llama-local"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 4.0e-4
+warmup_steps = 10
+warmup_init_lr = 0.0
+total_steps = 200
+final_lr = 4.0e-5
+
+[model.LLM.optimizer.AdamW]
+betas = [0.9, 0.95]
+weight_decay = 0.0
+eps = 1.0e-8
+clip_grad_norm = 1.0

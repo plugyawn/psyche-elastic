@@ -1,0 +1,19 @@
+# Minimal, pinned Python deps for running Psyche's macOS bundle.
+#
+# This is intentionally a fully-pinned "lock" style requirements file so
+# multiple Macs can recreate the same `.venv` without copying it around.
+#
+# If you change runtime deps, regenerate/update versions from a known-good env.
+filelock==3.20.0
+fsspec==2025.12.0
+jinja2==3.1.6
+markupsafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.3.5
+packaging==25.0
+safetensors==0.7.0
+setuptools==80.9.0
+sympy==1.14.0
+torch==2.9.1
+typing_extensions==4.15.0

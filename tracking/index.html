@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Psyche SSSL Training - Live Comparison</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'SF Mono', 'Monaco', monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { color: #58a6ff; margin-bottom: 5px; }
+        .subtitle { color: #8b949e; margin-bottom: 20px; }
+        .dashboard { display: grid; grid-template-columns: 1fr 300px; gap: 20px; }
+        .chart-container {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .stats-panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .stat-card {
+            background: #21262d;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 10px;
+        }
+        .stat-label { color: #8b949e; font-size: 12px; text-transform: uppercase; }
+        .stat-value { font-size: 24px; font-weight: bold; margin-top: 5px; }
+        .stat-value.baseline { color: #f85149; }
+        .stat-value.experiment { color: #3fb950; }
+        .stat-value.neutral { color: #58a6ff; }
+        .legend { display: flex; gap: 20px; margin-bottom: 15px; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+        .legend-dot.baseline { background: #f85149; }
+        .legend-dot.experiment { background: #3fb950; }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .status-badge.running { background: #238636; color: #fff; }
+        .status-badge.complete { background: #8b949e; color: #fff; }
+        .status-badge.waiting { background: #9e6a03; color: #fff; }
+        .config-display {
+            background: #21262d;
+            border-radius: 6px;
+            padding: 10px;
+            margin-top: 15px;
+            font-size: 12px;
+        }
+        .config-display code { color: #79c0ff; }
+        #log {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 10px;
+            height: 150px;
+            overflow-y: auto;
+            font-size: 11px;
+            margin-top: 15px;
+            color: #8b949e;
+        }
+        .comparison {
+            margin-top: 15px;
+            padding: 15px;
+            background: #21262d;
+            border-radius: 6px;
+        }
+        .comparison-title { font-size: 12px; color: #8b949e; margin-bottom: 10px; }
+        .comparison-value { font-size: 18px; font-weight: bold; }
+        .comparison-value.better { color: #3fb950; }
+        .comparison-value.worse { color: #f85149; }
+        .comparison-value.same { color: #8b949e; }
+    </style>
+</head>
+<body>
+    <h1>Psyche SSSL Training Comparison</h1>
+    <p class="subtitle">Heterogeneous MatFormer (0,1,1,1) vs Homogeneous Baseline (0,0,0,0)</p>
+
+    <div class="dashboard">
+        <div class="chart-container">
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-dot baseline"></div>
+                    <span>Baseline (0,0,0,0) - All Tier-0</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot experiment"></div>
+                    <span>Experiment (0,1,1,1) - Mixed Tiers</span>
+                </div>
+            </div>
+            <canvas id="lossChart" height="300"></canvas>
+        </div>
+
+        <div class="stats-panel">
+            <div class="stat-card">
+                <div class="stat-label">Current Step</div>
+                <div class="stat-value neutral" id="currentStep">0 / 40</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Baseline (Tier-0) Loss</div>
+                <div class="stat-value baseline" id="baselineLoss">--</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Experiment (Tier-0) Loss</div>
+                <div class="stat-value experiment" id="experimentLoss">--</div>
+            </div>
+
+            <div class="comparison">
+                <div class="comparison-title">Loss Difference at Current Step</div>
+                <div class="comparison-value" id="lossDiff">--</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Status</div>
+                <div id="statusContainer">
+                    <span class="status-badge waiting" id="baselineStatus">Baseline: Waiting</span>
+                    <span class="status-badge waiting" id="experimentStatus">Experiment: Waiting</span>
+                </div>
+            </div>
+
+            <div class="config-display">
+                <strong>Baseline:</strong> <code>--client-matformer-tiers 0,0,0,0</code><br>
+                <strong>Experiment:</strong> <code>--client-matformer-tiers 0,1,1,1</code>
+            </div>
+
+            <div id="log">Waiting for data...</div>
+        </div>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Baseline (0,0,0,0)',
+                        data: [],
+                        borderColor: '#f85149',
+                        backgroundColor: 'rgba(248, 81, 73, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3
+                    },
+                    {
+                        label: 'Experiment (0,1,1,1)',
+                        data: [],
+                        borderColor: '#3fb950',
+                        backgroundColor: 'rgba(63, 185, 80, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: {
+                        title: { display: true, text: 'Training Step', color: '#8b949e' },
+                        grid: { color: '#30363d' },
+                        ticks: { color: '#8b949e' }
+                    },
+                    y: {
+                        title: { display: true, text: 'Loss (Tier-0)', color: '#8b949e' },
+                        grid: { color: '#30363d' },
+                        ticks: { color: '#8b949e' },
+                        min: 9,
+                        max: 11.5
+                    }
+                },
+                animation: { duration: 300 }
+            }
+        });
+
+        let baselineData = {};
+        let experimentData = {};
+
+        function log(msg) {
+            const logDiv = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            logDiv.innerHTML = `[${time}] ${msg}\n` + logDiv.innerHTML;
+            if (logDiv.innerHTML.length > 5000) {
+                logDiv.innerHTML = logDiv.innerHTML.substring(0, 5000);
+            }
+        }
+
+        async function loadBaseline() {
+            try {
+                const resp = await fetch('baseline.json?t=' + Date.now());
+                if (resp.ok) {
+                    baselineData = await resp.json();
+                    log(`Loaded baseline: ${Object.keys(baselineData).length} steps`);
+                    document.getElementById('baselineStatus').className = 'status-badge complete';
+                    document.getElementById('baselineStatus').textContent = 'Baseline: Complete';
+                    updateChart();
+                }
+            } catch (e) {
+                log('Waiting for baseline data...');
+            }
+        }
+
+        async function loadExperiment() {
+            try {
+                const resp = await fetch('experiment.json?t=' + Date.now());
+                if (resp.ok) {
+                    const newData = await resp.json();
+                    const oldSteps = Object.keys(experimentData).length;
+                    experimentData = newData;
+                    const newSteps = Object.keys(experimentData).length;
+
+                    if (newSteps > oldSteps) {
+                        log(`Experiment step ${newSteps}: loss = ${experimentData[newSteps]?.toFixed(4)}`);
+                    }
+
+                    if (newSteps > 0 && newSteps < 40) {
+                        document.getElementById('experimentStatus').className = 'status-badge running';
+                        document.getElementById('experimentStatus').textContent = 'Experiment: Running';
+                    } else if (newSteps >= 40) {
+                        document.getElementById('experimentStatus').className = 'status-badge complete';
+                        document.getElementById('experimentStatus').textContent = 'Experiment: Complete';
+                    }
+
+                    updateChart();
+                }
+            } catch (e) {
+                // Experiment not started yet
+            }
+        }
+
+        function updateChart() {
+            const allSteps = new Set([
+                ...Object.keys(baselineData).map(Number),
+                ...Object.keys(experimentData).map(Number)
+            ]);
+            const steps = Array.from(allSteps).sort((a, b) => a - b);
+
+            chart.data.labels = steps;
+            chart.data.datasets[0].data = steps.map(s => baselineData[s] || null);
+            chart.data.datasets[1].data = steps.map(s => experimentData[s] || null);
+            chart.update('none');
+
+            // Update stats
+            const maxStep = Math.max(...steps, 0);
+            document.getElementById('currentStep').textContent = `${maxStep} / 40`;
+
+            const latestBaseline = baselineData[maxStep];
+            const latestExperiment = experimentData[maxStep];
+
+            if (latestBaseline !== undefined) {
+                document.getElementById('baselineLoss').textContent = latestBaseline.toFixed(4);
+            }
+            if (latestExperiment !== undefined) {
+                document.getElementById('experimentLoss').textContent = latestExperiment.toFixed(4);
+            }
+
+            // Calculate difference
+            if (latestBaseline !== undefined && latestExperiment !== undefined) {
+                const diff = latestExperiment - latestBaseline;
+                const diffEl = document.getElementById('lossDiff');
+                if (Math.abs(diff) < 0.01) {
+                    diffEl.textContent = `~0 (same)`;
+                    diffEl.className = 'comparison-value same';
+                } else if (diff < 0) {
+                    diffEl.textContent = `${diff.toFixed(4)} (experiment better)`;
+                    diffEl.className = 'comparison-value better';
+                } else {
+                    diffEl.textContent = `+${diff.toFixed(4)} (baseline better)`;
+                    diffEl.className = 'comparison-value worse';
+                }
+            }
+        }
+
+        // Initial load
+        loadBaseline();
+        loadExperiment();
+
+        // Poll for updates
+        setInterval(() => {
+            loadBaseline();
+            loadExperiment();
+        }, 2000);
+    </script>
+</body>
+</html>

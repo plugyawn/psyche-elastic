@@ -1,0 +1,43 @@
+run_id = "ngpt-fw-500-ng"
+run_state = "WaitingForMembers"
+
+[config]
+warmup_time = 5
+cooldown_time = 5
+max_round_train_time = 30
+round_witness_time = 2
+global_batch_size_warmup_tokens = 0
+epoch_time = 100000
+total_steps = 500
+min_clients = 2
+init_min_clients = 2
+global_batch_size_start = 4
+global_batch_size_end = 4
+verification_percent = 0
+witness_nodes = 1
+waiting_for_members_extra_time = 3
+
+[model.LLM]
+architecture = "HfNanoGPT"
+data_type = "Pretraining"
+max_seq_len = 256
+data_location = { Local = "data/fineweb10B" }
+cold_start_warmup_steps = 0
+
+[model.LLM.checkpoint.Hub]
+repo_id = "./checkpoints/nanogpt-20m-init-normgain"
+
+[model.LLM.lr_schedule.Cosine]
+base_lr = 1.0e-3
+warmup_steps = 50
+warmup_init_lr = 0.0
+total_steps = 500
+final_lr = 1.0e-4
+
+[model.LLM.optimizer.Distro]
+clip_grad_norm = 1.0
+compression_decay = 0.999
+compression_chunk = 64
+compression_topk = 64
+quantize_1bit = false
+weight_decay = 0.0
