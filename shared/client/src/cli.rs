@@ -1,14 +1,14 @@
 use crate::{CheckpointConfig, HubUploadInfo, WandBInfo};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::Args;
+use clap::ValueEnum;
 use psyche_eval::tasktype_from_name;
 use psyche_modeling::Devices;
 use psyche_network::{DiscoveryMode, RelayKind, SecretKey};
 use psyche_network_fault_injection::{FaultConfig, FaultConfigBuilder};
 use psyche_tui::LogOutput;
 use std::{path::PathBuf, time::Duration};
-use clap::ValueEnum;
 
 pub fn read_identity_secret_key(
     identity_secret_key_path: Option<&PathBuf>,
@@ -122,6 +122,21 @@ pub struct TrainArgs {
 
     #[clap(long, env, default_value_t = 1)]
     pub micro_batch_size: usize,
+
+    /// Experimental: for the first N training steps, fetch the same canonical batch for every
+    /// trainer to improve early gradient alignment across tiers.
+    ///
+    /// This intentionally breaks the "assigned BatchId -> actual data" provenance and is meant
+    /// only for off-chain debugging/ablations.
+    #[clap(long, env, default_value_t = 0)]
+    pub same_batch_warmup_steps: u32,
+
+    /// Experimental: number of local inner training updates per coordinator step on
+    /// smaller MatFormer tiers (`tier > 0`).
+    ///
+    /// The global LR schedule remains keyed to the outer coordinator step (not inner-step count).
+    #[clap(long, env, default_value_t = 1)]
+    pub matformer_local_inner_steps: u32,
 
     /// If provided, every shared gradient this client sees will be written to this directory.
     #[clap(long, env)]
@@ -245,6 +260,119 @@ pub struct TrainArgs {
     #[clap(long, env, default_value_t = 16)]
     pub matformer_helper_rotation_interval: u64,
 
+    /// DisTrO apply mode: `sign` (default, original behavior) or `raw`.
+    ///
+    /// `raw` preserves decoded gradient magnitude at apply-time and rescales to avoid lr^2 shrinkage.
+    #[clap(long, env, value_enum, default_value_t = DistroApplyMode::Sign)]
+    pub distro_apply_mode: DistroApplyMode,
+
+    /// DisTrO transmitted value mode.
+    /// - auto: preserves existing behavior
+    /// - sign: force sign-valued sparse payloads
+    /// - raw: force raw sparse payloads (disables 1-bit sign quantization)
+    #[clap(long, env, value_enum, default_value_t = DistroValueMode::Auto)]
+    pub distro_value_mode: DistroValueMode,
+
+    /// Experimental: apply updates from only one trainer "slot" per step.
+    ///
+    /// The slot index is computed from the round's trainer set in stable order
+    /// (the coordinator's `epoch_state.clients` order, filtered to trainers for that round).
+    ///
+    /// This is useful for "L+S minus S (no redistribution)" controls: keep 2+ trainers
+    /// for batch partitioning/witnessing, but apply only trainer slot 0 (or another index).
+    #[clap(long, env)]
+    pub distro_apply_only_trainer_index: Option<u16>,
+
+    /// Enable guarded raw-v2 normalization path for DisTrO.
+    #[clap(long, env, default_value_t = false)]
+    pub distro_raw_v2_enabled: bool,
+
+    /// Raw-v2 normalization mode.
+    #[clap(long, env, value_enum, default_value_t = DistroRawNormMode::Off)]
+    pub distro_raw_norm_mode: DistroRawNormMode,
+
+    /// Raw-v2 extra scale multiplier after norm matching.
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_raw_scale_multiplier: f64,
+
+    /// Raw-v2 maximum allowed scale factor.
+    ///
+    /// For `match-sign-equivalent`, early training often needs very large scale factors.
+    /// Keep this high and use `distro_raw_abs_clip_mult` as the primary safety bound.
+    #[clap(long, env, default_value_t = 1.0e9)]
+    pub distro_raw_scale_max: f64,
+
+    /// Raw-v2 per-parameter abs-clip multiplier relative to matched RMS.
+    #[clap(long, env, default_value_t = 8.0)]
+    pub distro_raw_abs_clip_mult: f64,
+
+    /// Raw-v2 sign-equivalent target multiplier used by `match-sign-equivalent`.
+    ///
+    /// Target norm is:
+    /// - `sign_equiv_mult * sqrt(numel_effective)` for `match-sign-equivalent`
+    /// - `sign_equiv_mult * sqrt(nnz_effective)` for `match-sign-equivalent-nnz`
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_raw_sign_equiv_mult: f64,
+
+    /// Policy when raw-v2 sidecars are missing or invalid.
+    #[clap(
+        long,
+        env,
+        value_enum,
+        default_value_t = DistroRawMissingSidecarPolicy::WarnOff
+    )]
+    pub distro_raw_missing_sidecar_policy: DistroRawMissingSidecarPolicy,
+
+    /// Tier-0 suffix gate warmup steps (0 = disabled).
+    ///
+    /// When enabled, tier-0 scales its MLP suffix channels by a beta that ramps
+    /// from 0 -> 1 over `warmup_steps`, starting at `start_step`. This makes tier-0
+    /// behave like a smaller MatFormer tier early (prefix-only), then smoothly
+    /// grow to full width.
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_suffix_gate_warmup_steps: u32,
+
+    /// Tier-0 suffix gate start step (used only if warmup steps > 0).
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_suffix_gate_start_step: u32,
+
+    /// Which MatFormer tier's prefix defines the "core" width for the suffix gate.
+    ///
+    /// Example: for tiers 0 and 1, set this to 1 (core = intermediate/2).
+    #[clap(long, env, default_value_t = 1)]
+    pub matformer_suffix_gate_tier: u8,
+
+    /// Suffix gate schedule shape for ramping beta (linear or cosine).
+    #[clap(long, env, value_enum, default_value_t = MatformerGateSchedule::Linear)]
+    pub matformer_suffix_gate_schedule: MatformerGateSchedule,
+
+    /// If true, additionally scale the scheduled suffix beta by a learned per-layer scalar
+    /// `sigmoid(logit)` (in (0,1)). This gives tier-0 a knob to suppress/enable suffix
+    /// capacity automatically.
+    #[clap(long, env, default_value_t = false)]
+    pub matformer_suffix_gate_learnable: bool,
+
+    /// Initial logit for the learned suffix gate scalar (higher => closer to 1.0).
+    #[clap(long, env, default_value_t = 6.0)]
+    pub matformer_suffix_gate_learnable_init_logit: f64,
+
+    /// Convenience: configure a coupled "prefix-only warmup" + "ramp" schedule for both:
+    /// - tier-0 suffix gate (extra FFN capacity), and
+    /// - in-place distillation (tier>0 matches tier-0).
+    ///
+    /// When enabled, the client overrides:
+    /// - `matformer_suffix_gate_start_step` and `matformer_distillation_start_step` = `phase_a_steps`
+    /// - `matformer_suffix_gate_warmup_steps` and `matformer_distillation_warmup_steps` = `ramp_steps`
+    ///
+    /// Set `phase_a_steps` > 0 to keep tier-0 and tier>0 functionally similar early.
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_synergy_phase_a_steps: u32,
+
+    /// Coupled ramp length used by `--matformer-synergy-phase-a-steps`.
+    /// Must be > 0 when synergy is enabled.
+    #[clap(long, env, default_value_t = 0)]
+    pub matformer_synergy_ramp_steps: u32,
+
     /// Log a one-time memory snapshot (RSS and, if available, GPU memory) when training starts.
     #[clap(long, env, default_value_t = false)]
     pub log_memory_usage: bool,
@@ -264,11 +392,11 @@ pub struct TrainArgs {
     pub matformer_distillation_beta_max: f64,
 
     /// Number of top logits to transmit per token for distillation.
-    #[clap(long, env, default_value_t = 32)]
+    #[clap(long, env, default_value_t = 64)]
     pub matformer_distillation_top_k: u16,
 
     /// Temperature for KL divergence softening in distillation.
-    #[clap(long, env, default_value_t = 2.0)]
+    #[clap(long, env, default_value_t = 1.0)]
     pub matformer_distillation_temperature: f32,
 
     /// Step at which distillation begins (teacher is garbage early).
@@ -278,6 +406,32 @@ pub struct TrainArgs {
     /// Steps to ramp distillation β from 0 to beta_max.
     #[clap(long, env, default_value_t = 100)]
     pub matformer_distillation_warmup_steps: u32,
+
+    /// Distillation objective combine mode.
+    /// `mix` = (1-β)CE + βKD, `add` = CE + βKD.
+    #[clap(long, env, value_enum, default_value_t = MatformerDistillationCombineMode::Add)]
+    pub matformer_distillation_combine_mode: MatformerDistillationCombineMode,
+
+    /// If set, distill only on the last N token positions (teacher transmits only that suffix).
+    ///
+    /// This is the main knob for WAN bandwidth and student-side KD memory.
+    /// Must be >= 2.
+    #[clap(long, env)]
+    pub matformer_distillation_logits_to_keep: Option<u16>,
+
+    /// Optional confidence gate: if mean teacher top-k mass is below this threshold,
+    /// disable KD for that step (β_eff = 0).
+    #[clap(long, env)]
+    pub matformer_distillation_min_teacher_topk_mass: Option<f64>,
+
+    /// Optional KD scaling to avoid "KD vanishes when the teacher is high-entropy".
+    ///
+    /// If > 0, KD is multiplied by:
+    /// `1 / clamp(mean_q_topk_mass, floor, 1.0)`.
+    ///
+    /// Set to 0 to disable.
+    #[clap(long, env, default_value_t = 0.05)]
+    pub matformer_distillation_kd_q_topk_mass_floor: f64,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -285,6 +439,47 @@ pub enum MatformerLoadStrategy {
     Auto,
     Universal,
     Sliced,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MatformerGateSchedule {
+    Linear,
+    Cosine,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MatformerDistillationCombineMode {
+    Mix,
+    Add,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DistroApplyMode {
+    Sign,
+    Raw,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DistroValueMode {
+    Auto,
+    Sign,
+    Raw,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum DistroRawNormMode {
+    Off,
+    MatchPreL2,
+    MatchSignEquivalent,
+    MatchSignEquivalentNnz,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum DistroRawMissingSidecarPolicy {
+    WarnOff,
+    Fail,
 }
 
 impl TrainArgs {
