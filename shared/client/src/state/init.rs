@@ -1,23 +1,25 @@
-use crate::{IntegrationTestLogMarker, WandBInfo, fetch_data::DataFetcher};
 use crate::cli::MatformerLoadStrategy;
+use crate::{fetch_data::DataFetcher, IntegrationTestLogMarker, WandBInfo};
 use psyche_coordinator::{
-    Coordinator, HealthChecks,
     model::{self, HttpLLMTrainingDataLocation, LLMTrainingDataLocation},
+    Coordinator, HealthChecks,
 };
-use psyche_core::{Barrier, CancellableBarrier, NodeIdentity, Shuffle, TokenSize, sha256};
+use psyche_core::{
+    sha256, Barrier, CancellableBarrier, NodeIdentity, OptimizerDefinition, Shuffle, TokenSize,
+};
 use psyche_data_provider::{
-    DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
-    PreprocessedDataProvider, Split, WeightedDataProvider, download_dataset_repo_async,
-    download_model_repo_async,
+    download_dataset_repo_async, download_model_repo_async,
     http::{FileURLs, HttpDataProvider},
+    DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
+    PreprocessedDataProvider, Split, WeightedDataProvider,
 };
 use psyche_metrics::ClientMetrics;
 use psyche_modeling::{
-    AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM, CommunicatorId,
-    DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices, DummyModel, LlamaConfig,
-    LlamaForCausalLM, NanoGPTConfig, NanoGPTForCausalLM, LocalTrainer, ModelConfig, ModelLoadError,
-    ParallelModels, PretrainedSource, Trainer,
-    auto_tokenizer,
+    auto_tokenizer, AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM,
+    CommunicatorId, DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices, DistroApplyMode,
+    DistroRawConfig, DistroValueMode, DummyModel, LlamaConfig, LlamaForCausalLM, LocalTrainer,
+    ModelConfig, ModelLoadError, NanoGPTConfig, NanoGPTForCausalLM, ParallelModels,
+    PretrainedSource, Trainer,
 };
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
 use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
@@ -28,7 +30,7 @@ use std::{
 };
 use tch::{Device, Kind, Tensor};
 use thiserror::Error;
-use tokenizers::{ModelWrapper, Tokenizer, models::wordlevel::WordLevel};
+use tokenizers::{models::wordlevel::WordLevel, ModelWrapper, Tokenizer};
 use tokio::{
     io,
     sync::{mpsc::UnboundedSender, oneshot},
@@ -37,11 +39,15 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::{
-    CheckpointConfig, FinishedBroadcast,
     cooldown::{CooldownStepMetadata, MatformerCheckpointInfo},
-    evals::ModelTaskRunner, stats::StatsLogger, steps::StepStateMachine,
-    train::TrainingStepMetadata, types::DistroBroadcastAndPayload,
-    warmup::WarmupStepMetadata, witness::WitnessStepMetadata,
+    evals::ModelTaskRunner,
+    stats::StatsLogger,
+    steps::StepStateMachine,
+    train::TrainingStepMetadata,
+    types::DistroBroadcastAndPayload,
+    warmup::WarmupStepMetadata,
+    witness::WitnessStepMetadata,
+    CheckpointConfig, FinishedBroadcast,
 };
 use iroh_blobs::api::Tag;
 
@@ -65,6 +71,11 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub data_parallelism: usize,
     pub tensor_parallelism: usize,
     pub micro_batch_size: usize,
+    /// Experimental: during the first N training steps, fetch the same canonical batch for every
+    /// trainer (client-side data aliasing for early gradient alignment).
+    pub same_batch_warmup_steps: u32,
+    /// Experimental: number of local inner updates per coordinator step on smaller tiers.
+    pub matformer_local_inner_steps: u32,
     pub optim_stats_every_n_steps: Option<u32>,
     pub grad_accum_in_fp32: bool,
     pub log_memory_usage: bool,
@@ -88,8 +99,23 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
 
     pub sidecar_port: Option<u16>,
 
+    /// Tier-0 suffix gate schedule (progressive growth). Applied as a runtime config override.
+    pub suffix_gate_config: Option<psyche_modeling::SuffixGateConfig>,
+
     /// Distillation config: if set, tier-0 produces teacher logits, tier>0 consumes them.
     pub distillation_config: Option<psyche_modeling::DistillationConfig>,
+
+    /// DisTrO apply mode (`sign` default or `raw`).
+    pub distro_apply_mode: DistroApplyMode,
+
+    /// DisTrO value mode (`auto`, `sign`, `raw`).
+    pub distro_value_mode: DistroValueMode,
+
+    /// Experimental: apply updates from only one trainer slot per step (drop other trainers).
+    pub distro_apply_only_trainer_index: Option<u16>,
+
+    /// Guarded raw-v2 config.
+    pub distro_raw_config: DistroRawConfig,
 }
 
 #[cfg(test)]
@@ -135,13 +161,8 @@ mod tests {
             "intermediate_size": 1024,
             "matformer_tier": 1
         });
-        let err = validate_no_double_slicing(
-            &config,
-            1,
-            &MatformerLoadStrategy::Universal,
-            true,
-        )
-        .unwrap_err();
+        let err = validate_no_double_slicing(&config, 1, &MatformerLoadStrategy::Universal, true)
+            .unwrap_err();
         assert!(matches!(err, InitRunError::DoubleSlicingDetected { .. }));
     }
 
@@ -151,13 +172,9 @@ mod tests {
             "intermediate_size": 1024,
             "matformer_tier": 1
         });
-        assert!(validate_no_double_slicing(
-            &config,
-            1,
-            &MatformerLoadStrategy::Auto,
-            true,
-        )
-        .is_ok());
+        assert!(
+            validate_no_double_slicing(&config, 1, &MatformerLoadStrategy::Auto, true,).is_ok()
+        );
     }
 }
 
@@ -183,30 +200,57 @@ fn print_matformer_summary(
         "Disabled"
     };
 
-    let tier_match = if cli_tier == effective_tier { "✓" } else { "≠" };
+    let tier_match = if cli_tier == effective_tier {
+        "✓"
+    } else {
+        "≠"
+    };
     let capacity_pct = (active_intermediate_size * 100) / intermediate_size;
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════╗");
     eprintln!("║                      MATFORMER CONFIGURATION                     ║");
     eprintln!("╠══════════════════════════════════════════════════════════════════╣");
-    eprintln!("║  Checkpoint:       {:<45} ║", truncate_path(checkpoint_path, 45));
-    eprintln!("║  Load strategy:    {:<45} ║", format!("{:?}", load_strategy));
-    eprintln!("║  Sliced checkpoint: {:<44} ║", if uses_sliced_checkpoint { "Yes" } else { "No" });
+    eprintln!(
+        "║  Checkpoint:       {:<45} ║",
+        truncate_path(checkpoint_path, 45)
+    );
+    eprintln!(
+        "║  Load strategy:    {:<45} ║",
+        format!("{:?}", load_strategy)
+    );
+    eprintln!(
+        "║  Sliced checkpoint: {:<44} ║",
+        if uses_sliced_checkpoint { "Yes" } else { "No" }
+    );
     eprintln!("╠══════════════════════════════════════════════════════════════════╣");
     eprintln!("║  CLI tier:         {:<45} ║", cli_tier);
-    eprintln!("║  Effective tier:   {:<45} ║", format!("{} {}", effective_tier, tier_match));
+    eprintln!(
+        "║  Effective tier:   {:<45} ║",
+        format!("{} {}", effective_tier, tier_match)
+    );
     eprintln!("║  Helper mode:      {:<45} ║", helper_status);
     eprintln!("╠══════════════════════════════════════════════════════════════════╣");
-    eprintln!("║  FFN width:        {:<45} ║", format!("{} / {} ({}%)", active_intermediate_size, intermediate_size, capacity_pct));
+    eprintln!(
+        "║  FFN width:        {:<45} ║",
+        format!(
+            "{} / {} ({}%)",
+            active_intermediate_size, intermediate_size, capacity_pct
+        )
+    );
     eprintln!("╚══════════════════════════════════════════════════════════════════╝");
 
     // Validation warnings
     if cli_tier != effective_tier {
         eprintln!();
-        eprintln!("[WARNING] CLI tier ({}) differs from effective tier ({})", cli_tier, effective_tier);
+        eprintln!(
+            "[WARNING] CLI tier ({}) differs from effective tier ({})",
+            cli_tier, effective_tier
+        );
         if uses_sliced_checkpoint {
-            eprintln!("          Sliced checkpoint detected - using tier 0 to avoid double-slicing.");
+            eprintln!(
+                "          Sliced checkpoint detected - using tier 0 to avoid double-slicing."
+            );
             eprintln!("          This is expected behavior for pre-truncated checkpoints.");
         }
     }
@@ -253,9 +297,7 @@ async fn resolve_matformer_local_repo_path(
     let tier_exists = tokio::fs::try_exists(&tier_path).await?;
 
     match strategy {
-        MatformerLoadStrategy::Universal => {
-            Ok((base_exists.then(|| base.to_path_buf()), false))
-        }
+        MatformerLoadStrategy::Universal => Ok((base_exists.then(|| base.to_path_buf()), false)),
         MatformerLoadStrategy::Auto => {
             if tier_exists {
                 Ok((Some(tier_path), true))
@@ -299,7 +341,9 @@ fn infer_tier_from_checkpoint_config(config: &serde_json::Value) -> (Option<u8>,
 
     // No explicit tier - check if base size stored (can infer tier)
     if let (Some(base), Some(current)) = (
-        config.get("matformer_base_intermediate_size").and_then(|v| v.as_u64()),
+        config
+            .get("matformer_base_intermediate_size")
+            .and_then(|v| v.as_u64()),
         intermediate_size,
     ) {
         if base > 0 && current > 0 && base >= current {
@@ -320,12 +364,15 @@ fn apply_matformer_checkpoint_tier_overrides(
     matformer_tier_for_loading: u8,
 ) -> (bool, u8) {
     let (checkpoint_tier, _) = infer_tier_from_checkpoint_config(checkpoint_config);
-    let mut uses_sliced_checkpoint =
+    let uses_sliced_checkpoint =
         uses_sliced_checkpoint || checkpoint_tier.map(|tier| tier > 0).unwrap_or(false);
     let mut matformer_tier_for_loading = matformer_tier_for_loading;
 
     if uses_sliced_checkpoint
-        && matches!(load_strategy, MatformerLoadStrategy::Auto | MatformerLoadStrategy::Sliced)
+        && matches!(
+            load_strategy,
+            MatformerLoadStrategy::Auto | MatformerLoadStrategy::Sliced
+        )
     {
         matformer_tier_for_loading = 0;
     }
@@ -354,7 +401,8 @@ fn validate_no_double_slicing(
                 return Err(InitRunError::DoubleSlicingDetected {
                     checkpoint_tier: checkpoint_tier.unwrap_or(0),
                     cli_tier,
-                    hint: "Use --matformer-load-strategy auto or specify --matformer-tier 0".to_string(),
+                    hint: "Use --matformer-load-strategy auto or specify --matformer-tier 0"
+                        .to_string(),
                 });
             }
             MatformerLoadStrategy::Auto | MatformerLoadStrategy::Sliced => {
@@ -375,8 +423,7 @@ fn schema_hash_for_config(
     let arch = format!("{architecture:?}");
     let mut names = parameter_names.to_vec();
     names.sort();
-    let config_json =
-        serde_json::to_string(config).expect("config value is always serializable");
+    let config_json = serde_json::to_string(config).expect("config value is always serializable");
     let mut data = Vec::with_capacity(arch.len() + config_json.len() + names.len() * 32);
     data.extend_from_slice(arch.as_bytes());
     data.push(0);
@@ -395,6 +442,18 @@ fn canonicalize_config_for_schema(
     uses_sliced_checkpoint: bool,
 ) -> serde_json::Value {
     if let Some(obj) = config.as_object_mut() {
+        // Tier-sliced checkpoints may include MatFormer metadata fields that are
+        // absent from universal checkpoints. Normalize them away so all tiers
+        // compute the same canonical schema hash.
+        obj.remove("matformer_base_intermediate_size");
+        // Some NanoGPT checkpoints carry extra MatFormer metadata that does not
+        // affect parameter shapes/names, and may be missing from tier slices.
+        // Strip it for canonical hashing to avoid schema mismatches.
+        obj.remove("matformer_mixer_rank");
+        obj.remove("matformer_mixer_tier");
+        obj.remove("matformer_mixer_alpha");
+        obj.remove("matformer_mixer_loss_scale");
+
         if uses_sliced_checkpoint && matformer_tier > 0 {
             if let Some(value) = obj.get_mut("intermediate_size") {
                 if let Some(base) = value.as_u64() {
@@ -472,6 +531,15 @@ pub enum InitRunError {
         cli_tier: u8,
         hint: String,
     },
+
+    #[error("Invalid distillation config: {reason}")]
+    InvalidDistillationConfig { reason: String },
+
+    #[error("Invalid suffix gate config: {reason}")]
+    InvalidSuffixGateConfig { reason: String },
+
+    #[error("Invalid DisTrO config: {reason}")]
+    InvalidDistroConfig { reason: String },
 }
 
 enum RawLoadedModelType {
@@ -557,6 +625,179 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
         let model::Model::LLM(llm) = state.model;
 
+        if let Some(cfg) = init_config.suffix_gate_config.as_ref() {
+            if cfg.gate_tier > 60 {
+                return Err(InitRunError::InvalidSuffixGateConfig {
+                    reason: format!("suffix_gate gate_tier is too large (got {})", cfg.gate_tier),
+                });
+            }
+            if init_config.tensor_parallelism > 1 && init_config.matformer_tier == 0 {
+                warn!(
+                    tensor_parallelism = init_config.tensor_parallelism,
+                    "Suffix gate is currently ignored for tier-0 under tensor parallelism; run with --tensor-parallelism 1 if you need suffix gating."
+                );
+            }
+        }
+
+        if let Some(cfg) = init_config.distillation_config.as_ref() {
+            if !cfg.beta_max.is_finite() || cfg.beta_max < 0.0 {
+                return Err(InitRunError::InvalidDistillationConfig {
+                    reason: format!("beta_max must be finite and >= 0 (got {})", cfg.beta_max),
+                });
+            }
+            if !cfg.temperature.is_finite() || cfg.temperature <= 0.0 {
+                return Err(InitRunError::InvalidDistillationConfig {
+                    reason: format!(
+                        "temperature must be finite and > 0 (got {})",
+                        cfg.temperature
+                    ),
+                });
+            }
+            if cfg.top_k == 0 {
+                return Err(InitRunError::InvalidDistillationConfig {
+                    reason: "top_k must be >= 1".to_string(),
+                });
+            }
+            if let Some(n) = cfg.logits_to_keep {
+                if n < 2 {
+                    return Err(InitRunError::InvalidDistillationConfig {
+                        reason: format!("logits_to_keep must be >= 2 (got {n})"),
+                    });
+                }
+                if (n as u64) > (llm.max_seq_len as u64) {
+                    return Err(InitRunError::InvalidDistillationConfig {
+                        reason: format!(
+                            "logits_to_keep ({n}) exceeds max_seq_len ({})",
+                            llm.max_seq_len
+                        ),
+                    });
+                }
+            }
+            if let Some(min_q) = cfg.min_teacher_topk_mass {
+                if !min_q.is_finite() || !(0.0..=1.0).contains(&min_q) {
+                    return Err(InitRunError::InvalidDistillationConfig {
+                        reason: format!(
+                            "min_teacher_topk_mass must be finite and in [0,1] (got {min_q})"
+                        ),
+                    });
+                }
+            }
+            if !cfg.kd_q_topk_mass_floor.is_finite()
+                || cfg.kd_q_topk_mass_floor < 0.0
+                || cfg.kd_q_topk_mass_floor > 1.0
+            {
+                return Err(InitRunError::InvalidDistillationConfig {
+                    reason: format!(
+                        "kd_q_topk_mass_floor must be finite and in [0,1] (got {})",
+                        cfg.kd_q_topk_mass_floor
+                    ),
+                });
+            }
+        }
+
+        if init_config.distro_raw_config.enabled
+            && init_config.distro_apply_mode != DistroApplyMode::Raw
+        {
+            return Err(InitRunError::InvalidDistroConfig {
+                reason: "raw-v2 is enabled but distro_apply_mode != raw".to_string(),
+            });
+        }
+        if !init_config.distro_raw_config.scale_multiplier.is_finite()
+            || init_config.distro_raw_config.scale_multiplier < 0.0
+        {
+            return Err(InitRunError::InvalidDistroConfig {
+                reason: format!(
+                    "distro_raw_scale_multiplier must be finite and >= 0 (got {})",
+                    init_config.distro_raw_config.scale_multiplier
+                ),
+            });
+        }
+        if !init_config.distro_raw_config.scale_max.is_finite()
+            || init_config.distro_raw_config.scale_max <= 0.0
+        {
+            return Err(InitRunError::InvalidDistroConfig {
+                reason: format!(
+                    "distro_raw_scale_max must be finite and > 0 (got {})",
+                    init_config.distro_raw_config.scale_max
+                ),
+            });
+        }
+        if !init_config.distro_raw_config.abs_clip_mult.is_finite()
+            || init_config.distro_raw_config.abs_clip_mult < 0.0
+        {
+            return Err(InitRunError::InvalidDistroConfig {
+                reason: format!(
+                    "distro_raw_abs_clip_mult must be finite and >= 0 (got {})",
+                    init_config.distro_raw_config.abs_clip_mult
+                ),
+            });
+        }
+        if !init_config.distro_raw_config.sign_equiv_mult.is_finite()
+            || init_config.distro_raw_config.sign_equiv_mult <= 0.0
+        {
+            return Err(InitRunError::InvalidDistroConfig {
+                reason: format!(
+                    "distro_raw_sign_equiv_mult must be finite and > 0 (got {})",
+                    init_config.distro_raw_config.sign_equiv_mult
+                ),
+            });
+        }
+        if init_config.distro_raw_config.enabled
+            && matches!(
+                init_config.distro_raw_config.norm_mode,
+                psyche_modeling::DistroRawNormMode::MatchSignEquivalent
+                    | psyche_modeling::DistroRawNormMode::MatchSignEquivalentNnz
+            )
+            && init_config.distro_raw_config.scale_max < 1.0e6
+        {
+            warn!(
+                "distro_raw_scale_max={} is likely too low for match-sign-equivalent modes; expect heavy clamp and sign-mismatched update magnitudes",
+                init_config.distro_raw_config.scale_max
+            );
+        }
+        if init_config.distro_raw_config.norm_mode != psyche_modeling::DistroRawNormMode::Off
+            && !init_config.distro_raw_config.enabled
+        {
+            warn!(
+                "distro_raw_norm_mode={} has no effect unless distro_raw_v2_enabled=true",
+                match init_config.distro_raw_config.norm_mode {
+                    psyche_modeling::DistroRawNormMode::Off => "off",
+                    psyche_modeling::DistroRawNormMode::MatchPreL2 => "match-pre-l2",
+                    psyche_modeling::DistroRawNormMode::MatchSignEquivalent => {
+                        "match-sign-equivalent"
+                    }
+                    psyche_modeling::DistroRawNormMode::MatchSignEquivalentNnz => {
+                        "match-sign-equivalent-nnz"
+                    }
+                }
+            );
+        }
+
+        match &llm.optimizer {
+            OptimizerDefinition::Distro { quantize_1bit, .. } => {
+                if init_config.distro_value_mode == DistroValueMode::Raw && *quantize_1bit {
+                    warn!(
+                        "distro_value_mode=raw overrides optimizer quantize_1bit=true; transmitting non-quantized sparse values"
+                    );
+                }
+                if init_config.distro_value_mode == DistroValueMode::Sign && !*quantize_1bit {
+                    info!(
+                        "distro_value_mode=sign overrides optimizer quantize_1bit=false; transmitting sign-quantized sparse values"
+                    );
+                }
+            }
+            _ => {
+                if init_config.distro_apply_mode != DistroApplyMode::Sign
+                    || init_config.distro_value_mode != DistroValueMode::Auto
+                    || init_config.distro_raw_config.enabled
+                {
+                    warn!(
+                        "DisTrO flags are set but optimizer is not DisTrO; these options will be ignored"
+                    );
+                }
+            }
+        }
+
         let hub_read_token = init_config.hub_read_token.clone();
         let hub_max_concurrent_downloads = init_config.hub_max_concurrent_downloads;
         let data_future = async {
@@ -597,13 +838,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         Shuffle::DontShuffle,
                     )?)
                 }
-                LLMTrainingDataLocation::Dummy => {
-                    DataProvider::Dummy(DummyDataProvider::new(
-                        TokenSize::TwoBytes,
-                        llm.max_seq_len as usize,
-                        u64::MAX,
-                    ))
-                }
+                LLMTrainingDataLocation::Dummy => DataProvider::Dummy(DummyDataProvider::new(
+                    TokenSize::TwoBytes,
+                    llm.max_seq_len as usize,
+                    u64::MAX,
+                )),
                 LLMTrainingDataLocation::Http(HttpLLMTrainingDataLocation {
                     location,
                     token_size_in_bytes,
@@ -655,6 +894,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             };
             Ok(data_provider)
         };
+
+        // Avoid moving these out of `init_config` into spawned tasks; we still need the originals
+        // later when wiring up the training state machine.
+        let suffix_gate_config_for_model = init_config.suffix_gate_config.clone();
+        let distillation_config_for_model = init_config.distillation_config.clone();
 
         let model_future: JoinHandle<Result<RawLoadedModel, InitRunError>> = match &llm.architecture
         {
@@ -711,6 +955,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     Ok(model)
                 }),
                 model::Checkpoint::Hub(_) | model::Checkpoint::P2P(_) => tokio::spawn(async move {
+                    let suffix_gate_config_for_model = suffix_gate_config_for_model;
+                    let distillation_config_for_model = distillation_config_for_model;
                     let checkpoint = llm.checkpoint;
                     let loaded_checkpoint = match checkpoint {
                         model::Checkpoint::Hub(hub_repo) => {
@@ -726,46 +972,49 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 )
                                 .await?;
 
-                            let (repo_files, checkpoint_path, effective_tier_for_load) =
-                                if revision.is_none()
-                                    && maybe_local_path
-                                        .as_ref()
-                                        .map(|p| p.exists())
-                                        .unwrap_or(false)
-                                {
-                                    let repo_root = maybe_local_path.unwrap();
-                                    let mut ret = Vec::new();
-                                    let mut read_dir = tokio::fs::read_dir(repo_root.clone()).await?;
-                                    while let Some(dir_entry) = read_dir.next_entry().await? {
-                                        ret.push(dir_entry.path())
-                                    }
-                                    let effective_tier_for_load =
-                                        if sliced_checkpoint { 0 } else { init_config.matformer_tier };
-                                    (
-                                        ret,
-                                        Some(repo_root.to_string_lossy().to_string()),
-                                        effective_tier_for_load,
-                                    )
+                            let (repo_files, checkpoint_path, effective_tier_for_load) = if revision
+                                .is_none()
+                                && maybe_local_path
+                                    .as_ref()
+                                    .map(|p| p.exists())
+                                    .unwrap_or(false)
+                            {
+                                let repo_root = maybe_local_path.unwrap();
+                                let mut ret = Vec::new();
+                                let mut read_dir = tokio::fs::read_dir(repo_root.clone()).await?;
+                                while let Some(dir_entry) = read_dir.next_entry().await? {
+                                    ret.push(dir_entry.path())
+                                }
+                                let effective_tier_for_load = if sliced_checkpoint {
+                                    0
                                 } else {
-                                    info!(
-                                        "Downloading {}, revision: {:?} (if needed)",
-                                        hub_repo.repo_id, revision
-                                    );
-                                    let repo_files = download_model_repo_async(
-                                        &repo_id,
-                                        revision,
-                                        None,
-                                        init_config.hub_read_token,
-                                        Some(init_config.hub_max_concurrent_downloads),
-                                        false,
-                                    )
-                                    .await?;
-                                    (
-                                        repo_files,
-                                        Some(repo_id.clone()),
-                                        init_config.matformer_tier,
-                                    )
+                                    init_config.matformer_tier
                                 };
+                                (
+                                    ret,
+                                    Some(repo_root.to_string_lossy().to_string()),
+                                    effective_tier_for_load,
+                                )
+                            } else {
+                                info!(
+                                    "Downloading {}, revision: {:?} (if needed)",
+                                    hub_repo.repo_id, revision
+                                );
+                                let repo_files = download_model_repo_async(
+                                    &repo_id,
+                                    revision,
+                                    None,
+                                    init_config.hub_read_token,
+                                    Some(init_config.hub_max_concurrent_downloads),
+                                    false,
+                                )
+                                .await?;
+                                (
+                                    repo_files,
+                                    Some(repo_id.clone()),
+                                    init_config.matformer_tier,
+                                )
+                            };
                             let checkpoint_extra_files = repo_files
                                 .iter()
                                 .filter(|file| {
@@ -797,8 +1046,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                 .send(tx_model_config_response)
                                 .unwrap();
 
-                            let (model_config, tokenizer) =
-                                rx_model_config_response.await.unwrap();
+                            let (model_config, tokenizer) = rx_model_config_response.await.unwrap();
                             debug!("Got p2p info, model_config: {}", model_config);
 
                             let model_config = match llm.architecture {
@@ -883,7 +1131,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     );
 
                     let serialized_config = source.serialize_config()?;
-                    let config_json: serde_json::Value =
+                    let mut config_json: serde_json::Value =
                         serde_json::from_str(&serialized_config)?;
                     (uses_sliced_checkpoint, matformer_tier_for_loading) =
                         apply_matformer_checkpoint_tier_overrides(
@@ -899,19 +1147,40 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         &init_config.matformer_load_strategy,
                         uses_sliced_checkpoint,
                     )?;
+
+                    // Apply runtime MatFormer C2 knobs into the reported config (schema hash + UI).
+                    // This keeps schema hashes stable and run configs self-describing when
+                    // suffix gate and/or distillation are enabled via CLI.
+                    if let Some(obj) = config_json.as_object_mut() {
+                        let stab = obj
+                            .entry("matformer_stabilization".to_string())
+                            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                        if let Some(stab_obj) = stab.as_object_mut() {
+                            if let Some(cfg) = suffix_gate_config_for_model.as_ref() {
+                                let value = serde_json::to_value(cfg)
+                                    .expect("SuffixGateConfig is always serializable");
+                                stab_obj.insert("suffix_gate".to_string(), value);
+                            }
+                            if let Some(cfg) = distillation_config_for_model.as_ref() {
+                                let value = serde_json::to_value(cfg)
+                                    .expect("DistillationConfig is always serializable");
+                                stab_obj.insert("distillation".to_string(), value);
+                            }
+                        }
+                    }
+                    let serialized_config = serde_json::to_string(&config_json)
+                        .expect("config_json is always serializable");
                     let mut parameter_names = match llm.architecture {
                         model::LLMArchitecture::HfLlama => {
                             let config: LlamaConfig = serde_json::from_str(&serialized_config)?;
                             config.get_parameter_names()
                         }
                         model::LLMArchitecture::HfDeepseek => {
-                            let config: DeepseekConfig =
-                                serde_json::from_str(&serialized_config)?;
+                            let config: DeepseekConfig = serde_json::from_str(&serialized_config)?;
                             config.get_parameter_names()
                         }
                         model::LLMArchitecture::HfNanoGPT => {
-                            let config: NanoGPTConfig =
-                                serde_json::from_str(&serialized_config)?;
+                            let config: NanoGPTConfig = serde_json::from_str(&serialized_config)?;
                             config.get_parameter_names()
                         }
                         model::LLMArchitecture::HfAuto => {
@@ -946,88 +1215,94 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         model::LLMTrainingDataType::Pretraining => None,
                     };
 
-                    let raw_loaded_model_type: RawLoadedModelType =
-                        if llm.architecture == model::LLMArchitecture::HfAuto {
-                            #[cfg(feature = "python")]
-                            {
-                                let dp = init_config.data_parallelism;
-                                let tp = init_config.tensor_parallelism;
+                    let raw_loaded_model_type: RawLoadedModelType = if llm.architecture
+                        == model::LLMArchitecture::HfAuto
+                    {
+                        #[cfg(feature = "python")]
+                        {
+                            let dp = init_config.data_parallelism;
+                            let tp = init_config.tensor_parallelism;
 
-                                tokio::task::spawn_blocking(move || {
-                                    if tp != 1 || dp != 1 {
-                                        psyche_modeling::PythonDistributedCausalLM::new(
-                                            "hf-auto".to_string(),
-                                            source.try_into()?,
-                                            tch::Device::cuda_if_available(),
-                                            attn_implementation.unwrap_or_default(),
-                                            psyche_modeling::ParallelismConfig { dp, tp },
-                                            Some(llm.max_seq_len as usize),
-                                            init_config.sidecar_port,
-                                            None,
+                            tokio::task::spawn_blocking(move || {
+                                if tp != 1 || dp != 1 {
+                                    psyche_modeling::PythonDistributedCausalLM::new(
+                                        "hf-auto".to_string(),
+                                        source.try_into()?,
+                                        tch::Device::cuda_if_available(),
+                                        attn_implementation.unwrap_or_default(),
+                                        psyche_modeling::ParallelismConfig { dp, tp },
+                                        Some(llm.max_seq_len as usize),
+                                        init_config.sidecar_port,
+                                        None,
+                                    )
+                                    .map(RawLoadedModelType::PythonDistributed)
+                                    .map_err(InitRunError::PythonDistributedError)
+                                } else {
+                                    let device =
+                                        init_config.device.device_for_rank(0).ok_or_else(|| {
+                                            ModelLoadError::NoDeviceForRank(0, init_config.device)
+                                        })?;
+                                    psyche_modeling::PythonCausalLM::new(
+                                        "hf-auto",
+                                        &source.try_into()?,
+                                        device,
+                                        attn_implementation.unwrap_or_default(),
+                                        None,
+                                        Some(llm.max_seq_len as usize),
+                                    )
+                                    .map(RawLoadedModelType::Python)
+                                    .map_err(InitRunError::PythonModelError)
+                                }
+                            })
+                            .await
+                            .map_err(InitRunError::ModelLoadingThreadCrashed)??
+                        }
+
+                        #[cfg(not(feature = "python"))]
+                        {
+                            return Err(InitRunError::UnsupportedArchitecture(
+                                "HfAuto".to_string(),
+                            ));
+                        }
+                    } else {
+                        let mut futures: Vec<
+                            JoinHandle<Result<Box<dyn CausalLM>, ModelLoadError>>,
+                        > = Vec::with_capacity(
+                            init_config.data_parallelism * init_config.tensor_parallelism,
+                        );
+                        let devices = init_config.device.clone();
+                        let matformer_tier = matformer_tier_for_loading;
+                        let helper_fraction = init_config.matformer_helper_fraction;
+                        let helper_rotation_interval =
+                            init_config.matformer_helper_rotation_interval;
+                        let suffix_gate_config = suffix_gate_config_for_model.clone();
+                        let distillation_config = distillation_config_for_model.clone();
+
+                        for dp in 0..init_config.data_parallelism {
+                            let communicator_id: Option<CommunicatorId> =
+                                match init_config.tensor_parallelism {
+                                    0 | 1 => None,
+                                    #[cfg(feature = "parallelism")]
+                                    _ => Some(tch::CStore::new().into()),
+                                    #[cfg(not(feature = "parallelism"))]
+                                    _ => unimplemented!(),
+                                };
+                            for tp in 0..init_config.tensor_parallelism {
+                                let tensor_parallelism_world =
+                                    communicator_id.as_ref().map(|communicator_id| {
+                                        (
+                                            communicator_id.clone(),
+                                            tp,
+                                            init_config.tensor_parallelism,
                                         )
-                                        .map(RawLoadedModelType::PythonDistributed)
-                                        .map_err(InitRunError::PythonDistributedError)
-                                    } else {
-                                        let device = init_config.device.device_for_rank(0).ok_or_else(
-                                            || ModelLoadError::NoDeviceForRank(0, init_config.device),
-                                        )?;
-                                        psyche_modeling::PythonCausalLM::new(
-                                            "hf-auto",
-                                            &source.try_into()?,
-                                            device,
-                                            attn_implementation.unwrap_or_default(),
-                                            None,
-                                            Some(llm.max_seq_len as usize),
-                                        )
-                                        .map(RawLoadedModelType::Python)
-                                        .map_err(InitRunError::PythonModelError)
-                                    }
-                                })
-                                .await
-                                .map_err(InitRunError::ModelLoadingThreadCrashed)??
-                            }
-
-                            #[cfg(not(feature = "python"))]
-                            {
-                                return Err(InitRunError::UnsupportedArchitecture(
-                                    "HfAuto".to_string(),
-                                ));
-                            }
-                        } else {
-                            let mut futures: Vec<
-                                JoinHandle<Result<Box<dyn CausalLM>, ModelLoadError>>,
-                            > = Vec::with_capacity(
-                                init_config.data_parallelism * init_config.tensor_parallelism,
-                            );
-                            let devices = init_config.device.clone();
-                            let matformer_tier = matformer_tier_for_loading;
-                            let helper_fraction = init_config.matformer_helper_fraction;
-                            let helper_rotation_interval =
-                                init_config.matformer_helper_rotation_interval;
-
-                            for dp in 0..init_config.data_parallelism {
-                                let communicator_id: Option<CommunicatorId> =
-                                    match init_config.tensor_parallelism {
-                                        0 | 1 => None,
-                                        #[cfg(feature = "parallelism")]
-                                        _ => Some(tch::CStore::new().into()),
-                                        #[cfg(not(feature = "parallelism"))]
-                                        _ => unimplemented!(),
-                                    };
-                                for tp in 0..init_config.tensor_parallelism {
-                                    let tensor_parallelism_world =
-                                        communicator_id.as_ref().map(|communicator_id| {
-                                            (
-                                                communicator_id.clone(),
-                                                tp,
-                                                init_config.tensor_parallelism,
-                                            )
-                                        });
-                                    let source = source.clone();
-                                    let rank = dp * init_config.tensor_parallelism + tp;
-                                    let devices = devices.clone();
-                                    let device = devices.device_for_rank(rank);
-                                    futures.push(tokio::task::spawn_blocking(move || {
+                                    });
+                                let source = source.clone();
+                                let rank = dp * init_config.tensor_parallelism + tp;
+                                let devices = devices.clone();
+                                let device = devices.device_for_rank(rank);
+                                let suffix_gate_config = suffix_gate_config.clone();
+                                let distillation_config = distillation_config.clone();
+                                futures.push(tokio::task::spawn_blocking(move || {
                                         let device = device.ok_or_else(|| {
                                             ModelLoadError::NoDeviceForRank(rank, devices)
                                         })?;
@@ -1038,16 +1313,23 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                         };
                                         match llm.architecture {
                                             model::LLMArchitecture::HfLlama => {
-                                                LlamaForCausalLM::from_pretrained_with_matformer_config(
+                                                LlamaForCausalLM::from_pretrained_with_config_overrides(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,
                                                     Some(device),
                                                     tensor_parallelism_world,
                                                     Some(llm.max_seq_len as usize),
-                                                    matformer_tier,
-                                                    helper_fraction,
-                                                    helper_rotation_interval,
+                                                    |config| {
+                                                        config.matformer_tier = matformer_tier;
+                                                        config.matformer_helper_fraction = helper_fraction;
+                                                        config.matformer_helper_rotation_interval =
+                                                            helper_rotation_interval;
+                                                        config.matformer_stabilization.suffix_gate =
+                                                            suffix_gate_config;
+                                                        config.matformer_stabilization.distillation =
+                                                            distillation_config;
+                                                    },
                                                 )
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
@@ -1063,151 +1345,157 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
                                             model::LLMArchitecture::HfNanoGPT => {
-                                                NanoGPTForCausalLM::from_pretrained_with_matformer_config(
+                                                NanoGPTForCausalLM::from_pretrained_with_config_overrides(
                                                     &source.try_into()?,
                                                     Some(kind),
                                                     attn_implementation,
                                                     Some(device),
                                                     tensor_parallelism_world,
                                                     Some(llm.max_seq_len as usize),
-                                                    matformer_tier,
-                                                    helper_fraction,
-                                                    helper_rotation_interval,
+                                                    |config| {
+                                                        config.matformer_tier = matformer_tier;
+                                                        config.matformer_helper_fraction = helper_fraction;
+                                                        config.matformer_helper_rotation_interval =
+                                                            helper_rotation_interval;
+                                                        config.matformer_stabilization.suffix_gate =
+                                                            suffix_gate_config;
+                                                        config.matformer_stabilization.distillation =
+                                                            distillation_config;
+                                                    },
                                                 )
                                                 .map(|x| Box::new(x) as Box<dyn CausalLM>)
                                             }
                                             model::LLMArchitecture::HfAuto => unreachable!(),
                                         }
                                     }));
-                                }
-                            }
-
-                            let mut models: Vec<Box<dyn CausalLM>> = Vec::new();
-                            for future in futures {
-                                let model = future
-                                    .await
-                                    .map_err(InitRunError::ModelLoadingThreadCrashed)??;
-                                models.push(model);
-                            }
-
-                            RawLoadedModelType::ParallelNativeModels(models)
-                        };
-
-                        debug!("Config uploaded: {}", serialized_config);
-                        let serialized_tokenizer = tokenizer.to_string(false).unwrap();
-                        tx_config
-                            .send((serialized_config.clone(), serialized_tokenizer))
-                            .unwrap();
-
-                        let hidden_size = config_json
-                            .get("hidden_size")
-                            .and_then(|v| v.as_u64());
-                        let intermediate_size = config_json
-                            .get("intermediate_size")
-                            .and_then(|v| v.as_u64());
-                        let active_intermediate_size = intermediate_size.and_then(|h| {
-                            let divisor = 1_u64.checked_shl(matformer_tier_for_loading as u32)?;
-                            Some(h / divisor)
-                        });
-                        // Compute base intermediate size (before any tier slicing)
-                        // For sliced checkpoints, scale up by CLI tier to get original base
-                        let base_intermediate_size: Option<u64> = intermediate_size.and_then(|size| {
-                            if uses_sliced_checkpoint && init_config.matformer_tier > 0 {
-                                // Sliced checkpoint: scale up to get base
-                                size.checked_shl(init_config.matformer_tier as u32)
-                            } else {
-                                // Full checkpoint: intermediate_size IS the base
-                                Some(size)
-                            }
-                        });
-                        let num_hidden_layers = config_json
-                            .get("num_hidden_layers")
-                            .and_then(|v| v.as_u64());
-                        let vocab_size = config_json
-                            .get("vocab_size")
-                            .and_then(|v| v.as_u64());
-
-                        let canonical_config = canonicalize_config_for_schema(
-                            config_json.clone(),
-                            init_config.matformer_tier,
-                            uses_sliced_checkpoint,
-                        );
-                        let schema_info = ModelSchemaInfo {
-                            schema_hash_local: schema_hash_for_config(
-                                llm.architecture,
-                                &config_json,
-                                &parameter_names,
-                            ),
-                            schema_hash_canonical: schema_hash_for_config(
-                                llm.architecture,
-                                &canonical_config,
-                                &parameter_names,
-                            ),
-                            parameter_count: u32::try_from(parameter_names.len())
-                                .unwrap_or(u32::MAX),
-                            matformer_tier: init_config.matformer_tier,
-                            uses_sliced_checkpoint,
-                        };
-                        if tx_schema.send(schema_info).is_err() {
-                            warn!("Failed to send schema hash info; channel closed");
-                        }
-
-                        match (hidden_size, intermediate_size, active_intermediate_size) {
-                            (Some(hidden_size), Some(intermediate_size), Some(active_intermediate_size)) => {
-                                info!(
-                                    integration_test_log_marker = %IntegrationTestLogMarker::LoadedModel,
-                                    checkpoint = %llm.checkpoint,
-                                    gpus = init_config.data_parallelism * init_config.tensor_parallelism,
-                                    dp = init_config.data_parallelism,
-                                    tp = init_config.tensor_parallelism,
-                                    matformer_tier = init_config.matformer_tier,
-                                    matformer_effective_tier = matformer_tier_for_loading,
-                                    matformer_load_strategy = ?init_config.matformer_load_strategy,
-                                    matformer_uses_sliced_checkpoint = uses_sliced_checkpoint,
-                                    matformer_checkpoint_path = matformer_checkpoint_path.as_deref().unwrap_or("unknown"),
-                                    hidden_size = hidden_size,
-                                    intermediate_size = intermediate_size,
-                                    intermediate_size_active = active_intermediate_size,
-                                    num_hidden_layers = num_hidden_layers.unwrap_or_default(),
-                                    vocab_size = vocab_size.unwrap_or_default(),
-                                    "loaded_model",
-                                );
-
-                                // Print MatFormer configuration summary
-                                print_matformer_summary(
-                                    matformer_checkpoint_path.as_deref().unwrap_or("unknown"),
-                                    init_config.matformer_tier,
-                                    matformer_tier_for_loading,
-                                    uses_sliced_checkpoint,
-                                    &init_config.matformer_load_strategy,
-                                    init_config.matformer_helper_fraction,
-                                    intermediate_size,
-                                    active_intermediate_size,
-                                );
-                            }
-                            _ => {
-                                info!(
-                                    integration_test_log_marker = %IntegrationTestLogMarker::LoadedModel,
-                                    checkpoint = %llm.checkpoint,
-                                    gpus = init_config.data_parallelism * init_config.tensor_parallelism,
-                                    dp = init_config.data_parallelism,
-                                    tp = init_config.tensor_parallelism,
-                                    matformer_tier = init_config.matformer_tier,
-                                    "loaded_model",
-                                );
                             }
                         }
 
-                        Ok(RawLoadedModel {
-                            models: raw_loaded_model_type,
-                            tokenizer,
-                            model_task_runner,
-                            checkpoint_extra_files,
-                            parameter_names,
-                            matformer_effective_tier: matformer_tier_for_loading,
-                            matformer_base_intermediate_size: base_intermediate_size,
-                        })
-                    }),
+                        let mut models: Vec<Box<dyn CausalLM>> = Vec::new();
+                        for future in futures {
+                            let model = future
+                                .await
+                                .map_err(InitRunError::ModelLoadingThreadCrashed)??;
+                            models.push(model);
+                        }
+
+                        RawLoadedModelType::ParallelNativeModels(models)
+                    };
+
+                    debug!("Config uploaded: {}", serialized_config);
+                    let serialized_tokenizer = tokenizer.to_string(false).unwrap();
+                    tx_config
+                        .send((serialized_config.clone(), serialized_tokenizer))
+                        .unwrap();
+
+                    let hidden_size = config_json.get("hidden_size").and_then(|v| v.as_u64());
+                    let intermediate_size = config_json
+                        .get("intermediate_size")
+                        .and_then(|v| v.as_u64());
+                    let active_intermediate_size = intermediate_size.and_then(|h| {
+                        let divisor = 1_u64.checked_shl(matformer_tier_for_loading as u32)?;
+                        Some(h / divisor)
+                    });
+                    // Compute base intermediate size (before any tier slicing)
+                    // For sliced checkpoints, scale up by CLI tier to get original base
+                    let base_intermediate_size: Option<u64> = intermediate_size.and_then(|size| {
+                        if uses_sliced_checkpoint && init_config.matformer_tier > 0 {
+                            // Sliced checkpoint: scale up to get base
+                            size.checked_shl(init_config.matformer_tier as u32)
+                        } else {
+                            // Full checkpoint: intermediate_size IS the base
+                            Some(size)
+                        }
+                    });
+                    let num_hidden_layers = config_json
+                        .get("num_hidden_layers")
+                        .and_then(|v| v.as_u64());
+                    let vocab_size = config_json.get("vocab_size").and_then(|v| v.as_u64());
+
+                    let canonical_config = canonicalize_config_for_schema(
+                        config_json.clone(),
+                        init_config.matformer_tier,
+                        uses_sliced_checkpoint,
+                    );
+                    let schema_info = ModelSchemaInfo {
+                        schema_hash_local: schema_hash_for_config(
+                            llm.architecture,
+                            &config_json,
+                            &parameter_names,
+                        ),
+                        schema_hash_canonical: schema_hash_for_config(
+                            llm.architecture,
+                            &canonical_config,
+                            &parameter_names,
+                        ),
+                        parameter_count: u32::try_from(parameter_names.len()).unwrap_or(u32::MAX),
+                        matformer_tier: init_config.matformer_tier,
+                        uses_sliced_checkpoint,
+                    };
+                    if tx_schema.send(schema_info).is_err() {
+                        warn!("Failed to send schema hash info; channel closed");
+                    }
+
+                    match (hidden_size, intermediate_size, active_intermediate_size) {
+                        (
+                            Some(hidden_size),
+                            Some(intermediate_size),
+                            Some(active_intermediate_size),
+                        ) => {
+                            info!(
+                                integration_test_log_marker = %IntegrationTestLogMarker::LoadedModel,
+                                checkpoint = %llm.checkpoint,
+                                gpus = init_config.data_parallelism * init_config.tensor_parallelism,
+                                dp = init_config.data_parallelism,
+                                tp = init_config.tensor_parallelism,
+                                matformer_tier = init_config.matformer_tier,
+                                matformer_effective_tier = matformer_tier_for_loading,
+                                matformer_load_strategy = ?init_config.matformer_load_strategy,
+                                matformer_uses_sliced_checkpoint = uses_sliced_checkpoint,
+                                matformer_checkpoint_path = matformer_checkpoint_path.as_deref().unwrap_or("unknown"),
+                                hidden_size = hidden_size,
+                                intermediate_size = intermediate_size,
+                                intermediate_size_active = active_intermediate_size,
+                                num_hidden_layers = num_hidden_layers.unwrap_or_default(),
+                                vocab_size = vocab_size.unwrap_or_default(),
+                                "loaded_model",
+                            );
+
+                            // Print MatFormer configuration summary
+                            print_matformer_summary(
+                                matformer_checkpoint_path.as_deref().unwrap_or("unknown"),
+                                init_config.matformer_tier,
+                                matformer_tier_for_loading,
+                                uses_sliced_checkpoint,
+                                &init_config.matformer_load_strategy,
+                                init_config.matformer_helper_fraction,
+                                intermediate_size,
+                                active_intermediate_size,
+                            );
+                        }
+                        _ => {
+                            info!(
+                                integration_test_log_marker = %IntegrationTestLogMarker::LoadedModel,
+                                checkpoint = %llm.checkpoint,
+                                gpus = init_config.data_parallelism * init_config.tensor_parallelism,
+                                dp = init_config.data_parallelism,
+                                tp = init_config.tensor_parallelism,
+                                matformer_tier = init_config.matformer_tier,
+                                "loaded_model",
+                            );
+                        }
+                    }
+
+                    Ok(RawLoadedModel {
+                        models: raw_loaded_model_type,
+                        tokenizer,
+                        model_task_runner,
+                        checkpoint_extra_files,
+                        parameter_names,
+                        matformer_effective_tier: matformer_tier_for_loading,
+                        matformer_base_intermediate_size: base_intermediate_size,
+                    })
+                }),
                 model::Checkpoint::Ephemeral => return Err(InitRunError::ModelIsEphemeral),
             },
         };
@@ -1291,8 +1579,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
         // TODO add data fetching for verifying, too..
         let data_provider = data.map_err(InitRunError::DataProviderConnect)?;
-        let data_fetcher =
-            DataFetcher::<T, A>::new(data_provider, init_config.data_parallelism * 2);
+        let data_fetcher = DataFetcher::<T, A>::new(
+            data_provider,
+            init_config.data_parallelism * 2,
+            init_config.same_batch_warmup_steps,
+        );
 
         let trainers: Vec<Trainer> = match models {
             RawLoadedModelType::ParallelNativeModels(models) => {
@@ -1361,6 +1652,9 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             },
                             llm.lr_schedule,
                             llm.optimizer,
+                            init_config.distro_apply_mode,
+                            init_config.distro_value_mode,
+                            init_config.distro_raw_config,
                             init_config.micro_batch_size,
                             init_config.optim_stats_every_n_steps,
                             init_config.grad_accum_in_fp32,
@@ -1371,35 +1665,37 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             }
             #[cfg(feature = "python")]
             RawLoadedModelType::Python(model) => {
-                vec![
-                    psyche_modeling::LocalTrainer::new(
-                        ParallelModels {
-                            models: vec![Box::new(model) as Box<dyn CausalLM>],
-                            barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
-                            data_parallel: None,
-                        },
-                        llm.lr_schedule,
-                        llm.optimizer,
-                        init_config.micro_batch_size,
-                        init_config.optim_stats_every_n_steps,
-                        init_config.grad_accum_in_fp32,
-                    )
-                    .into(),
-                ]
+                vec![psyche_modeling::LocalTrainer::new(
+                    ParallelModels {
+                        models: vec![Box::new(model) as Box<dyn CausalLM>],
+                        barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
+                        data_parallel: None,
+                    },
+                    llm.lr_schedule,
+                    llm.optimizer,
+                    init_config.distro_apply_mode,
+                    init_config.distro_value_mode,
+                    init_config.distro_raw_config,
+                    init_config.micro_batch_size,
+                    init_config.optim_stats_every_n_steps,
+                    init_config.grad_accum_in_fp32,
+                )
+                .into()]
             }
             #[cfg(feature = "python")]
             RawLoadedModelType::PythonDistributed(model) => {
-                vec![
-                    psyche_modeling::PythonDistributedTrainer::new(
-                        model,
-                        llm.lr_schedule,
-                        llm.optimizer,
-                        init_config.micro_batch_size,
-                        init_config.optim_stats_every_n_steps,
-                        init_config.grad_accum_in_fp32,
-                    )?
-                    .into(),
-                ]
+                vec![psyche_modeling::PythonDistributedTrainer::new(
+                    model,
+                    llm.lr_schedule,
+                    llm.optimizer,
+                    init_config.distro_apply_mode,
+                    init_config.distro_value_mode,
+                    init_config.distro_raw_config,
+                    init_config.micro_batch_size,
+                    init_config.optim_stats_every_n_steps,
+                    init_config.grad_accum_in_fp32,
+                )?
+                .into()]
             }
         };
 
@@ -1434,6 +1730,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             tx_distro_result,
             parameter_names: parameter_names.clone(),
             matformer_tier: init_config.matformer_tier,
+            distro_apply_only_trainer_index: init_config.distro_apply_only_trainer_index,
 
             model_task_runner: model_task_runner.clone(),
             log_memory_usage: init_config.log_memory_usage,
@@ -1441,6 +1738,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             wandb_run,
             tx_teacher_logits,
             distillation_config: init_config.distillation_config,
+            distro_value_mode: init_config.distro_value_mode,
+            matformer_local_inner_steps: init_config.matformer_local_inner_steps,
         };
 
         let witness = WitnessStepMetadata {

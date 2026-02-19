@@ -5,17 +5,19 @@ use psyche_centralized_shared::{
     ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage, TrainingAssignment,
 };
 use psyche_client::{
-    Client, ClientTUI, ClientTUIState, NC, RunInitConfig, TrainArgs, read_identity_secret_key,
+    read_identity_secret_key, Client, ClientTUI, ClientTUIState, RunInitConfig, TrainArgs, NC,
 };
-use psyche_coordinator::{Coordinator, HealthChecks, model};
+use psyche_coordinator::{model, Coordinator, HealthChecks};
 use psyche_metrics::ClientMetrics;
 use psyche_network::{
-    AuthenticatableIdentity, EndpointId, NetworkTUIState, NetworkTui, SecretKey, TcpClient,
-    allowlist,
+    allowlist, AuthenticatableIdentity, EndpointId, NetworkTUIState, NetworkTui, SecretKey,
+    TcpClient,
 };
 use psyche_tui::logging::LoggerWidget;
 use psyche_tui::{CustomWidget, TabbedWidget};
-use psyche_watcher::{Backend as WatcherBackend, CoordinatorTui, ModelSchemaInfo, OpportunisticData};
+use psyche_watcher::{
+    Backend as WatcherBackend, CoordinatorTui, ModelSchemaInfo, OpportunisticData,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -140,10 +142,33 @@ pub async fn build_app(
     )
     .await?;
 
+    let mut suffix_gate_start_step = p.matformer_suffix_gate_start_step;
+    let mut suffix_gate_warmup_steps = p.matformer_suffix_gate_warmup_steps;
+    let mut distill_start_step = p.matformer_distillation_start_step;
+    let mut distill_warmup_steps = p.matformer_distillation_warmup_steps;
+    if p.matformer_synergy_phase_a_steps > 0 || p.matformer_synergy_ramp_steps > 0 {
+        if p.matformer_synergy_phase_a_steps == 0 || p.matformer_synergy_ramp_steps == 0 {
+            return Err(Error::msg(
+                "MatFormer synergy schedule requires both --matformer-synergy-phase-a-steps and --matformer-synergy-ramp-steps to be > 0",
+            ));
+        }
+        suffix_gate_start_step = p.matformer_synergy_phase_a_steps;
+        suffix_gate_warmup_steps = p.matformer_synergy_ramp_steps;
+        distill_start_step = p.matformer_synergy_phase_a_steps;
+        distill_warmup_steps = p.matformer_synergy_ramp_steps;
+        info!(
+            phase_a_steps = p.matformer_synergy_phase_a_steps,
+            ramp_steps = p.matformer_synergy_ramp_steps,
+            "Applying MatFormer synergy schedule overrides (suffix gate + distillation)"
+        );
+    }
+
     let state_options: RunInitConfig<ClientId, ClientId> = RunInitConfig {
         data_parallelism: p.data_parallelism,
         tensor_parallelism: p.tensor_parallelism,
         micro_batch_size: p.micro_batch_size,
+        same_batch_warmup_steps: p.same_batch_warmup_steps,
+        matformer_local_inner_steps: p.matformer_local_inner_steps,
         write_gradients_dir: p.write_gradients_dir,
         eval_tasks,
         eval_task_max_docs: p.eval_task_max_docs,
@@ -166,17 +191,84 @@ pub async fn build_app(
         matformer_helper_rotation_interval: p.matformer_helper_rotation_interval,
         log_memory_usage: p.log_memory_usage,
         sidecar_port: p.sidecar_port,
+        suffix_gate_config: if suffix_gate_warmup_steps > 0 || p.matformer_suffix_gate_learnable {
+            Some(psyche_modeling::SuffixGateConfig {
+                gate_tier: p.matformer_suffix_gate_tier,
+                start_step: suffix_gate_start_step,
+                warmup_steps: suffix_gate_warmup_steps,
+                schedule: match p.matformer_suffix_gate_schedule {
+                    psyche_client::MatformerGateSchedule::Linear => {
+                        psyche_modeling::SuffixGateSchedule::Linear
+                    }
+                    psyche_client::MatformerGateSchedule::Cosine => {
+                        psyche_modeling::SuffixGateSchedule::Cosine
+                    }
+                },
+                learnable: p.matformer_suffix_gate_learnable,
+                learnable_init_logit: p.matformer_suffix_gate_learnable_init_logit,
+            })
+        } else {
+            None
+        },
         distillation_config: if p.matformer_distillation_beta_max > 0.0 {
             Some(psyche_modeling::DistillationConfig {
                 top_k: p.matformer_distillation_top_k,
+                logits_to_keep: p.matformer_distillation_logits_to_keep,
                 temperature: p.matformer_distillation_temperature,
                 beta_max: p.matformer_distillation_beta_max,
-                start_step: p.matformer_distillation_start_step,
-                warmup_steps: p.matformer_distillation_warmup_steps,
+                start_step: distill_start_step,
+                warmup_steps: distill_warmup_steps,
+                combine_mode: match p.matformer_distillation_combine_mode {
+                    psyche_client::MatformerDistillationCombineMode::Mix => {
+                        psyche_modeling::DistillationCombineMode::Mix
+                    }
+                    psyche_client::MatformerDistillationCombineMode::Add => {
+                        psyche_modeling::DistillationCombineMode::Add
+                    }
+                },
+                min_teacher_topk_mass: p.matformer_distillation_min_teacher_topk_mass,
+                kd_q_topk_mass_floor: p.matformer_distillation_kd_q_topk_mass_floor,
                 ..Default::default()
             })
         } else {
             None
+        },
+        distro_apply_mode: match p.distro_apply_mode {
+            psyche_client::DistroApplyMode::Sign => psyche_modeling::DistroApplyMode::Sign,
+            psyche_client::DistroApplyMode::Raw => psyche_modeling::DistroApplyMode::Raw,
+        },
+        distro_value_mode: match p.distro_value_mode {
+            psyche_client::DistroValueMode::Auto => psyche_modeling::DistroValueMode::Auto,
+            psyche_client::DistroValueMode::Sign => psyche_modeling::DistroValueMode::Sign,
+            psyche_client::DistroValueMode::Raw => psyche_modeling::DistroValueMode::Raw,
+        },
+        distro_apply_only_trainer_index: p.distro_apply_only_trainer_index,
+        distro_raw_config: psyche_modeling::DistroRawConfig {
+            enabled: p.distro_raw_v2_enabled,
+            norm_mode: match p.distro_raw_norm_mode {
+                psyche_client::DistroRawNormMode::Off => psyche_modeling::DistroRawNormMode::Off,
+                psyche_client::DistroRawNormMode::MatchPreL2 => {
+                    psyche_modeling::DistroRawNormMode::MatchPreL2
+                }
+                psyche_client::DistroRawNormMode::MatchSignEquivalent => {
+                    psyche_modeling::DistroRawNormMode::MatchSignEquivalent
+                }
+                psyche_client::DistroRawNormMode::MatchSignEquivalentNnz => {
+                    psyche_modeling::DistroRawNormMode::MatchSignEquivalentNnz
+                }
+            },
+            scale_multiplier: p.distro_raw_scale_multiplier,
+            scale_max: p.distro_raw_scale_max,
+            abs_clip_mult: p.distro_raw_abs_clip_mult,
+            sign_equiv_mult: p.distro_raw_sign_equiv_mult,
+            missing_sidecar_policy: match p.distro_raw_missing_sidecar_policy {
+                psyche_client::DistroRawMissingSidecarPolicy::WarnOff => {
+                    psyche_modeling::DistroRawMissingSidecarPolicy::WarnOff
+                }
+                psyche_client::DistroRawMissingSidecarPolicy::Fail => {
+                    psyche_modeling::DistroRawMissingSidecarPolicy::Fail
+                }
+            },
         },
     };
     let app = App {
