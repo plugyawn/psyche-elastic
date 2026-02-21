@@ -29,6 +29,7 @@ TIER1_INNER_STEPS="${TIER1_INNER_STEPS:-4}"
 SERVER_PORT="${SERVER_PORT:-23620}"
 METRICS_BASE_PORT="${METRICS_BASE_PORT:-7110}"
 P2P_BASE_PORT="${P2P_BASE_PORT:-36120}"
+CLIENT_START_DELAY_SECS="${CLIENT_START_DELAY_SECS:-5}"
 
 WANDB_PROJECT="${WANDB_PROJECT:-psyche-a100}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
@@ -63,18 +64,42 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   cargo build --release -p psyche-centralized-server -p psyche-centralized-client
 fi
 
-PY="${PYO3_PYTHON:-python3}"
-read -r RUN_ID TOTAL_STEPS < <("${PY}" - "${CFG_PATH}" <<'PY'
-import sys
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
-with open(sys.argv[1], "rb") as f:
-    cfg = tomllib.load(f)
-print(cfg["run_id"], cfg["config"]["total_steps"])
-PY
-)
+RUN_ID="$(
+  awk -F'=' '
+    /^run_id[[:space:]]*=/ {
+      v=$2
+      gsub(/"/, "", v)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      print v
+      exit
+    }
+  ' "${CFG_PATH}"
+)"
+
+TOTAL_STEPS="$(
+  awk -F'=' '
+    /^\[config\]$/ { in_cfg=1; next }
+    /^\[/ { if (in_cfg) exit }
+    in_cfg && /^total_steps[[:space:]]*=/ {
+      v=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      print v
+      exit
+    }
+  ' "${CFG_PATH}"
+)"
+
+if [[ -z "${RUN_ID}" || -z "${TOTAL_STEPS}" ]]; then
+  echo "[inner] Failed to parse run_id/total_steps from ${CFG_PATH}" >&2
+  exit 1
+fi
+
+MAX_RUN_ID_CHARS=32
+if (( ${#RUN_ID} > MAX_RUN_ID_CHARS )); then
+  echo "[inner] run_id is too long (${#RUN_ID} > ${MAX_RUN_ID_CHARS}): ${RUN_ID}" >&2
+  echo "[inner] Shorten run_id in ${CFG_PATH} to avoid server/client mismatch from truncation." >&2
+  exit 1
+fi
 
 if [[ -z "${LOG_ROOT}" ]]; then
   LOG_ROOT="${ROOT}/logs/a100_innersteps_single/${RUN_ID}/$(date -u +%Y%m%d_%H%M%S)"
@@ -89,6 +114,7 @@ echo "[inner] run_id=${RUN_ID} total_steps=${TOTAL_STEPS}"
 echo "[inner] log_root=${LOG_ROOT}"
 echo "[inner] tier1_inner_steps=${TIER1_INNER_STEPS}"
 echo "[inner] heldout_eval_batches=${HELDOUT_EVAL_BATCHES} heldout_eval_batch_size=${HELDOUT_EVAL_BATCH_SIZE}"
+echo "[inner] client_start_delay_secs=${CLIENT_START_DELAY_SECS}"
 echo "[inner] wandb_group=${WANDB_GROUP}"
 
 server_pid=""
@@ -125,7 +151,7 @@ server_pid=$!
 
 retries=240
 while (( retries > 0 )); do
-  if "${PY}" - <<'PY' "${SERVER_PORT}"
+  if python3 - <<'PY' "${SERVER_PORT}"
 import socket,sys
 port=int(sys.argv[1])
 s=socket.socket(); s.settimeout(0.4)
@@ -146,6 +172,10 @@ done
 if (( retries == 0 )); then
   echo "[inner] Timed out waiting for server port ${SERVER_PORT}." >&2
   exit 1
+fi
+
+if (( CLIENT_START_DELAY_SECS > 0 )); then
+  sleep "${CLIENT_START_DELAY_SECS}"
 fi
 
 export RUST_LOG="warn,psyche_client=info,psyche_modeling=info,psyche_centralized_client=info"
@@ -207,7 +237,7 @@ done
 has_loss_at_step() {
   local path="$1"
   local target_step="$2"
-  "${PY}" - "$path" "$target_step" <<'PY'
+  python3 - "$path" "$target_step" <<'PY'
 import sys
 path = sys.argv[1]
 target = str(int(sys.argv[2]))

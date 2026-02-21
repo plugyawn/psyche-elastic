@@ -1,4 +1,4 @@
-run_id = "exp-ngpt20m-fw-1953-ls-b200-sb-remedy"
+run_id = "fw1953-ls-b200-sb-rmd"
 run_state = "WaitingForMembers"
 
 [config]
