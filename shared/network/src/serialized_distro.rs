@@ -1,5 +1,5 @@
 use psyche_core::BatchId;
-use psyche_modeling::DistroResult;
+use psyche_modeling::{DistroNormSidecar, DistroPeerMetadata, DistroResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,13 +13,23 @@ use thiserror::Error;
 
 use crate::serializable_tensor::SerializableTensor;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SerializedDistroResult {
     pub parameter_name: String,
     pub sparse_idx: SerializableTensor,
     pub sparse_val: SerializableTensor,
     pub xshape: Vec<u16>,
     pub totalk: u32,
+    #[serde(default)]
+    pub norm_sidecar: Option<SerializedDistroNormSidecar>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SerializedDistroNormSidecar {
+    pub full_pre_l2: f32,
+    pub full_pre_abs_mean: f32,
+    pub numel: u32,
+    pub nnz: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -27,7 +37,18 @@ pub struct TransmittableDistroResult {
     pub step: u32,
     pub trainer_nonce: u32,
     pub batch_id: BatchId,
+    #[serde(default)]
+    pub aggregation_metadata: SerializedDistroAggregationMetadata,
     pub distro_results: Vec<SerializedDistroResult>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct SerializedDistroAggregationMetadata {
+    pub inner_steps_used: u16,
+    pub sum_local_lr: f32,
+    pub tokens_processed: u32,
+    pub delta_l2_preclip: f32,
+    pub delta_l2_postclip: f32,
 }
 
 impl TransmittableDistroResult {
@@ -37,6 +58,11 @@ impl TransmittableDistroResult {
         hasher.update(self.trainer_nonce.to_be_bytes());
         hasher.update(self.batch_id.0.start.to_be_bytes());
         hasher.update(self.batch_id.0.end.to_be_bytes());
+        hasher.update(self.aggregation_metadata.inner_steps_used.to_be_bytes());
+        hasher.update(self.aggregation_metadata.sum_local_lr.to_be_bytes());
+        hasher.update(self.aggregation_metadata.tokens_processed.to_be_bytes());
+        hasher.update(self.aggregation_metadata.delta_l2_preclip.to_be_bytes());
+        hasher.update(self.aggregation_metadata.delta_l2_postclip.to_be_bytes());
         for result in &self.distro_results {
             hasher.update((result.parameter_name.len() as u32).to_be_bytes());
             hasher.update(result.parameter_name.as_bytes());
@@ -45,6 +71,15 @@ impl TransmittableDistroResult {
                 hasher.update(dim.to_be_bytes());
             }
             hasher.update(result.totalk.to_be_bytes());
+            if let Some(sc) = &result.norm_sidecar {
+                hasher.update([1u8]);
+                hasher.update(sc.full_pre_l2.to_be_bytes());
+                hasher.update(sc.full_pre_abs_mean.to_be_bytes());
+                hasher.update(sc.numel.to_be_bytes());
+                hasher.update(sc.nnz.to_be_bytes());
+            } else {
+                hasher.update([0u8]);
+            }
             result.sparse_idx.update_hash(&mut hasher);
             result.sparse_val.update_hash(&mut hasher);
         }
@@ -73,13 +108,19 @@ impl TryFrom<&DistroResult> for SerializedDistroResult {
                 .map(|&x| u16::try_from(x))
                 .collect::<Result<Vec<u16>, _>>()?,
             totalk: value.totalk as u32,
+            norm_sidecar: value
+                .norm_sidecar
+                .as_ref()
+                .map(SerializedDistroNormSidecar::from),
         })
     }
 }
 
 impl TryFrom<(&str, &DistroResult)> for SerializedDistroResult {
     type Error = SerializeDistroResultError;
-    fn try_from((parameter_name, value): (&str, &DistroResult)) -> std::result::Result<Self, Self::Error> {
+    fn try_from(
+        (parameter_name, value): (&str, &DistroResult),
+    ) -> std::result::Result<Self, Self::Error> {
         Ok(Self {
             parameter_name: parameter_name.to_owned(),
             sparse_idx: (&value.sparse_idx).try_into()?,
@@ -90,6 +131,10 @@ impl TryFrom<(&str, &DistroResult)> for SerializedDistroResult {
                 .map(|&x| u16::try_from(x))
                 .collect::<Result<Vec<u16>, _>>()?,
             totalk: value.totalk as u32,
+            norm_sidecar: value
+                .norm_sidecar
+                .as_ref()
+                .map(SerializedDistroNormSidecar::from),
         })
     }
 }
@@ -103,6 +148,8 @@ impl TryFrom<&SerializedDistroResult> for DistroResult {
             sparse_val: (&value.sparse_val).try_into()?,
             xshape: value.xshape.iter().map(|x| *x as i64).collect(),
             totalk: value.totalk as i64,
+            norm_sidecar: value.norm_sidecar.as_ref().map(DistroNormSidecar::from),
+            peer_metadata: None,
             stats: None,
         };
         // only pin if we have a device to pin to
@@ -112,6 +159,52 @@ impl TryFrom<&SerializedDistroResult> for DistroResult {
             distro_result.sparse_val = distro_result.sparse_val.pin_memory();
         }
         Ok(distro_result)
+    }
+}
+
+impl From<&DistroNormSidecar> for SerializedDistroNormSidecar {
+    fn from(value: &DistroNormSidecar) -> Self {
+        Self {
+            full_pre_l2: value.full_pre_l2,
+            full_pre_abs_mean: value.full_pre_abs_mean,
+            numel: value.numel,
+            nnz: value.nnz,
+        }
+    }
+}
+
+impl From<&SerializedDistroNormSidecar> for DistroNormSidecar {
+    fn from(value: &SerializedDistroNormSidecar) -> Self {
+        Self {
+            full_pre_l2: value.full_pre_l2,
+            full_pre_abs_mean: value.full_pre_abs_mean,
+            numel: value.numel,
+            nnz: value.nnz,
+        }
+    }
+}
+
+impl From<&SerializedDistroAggregationMetadata> for DistroPeerMetadata {
+    fn from(value: &SerializedDistroAggregationMetadata) -> Self {
+        Self {
+            inner_steps_used: value.inner_steps_used,
+            sum_local_lr: value.sum_local_lr,
+            tokens_processed: value.tokens_processed,
+            delta_l2_preclip: value.delta_l2_preclip,
+            delta_l2_postclip: value.delta_l2_postclip,
+        }
+    }
+}
+
+impl From<&DistroPeerMetadata> for SerializedDistroAggregationMetadata {
+    fn from(value: &DistroPeerMetadata) -> Self {
+        Self {
+            inner_steps_used: value.inner_steps_used,
+            sum_local_lr: value.sum_local_lr,
+            tokens_processed: value.tokens_processed,
+            delta_l2_preclip: value.delta_l2_preclip,
+            delta_l2_postclip: value.delta_l2_postclip,
+        }
     }
 }
 

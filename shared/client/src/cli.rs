@@ -151,6 +151,15 @@ pub struct TrainArgs {
     #[clap(long, env)]
     pub eval_task_max_docs: Option<usize>,
 
+    /// If > 0, run held-out validation loss evaluation during cooldown/checkpointing.
+    /// This uses validation data only (where supported) and logs `heldout_eval`.
+    #[clap(long, env, default_value_t = 0)]
+    pub heldout_eval_batches: usize,
+
+    /// Batch size (number of sequences) per held-out eval batch.
+    #[clap(long, env, default_value_t = 16)]
+    pub heldout_eval_batch_size: usize,
+
     // enable the execution of the model prompting task
     #[clap(long, env)]
     pub prompt_task: bool,
@@ -266,6 +275,12 @@ pub struct TrainArgs {
     #[clap(long, env, value_enum, default_value_t = DistroApplyMode::Sign)]
     pub distro_apply_mode: DistroApplyMode,
 
+    /// DisTrO aggregation mode.
+    /// - legacy: existing sparse aggregation path
+    /// - diloco-lite: weighted aggregation + outer momentum + trust-region scaling
+    #[clap(long, env, value_enum, default_value_t = DistroAggregateMode::Legacy)]
+    pub distro_aggregate_mode: DistroAggregateMode,
+
     /// DisTrO transmitted value mode.
     /// - auto: preserves existing behavior
     /// - sign: force sign-valued sparse payloads
@@ -322,6 +337,26 @@ pub struct TrainArgs {
         default_value_t = DistroRawMissingSidecarPolicy::WarnOff
     )]
     pub distro_raw_missing_sidecar_policy: DistroRawMissingSidecarPolicy,
+
+    /// DiLoCo-lite outer momentum (EMA beta) on the server-side aggregation path.
+    #[clap(long, env, default_value_t = 0.9)]
+    pub distro_diloco_outer_momentum: f64,
+
+    /// DiLoCo-lite multiplier on the aggregated direction before optimizer step.
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_diloco_outer_lr_multiplier: f64,
+
+    /// DiLoCo-lite trust-region target expressed as update-norm / parameter-norm.
+    #[clap(long, env, default_value_t = 0.02)]
+    pub distro_diloco_trust_region_target: f64,
+
+    /// DiLoCo-lite clamp factor for trust-region scaling.
+    #[clap(long, env, default_value_t = 1.0)]
+    pub distro_diloco_trust_region_max_scale: f64,
+
+    /// DiLoCo-lite cap on per-peer aggregation weight as multiple of mean peer weight.
+    #[clap(long, env, default_value_t = 2.0)]
+    pub distro_diloco_tier_weight_cap: f64,
 
     /// Tier-0 suffix gate warmup steps (0 = disabled).
     ///
@@ -457,6 +492,13 @@ pub enum MatformerDistillationCombineMode {
 pub enum DistroApplyMode {
     Sign,
     Raw,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum DistroAggregateMode {
+    Legacy,
+    DilocoLite,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

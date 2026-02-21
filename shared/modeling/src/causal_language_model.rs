@@ -1,15 +1,16 @@
 use crate::{
-    AllReduce, AttentionImplementation, Communicator, CommunicatorId, ModelConfig, ModelLoadError,
-    PretrainedSource, ReduceType, RoPEConfig, StableVarStoreIterator, StableVariableIterator,
+    AllReduce, AttentionImplementation, Communicator, CommunicatorId, DistillationCombineMode,
+    ModelConfig, ModelLoadError, PretrainedSource, ReduceType, RoPEConfig, StableVarStoreIterator,
+    StableVariableIterator,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicBool};
 use tch::{
     nn::{self, Module},
     Device, Kind, Tensor,
 };
-use tracing::trace;
+use tracing::{error, info, trace};
 
 #[cfg(feature = "parallelism")]
 use tch::CNCCL;
@@ -54,7 +55,9 @@ pub trait CausalLM: Send {
 
     /// Forward pass with knowledge distillation loss.
     ///
-    /// Computes: `(1 - β) * CE(student, labels) + β * KL(student/T, teacher/T) * T²`
+    /// Computes either:
+    /// - `(1 - β) * CE(student, labels) + β * KL(student/T, teacher/T) * T²` (`mix`)
+    /// - `CE(student, labels) + β * KL(student/T, teacher/T) * T²` (`add`)
     ///
     /// Default impl falls back to regular forward (ignores teacher targets).
     fn forward_with_distillation(
@@ -75,72 +78,233 @@ pub trait CausalLM: Send {
 /// Reconstructed teacher logit targets for knowledge distillation.
 ///
 /// Created from `CompressedTeacherLogits` on the student side.
-/// The teacher distribution is stored as sparse top-k + uniform remainder.
+/// The teacher distribution is stored as sparse top-k (WAN-friendly).
+///
+/// Note: we intentionally do *not* reconstruct a dense `[*, vocab]` teacher distribution,
+/// since that is prohibitively expensive for real vocab sizes.
 #[derive(Debug)]
 pub struct TeacherLogitTargets {
     /// Top-k vocabulary indices: [batch, seq, top_k]
     pub top_indices: Tensor,
     /// Top-k logit values: [batch, seq, top_k]
     pub top_values: Tensor,
+    /// Per-token log-normalizer: `logZ = logsumexp(logits / T)` over the full vocab.
+    ///
+    /// Shape: [batch, seq]
+    pub logsumexp: Tensor,
     /// Temperature used for softening
     pub temperature: f32,
     /// Number of top-k entries per token
     pub top_k: i64,
-    /// Vocab size for reconstructing full distribution
-    pub vocab_size: i64,
+    /// Distillation combine mode.
+    pub combine_mode: DistillationCombineMode,
+    /// Optional teacher-confidence gate threshold on mean q_topk_mass.
+    pub min_teacher_topk_mass: Option<f64>,
+
+    /// Optional KD scaling floor for the teacher's mean top-k mass.
+    ///
+    /// If > 0, scale KD by `1 / clamp(mean_q_topk_mass, floor, 1.0)`.
+    pub kd_q_topk_mass_floor: f64,
 }
 
-impl TeacherLogitTargets {
-    /// Reconstruct a full teacher log-probability distribution from sparse top-k.
-    ///
-    /// For tokens where we have top-k logits, the remaining probability mass
-    /// is distributed uniformly across the (vocab_size - top_k) remaining tokens.
-    ///
-    /// Returns: [batch * (seq-1), vocab_size] log-probabilities (shifted to match CE convention).
-    pub fn to_shifted_log_probs(&self, device: Device) -> Tensor {
-        let top_indices = self.top_indices.to(device);
-        let top_values = self.top_values.to(device).to_kind(Kind::Float);
-
-        // Apply temperature scaling
-        let scaled = &top_values / (self.temperature as f64);
-
-        // Compute softmax over top-k to get the "known" probability mass
-        let top_probs = scaled.softmax(-1, Kind::Float);
-
-        // Allocate full distribution with a small floor (uniform over remaining vocab)
-        let (batch, seq, _k) = top_indices.size3().unwrap();
-        let floor_val = 1e-8_f64 / (self.vocab_size as f64);
-        let mut full_log_probs =
-            Tensor::full([batch, seq, self.vocab_size], floor_val, (Kind::Float, device)).log();
-
-        // Scatter top-k probabilities into the full distribution
-        let top_probs_adjusted = &top_probs * (1.0 - 1e-8); // leave floor for remaining
-        let log_top_probs = top_probs_adjusted.log();
-        let _ = full_log_probs.scatter_(-1, &top_indices.to_kind(Kind::Int64), &log_top_probs);
-
-        // Shift by 1 to match causal LM convention: token[i] predicts token[i+1]
-        // Same shift as CE loss: take positions [0..seq-1]
-        full_log_probs.slice(1, 0, -1, 1).contiguous().view([-1, self.vocab_size])
+impl Clone for TeacherLogitTargets {
+    fn clone(&self) -> Self {
+        Self {
+            top_indices: self.top_indices.shallow_clone(),
+            top_values: self.top_values.shallow_clone(),
+            logsumexp: self.logsumexp.shallow_clone(),
+            temperature: self.temperature,
+            top_k: self.top_k,
+            combine_mode: self.combine_mode,
+            min_teacher_topk_mass: self.min_teacher_topk_mass,
+            kd_q_topk_mass_floor: self.kd_q_topk_mass_floor,
+        }
     }
 }
 
-/// Compute KD loss: `β * KL(student/T || teacher/T) * T²`.
+/// Compute KD loss using sparse top-k teacher targets.
 ///
-/// - `student_logits`: raw student logits [batch*(seq-1), vocab_size]
-/// - `teacher_log_probs`: teacher log-probs [batch*(seq-1), vocab_size]
+/// This computes KL(teacher || student) over the provided top-k support:
+/// `sum_k q_k * (log q_k - log p_k)`, where `q` is teacher softmax over top-k logits
+/// and `p_k` is student's probability at the same indices.
+///
+/// - `student_logits`: raw student logits `[N, vocab_size]` (already shifted/flattened)
+/// - `teacher_top_indices`: `[N, top_k]` int64 indices into vocab
+/// - `teacher_top_values`: `[N, top_k]` raw teacher logits corresponding to indices
 /// - `temperature`: softening temperature
+pub fn kd_loss_topk(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    temperature: f32,
+) -> Tensor {
+    kd_loss_topk_impl(
+        student_logits,
+        teacher_top_indices,
+        teacher_top_values,
+        temperature,
+        None,
+    )
+}
+
+/// Masked variant of `kd_loss_topk` that ignores positions where `valid_mask` is false.
 ///
-/// Returns a scalar loss tensor.
-pub fn kd_loss(student_logits: &Tensor, teacher_log_probs: &Tensor, temperature: f32) -> Tensor {
+/// `valid_mask` must be broadcastable to shape `[N]` where `N` is the flattened token count.
+pub fn kd_loss_topk_masked(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    temperature: f32,
+    valid_mask: &Tensor,
+) -> Tensor {
+    kd_loss_topk_impl(
+        student_logits,
+        teacher_top_indices,
+        teacher_top_values,
+        temperature,
+        Some(valid_mask),
+    )
+}
+
+fn kd_loss_topk_impl(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    temperature: f32,
+    valid_mask: Option<&Tensor>,
+) -> Tensor {
     let t = temperature as f64;
-    let student_log_probs = (student_logits / t).log_softmax(-1, Kind::Float);
-    // KL(student || teacher) = sum(teacher * (log(teacher) - log(student)))
-    // = sum(exp(teacher_log_probs) * (teacher_log_probs - student_log_probs))
+    let teacher_log_probs =
+        (teacher_top_values.to_kind(Kind::Float) / t).log_softmax(-1, Kind::Float);
     let teacher_probs = teacher_log_probs.exp();
-    let kl = (&teacher_probs * (teacher_log_probs - &student_log_probs))
-        .sum_dim_intlist(-1, false, Kind::Float)
-        .mean(Kind::Float);
+
+    // Student: avoid materializing full `[N, vocab]` log-softmax (VRAM-heavy).
+    // Compute logZ = logsumexp(logits/T) and gather only the teacher top-k positions.
+    let student_scaled = student_logits.to_kind(Kind::Float) / t;
+    let student_logz = student_scaled.logsumexp(-1, false).reshape([-1, 1]); // [N,1]
+    let gathered_logits =
+        student_scaled.gather(1, &teacher_top_indices.to_kind(Kind::Int64), false);
+    let gathered = gathered_logits - &student_logz;
+
+    let per_token_kl =
+        (&teacher_probs * (&teacher_log_probs - gathered)).sum_dim_intlist(-1, false, Kind::Float);
+    let kl = match valid_mask {
+        Some(mask) => {
+            let mask_f = mask.to_kind(Kind::Float);
+            let denom = mask_f.sum(Kind::Float).clamp_min(1.0);
+            (&per_token_kl * mask_f).sum(Kind::Float) / denom
+        }
+        None => per_token_kl.mean(Kind::Float),
+    };
     kl * (t * t)
+}
+
+/// Compute KD loss using sparse top-k teacher targets plus a single "tail" bucket.
+///
+/// Teacher transmits:
+/// - top-k logits + indices, and
+/// - `logZ = logsumexp(logits / T)` per token over the full vocab.
+///
+/// Student computes:
+/// - `q_i` exactly for the top-k entries under the full normalization (`logZ`),
+/// - `q_tail = 1 - sum_i q_i`,
+/// - same for `p_i` and `p_tail` from student softmax,
+/// and returns KL over `{topk} ∪ {tail}`.
+///
+/// This avoids the severe distortion of renormalizing teacher top-k to sum to 1.0.
+pub fn kd_loss_topk_tail_bucket_masked(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    teacher_logsumexp: &Tensor,
+    temperature: f32,
+    valid_mask: &Tensor,
+) -> Tensor {
+    kd_loss_topk_tail_bucket_impl(
+        student_logits,
+        teacher_top_indices,
+        teacher_top_values,
+        teacher_logsumexp,
+        temperature,
+        Some(valid_mask),
+    )
+}
+
+pub fn kd_loss_topk_tail_bucket(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    teacher_logsumexp: &Tensor,
+    temperature: f32,
+) -> Tensor {
+    kd_loss_topk_tail_bucket_impl(
+        student_logits,
+        teacher_top_indices,
+        teacher_top_values,
+        teacher_logsumexp,
+        temperature,
+        None,
+    )
+}
+
+fn kd_loss_topk_tail_bucket_impl(
+    student_logits: &Tensor,
+    teacher_top_indices: &Tensor,
+    teacher_top_values: &Tensor,
+    teacher_logsumexp: &Tensor,
+    temperature: f32,
+    valid_mask: Option<&Tensor>,
+) -> Tensor {
+    let t = temperature as f64;
+    let eps = 1.0e-8;
+
+    // Teacher: log q_i = (l_i / T) - logZ
+    let teacher_logz = teacher_logsumexp.to_kind(Kind::Float).reshape([-1, 1]); // [N, 1]
+    let teacher_scaled = teacher_top_values.to_kind(Kind::Float) / t;
+    let teacher_log_probs_top = &teacher_scaled - &teacher_logz; // [N, top_k]
+    let teacher_probs_top = teacher_log_probs_top.exp();
+    let q_top_mass = teacher_probs_top.sum_dim_intlist(-1, false, Kind::Float); // [N]
+    let q_tail = (Tensor::ones_like(&q_top_mass) - &q_top_mass).clamp(eps, 1.0);
+    let log_q_tail = q_tail.log();
+
+    // Student: avoid materializing full `[N, vocab]` log-softmax (VRAM-heavy).
+    // Compute logZ = logsumexp(logits/T) and gather only the teacher top-k positions.
+    let student_scaled = student_logits.to_kind(Kind::Float) / t;
+    let student_logz = student_scaled.logsumexp(-1, false).reshape([-1, 1]); // [N,1]
+    let gathered_logits =
+        student_scaled.gather(1, &teacher_top_indices.to_kind(Kind::Int64), false);
+    let gathered = gathered_logits - &student_logz; // log p_i at teacher indices
+    let student_probs_top = gathered.exp();
+    let p_top_mass = student_probs_top.sum_dim_intlist(-1, false, Kind::Float);
+    let p_tail = (Tensor::ones_like(&p_top_mass) - &p_top_mass).clamp(eps, 1.0);
+    let log_p_tail = p_tail.log();
+
+    // KL over {topk} ∪ {tail}
+    let kl_top = (&teacher_probs_top * (&teacher_log_probs_top - gathered)).sum_dim_intlist(
+        -1,
+        false,
+        Kind::Float,
+    );
+    let kl_tail = &q_tail * (&log_q_tail - &log_p_tail);
+    let per_token_kl = kl_top + kl_tail;
+
+    let kl = match valid_mask {
+        Some(mask) => {
+            let mask_f = mask.to_kind(Kind::Float);
+            let denom = mask_f.sum(Kind::Float).clamp_min(1.0);
+            (&per_token_kl * mask_f).sum(Kind::Float) / denom
+        }
+        None => per_token_kl.mean(Kind::Float),
+    };
+    kl * (t * t)
+}
+
+fn kd_scale_from_q_topk_mass_mean(mean_q_topk_mass: f64, q_floor: f64) -> f64 {
+    if q_floor <= 0.0 {
+        return 1.0;
+    }
+    let denom = mean_q_topk_mass.clamp(q_floor, 1.0);
+    1.0 / denom
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +361,8 @@ pub struct CausalLanguageModel<M: LanguageModelForward, C: LanguageModelConfig> 
 
 // this is absolutely unsafe, if you use it across threads with NCCL you will have a bad day
 unsafe impl<M: LanguageModelForward, C: LanguageModelConfig> Send for CausalLanguageModel<M, C> {}
+
+static LAST_DISTILL_INFO_STEP: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub type LanguageModelBuilder<M, C> = fn(
     vs: nn::Path,
@@ -396,6 +562,7 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguag
                 let vocab_size = self.config.vocab_size() as i64;
                 let shift_logits_flat = shift_logits.view([-1i64, vocab_size]);
                 let shift_targets = shift_labels.view(-1).to_kind(Kind::Int64);
+                let _valid_mask_full = shift_targets.ne(-100);
 
                 // CE loss
                 let ce_loss = shift_logits_flat.cross_entropy_loss::<Tensor>(
@@ -406,31 +573,204 @@ impl<M: LanguageModelForward, C: LanguageModelConfig> CausalLM for CausalLanguag
                     0.0,
                 );
 
-                // KD loss from teacher targets
-                // Override vocab_size if not set (0 means "infer from model")
-                let targets_with_vocab = TeacherLogitTargets {
-                    top_indices: teacher_targets.top_indices.shallow_clone(),
-                    top_values: teacher_targets.top_values.shallow_clone(),
-                    temperature: teacher_targets.temperature,
-                    top_k: teacher_targets.top_k,
-                    vocab_size: if teacher_targets.vocab_size == 0 {
-                        vocab_size
-                    } else {
-                        teacher_targets.vocab_size
-                    },
-                };
-                let teacher_log_probs = targets_with_vocab.to_shifted_log_probs(self.device);
-                let kd = kd_loss(&shift_logits_flat, &teacher_log_probs, teacher_targets.temperature);
+                // KD loss from sparse top-k teacher targets (WAN-friendly)
+                // Shift teacher targets the same way as CE: positions [0..seq-1] predict [1..seq]
+                let teacher_seq_size = teacher_targets.top_indices.size();
+                let teacher_seq_len = *teacher_seq_size.get(1).unwrap_or(&0);
+                let teacher_values_size = teacher_targets.top_values.size();
+                let teacher_logsumexp_size = teacher_targets.logsumexp.size();
+                let teacher_top_k = teacher_targets.top_k;
+                let step = crate::matformer_c2::current_step();
+                let teacher_indices = teacher_targets
+                    .top_indices
+                    .to(self.device)
+                    .to_kind(Kind::Int64);
+                let teacher_values = teacher_targets
+                    .top_values
+                    .to(self.device)
+                    .to_kind(Kind::Float);
+                let teacher_logsumexp = teacher_targets
+                    .logsumexp
+                    .to(self.device)
+                    .to_kind(Kind::Float);
 
-                // Combined: (1 - β) * CE + β * KD
-                let beta = distillation_beta;
-                let mut combined = &ce_loss * (1.0 - beta) + &kd * beta;
+                let (_, student_seq_len, _) = logits.size3().expect("logits must be 3D");
+                let teacher_payload_ok = teacher_top_k > 0
+                    && teacher_seq_size.len() == 3
+                    && teacher_values_size.len() == 3
+                    && teacher_logsumexp_size.len() == 2
+                    && teacher_seq_size[0] == teacher_values_size[0]
+                    && teacher_seq_size[1] == teacher_logsumexp_size[1]
+                    && teacher_seq_size[0] == teacher_logsumexp_size[0]
+                    && teacher_seq_size[2] == teacher_values_size[2]
+                    && teacher_seq_size[2] == teacher_top_k
+                    && teacher_indices
+                        .lt(0)
+                        .logical_or(&teacher_indices.ge(vocab_size))
+                        .any()
+                        .int64_value(&[])
+                        == 0
+                    && teacher_values.isfinite().all().int64_value(&[]) != 0
+                    && teacher_logsumexp.isfinite().all().int64_value(&[]) != 0
+                    && teacher_targets.temperature > 0.0;
+                if !teacher_payload_ok {
+                    error!(
+                        step = step,
+                        teacher_top_k = teacher_top_k,
+                        temperature = teacher_targets.temperature,
+                        teacher_indices_shape = ?teacher_seq_size,
+                        teacher_values_shape = ?teacher_values_size,
+                        teacher_logsumexp_shape = ?teacher_logsumexp_size,
+                        "Invalid teacher payload for distillation"
+                    );
+                    return (Some(logits), None);
+                }
+                if teacher_seq_len < 2 {
+                    error!(
+                        teacher_seq_len = teacher_seq_len,
+                        "Invalid teacher targets: seq_len must be >= 2 for distillation"
+                    );
+                    return (Some(logits), None);
+                }
+                if teacher_seq_len > student_seq_len {
+                    error!(
+                        teacher_seq_len = teacher_seq_len,
+                        student_seq_len = student_seq_len,
+                        "Invalid teacher targets: teacher seq_len exceeds student seq_len"
+                    );
+                    return (Some(logits), None);
+                }
+
+                // Teacher targets correspond to the *last* `teacher_seq_len` positions (when using
+                // `num_logits_to_keep` on the teacher). Align student KD to the same suffix.
+                let kd_start = student_seq_len - teacher_seq_len; // start in unshifted token positions
+                let kd_len = teacher_seq_len - 1; // after shifting, we have one fewer prediction
+
+                let shift_logits_kd = shift_logits
+                    .narrow(1, kd_start, kd_len)
+                    .contiguous()
+                    .view([-1i64, vocab_size]);
+                let kd_valid_mask = shift_labels
+                    .narrow(1, kd_start, kd_len)
+                    .contiguous()
+                    .view(-1)
+                    .to_kind(Kind::Int64)
+                    .ne(-100);
+
+                let teacher_indices_shift = teacher_indices
+                    .slice(1, 0, -1, 1)
+                    .contiguous()
+                    .view([-1i64, teacher_targets.top_k]);
+                let teacher_values_shift = teacher_values
+                    .slice(1, 0, -1, 1)
+                    .contiguous()
+                    .view([-1i64, teacher_targets.top_k]);
+                let teacher_logsumexp_shift = teacher_logsumexp
+                    .slice(1, 0, -1, 1)
+                    .contiguous()
+                    .view([-1i64]);
+                let kd_raw = kd_loss_topk_tail_bucket_masked(
+                    &shift_logits_kd,
+                    &teacher_indices_shift,
+                    &teacher_values_shift,
+                    &teacher_logsumexp_shift,
+                    teacher_targets.temperature,
+                    &kd_valid_mask,
+                );
+
+                let t = teacher_targets.temperature as f64;
+                let eps = 1.0e-8;
+
+                let teacher_logz = teacher_logsumexp_shift.to_kind(Kind::Float).view([-1, 1]); // [N, 1]
+                let teacher_scaled = &teacher_values_shift / t;
+                let teacher_probs_top = (&teacher_scaled - &teacher_logz).exp();
+                let q_top_mass = teacher_probs_top
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .clamp(0.0, 1.0);
+                let q_tail = (Tensor::ones_like(&q_top_mass) - &q_top_mass).clamp(eps, 1.0);
+
+                let student_scaled = &shift_logits_kd / t;
+                let student_logz = student_scaled.logsumexp(-1, false).reshape([-1, 1]);
+                let student_gathered =
+                    student_scaled.gather(1, &teacher_indices_shift.to_kind(Kind::Int64), false)
+                        - &student_logz;
+                let p_top_mass = student_gathered
+                    .exp()
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .clamp(0.0, 1.0);
+                let p_tail = (Tensor::ones_like(&p_top_mass) - &p_top_mass).clamp(eps, 1.0);
+
+                let mask_f = kd_valid_mask.to_kind(Kind::Float);
+                let denom = mask_f.sum(Kind::Float).clamp_min(1.0);
+                let q_topk_mass_mean = (&q_top_mass * &mask_f).sum(Kind::Float) / &denom;
+                let q_tail_mean = (&q_tail * &mask_f).sum(Kind::Float) / &denom;
+                let p_topk_mass_mean = (&p_top_mass * &mask_f).sum(Kind::Float) / &denom;
+                let p_tail_mean = (&p_tail * &mask_f).sum(Kind::Float) / &denom;
+
+                let q_topk_mass_mean_f = q_topk_mass_mean.double_value(&[]);
+                let beta_requested = distillation_beta;
+                let mut beta = beta_requested;
+                if let Some(min_teacher_topk_mass) = teacher_targets.min_teacher_topk_mass {
+                    if q_topk_mass_mean_f < min_teacher_topk_mass {
+                        beta = 0.0;
+                    }
+                }
+
+                let kd_scale = kd_scale_from_q_topk_mass_mean(
+                    q_topk_mass_mean_f,
+                    teacher_targets.kd_q_topk_mass_floor,
+                );
+                let kd = &kd_raw * kd_scale;
+
+                // Combined objective:
+                // - Mix: (1 - β) * CE + β * KD
+                // - Add: CE + β * KD
+                let mut combined = match teacher_targets.combine_mode {
+                    DistillationCombineMode::Mix => &ce_loss * (1.0 - beta) + &kd * beta,
+                    DistillationCombineMode::Add => &ce_loss + &kd * beta,
+                };
                 trace!(
                     ce = ce_loss.double_value(&[]),
+                    kd_raw = kd_raw.double_value(&[]),
                     kd = kd.double_value(&[]),
+                    kd_scale = kd_scale,
+                    beta_requested = beta_requested,
                     beta = beta,
+                    combine_mode = ?teacher_targets.combine_mode,
+                    teacher_seq_len = teacher_seq_len,
+                    student_seq_len = student_seq_len,
                     "distillation loss"
                 );
+
+                // INFO log once per step: CE/KD/beta and teacher/student top-k mass diagnostics.
+                if beta_requested > 0.0 {
+                    let prev = LAST_DISTILL_INFO_STEP.load(Ordering::Relaxed);
+                    if prev != step
+                        && LAST_DISTILL_INFO_STEP
+                            .compare_exchange(prev, step, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        info!(
+                            step = step,
+                            ce = ce_loss.double_value(&[]),
+                            kd_raw = kd_raw.double_value(&[]),
+                            kd = kd.double_value(&[]),
+                            kd_scale = kd_scale,
+                            kd_q_topk_mass_floor = teacher_targets.kd_q_topk_mass_floor,
+                            beta_requested = beta_requested,
+                            beta = beta,
+                            combine_mode = ?teacher_targets.combine_mode,
+                            min_teacher_topk_mass = teacher_targets.min_teacher_topk_mass,
+                            temperature = teacher_targets.temperature,
+                            q_topk_mass = q_topk_mass_mean_f,
+                            q_tail = q_tail_mean.double_value(&[]),
+                            p_topk_mass = p_topk_mass_mean.double_value(&[]),
+                            p_tail = p_tail_mean.double_value(&[]),
+                            teacher_seq_len = teacher_seq_len,
+                            "distillation stats"
+                        );
+                    }
+                }
 
                 if let Some(loss_scale) = loss_scale {
                     combined /= loss_scale;
@@ -536,13 +876,81 @@ impl EosToks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tch::nn;
 
     #[test]
-    fn test_kd_loss_identical_distributions() {
-        // When student and teacher have the same distribution, KL should be ~0
-        let logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
-        let log_probs = logits.log_softmax(-1, Kind::Float);
-        let loss = kd_loss(&logits, &log_probs, 1.0);
+    fn test_kd_loss_topk_tail_bucket_identical_distributions_full_support() {
+        // When student and teacher have the same distribution and teacher support covers full vocab,
+        // KL should be ~0.
+        let batch = 4;
+        let vocab = 50;
+        let student_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_logits = student_logits.shallow_clone();
+        let teacher_top_indices = Tensor::arange(vocab, (Kind::Int64, Device::Cpu))
+            .unsqueeze(0)
+            .repeat(&[batch, 1]);
+        let teacher_top_values = teacher_logits.shallow_clone();
+        let teacher_logsumexp = (&teacher_logits / 1.0).logsumexp(-1, false);
+        let loss = kd_loss_topk_tail_bucket(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            &teacher_logsumexp,
+            1.0,
+        );
+        let loss_val = loss.double_value(&[]);
+        assert!(
+            loss_val.abs() < 1e-4,
+            "KD loss (tail-bucket) with identical distributions should be ~0, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_kd_loss_topk_tail_bucket_different_distributions_full_support() {
+        // When student and teacher differ, KL should be > 0.
+        let batch = 4;
+        let vocab = 50;
+        let student_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_top_indices = Tensor::arange(vocab, (Kind::Int64, Device::Cpu))
+            .unsqueeze(0)
+            .repeat(&[batch, 1]);
+        let teacher_top_values = teacher_logits.shallow_clone();
+        let teacher_logsumexp = (&teacher_logits / 1.0).logsumexp(-1, false);
+        let loss = kd_loss_topk_tail_bucket(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            &teacher_logsumexp,
+            1.0,
+        );
+        let loss_val = loss.double_value(&[]);
+        assert!(
+            loss_val > 0.0,
+            "KD loss (tail-bucket) with different distributions should be > 0, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_kd_loss_topk_identical_distributions_full_support() {
+        // When student and teacher have the same distribution and teacher support covers full vocab,
+        // KL should be ~0.
+        let batch = 4;
+        let vocab = 50;
+        let student_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_logits = student_logits.shallow_clone();
+        let teacher_top_indices = Tensor::arange(vocab, (Kind::Int64, Device::Cpu))
+            .unsqueeze(0)
+            .repeat(&[batch, 1]);
+        let teacher_top_values = teacher_logits.shallow_clone();
+        let loss = kd_loss_topk(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            1.0,
+        );
         let loss_val = loss.double_value(&[]);
         assert!(
             loss_val.abs() < 1e-4,
@@ -552,12 +960,22 @@ mod tests {
     }
 
     #[test]
-    fn test_kd_loss_different_distributions() {
-        // When student and teacher differ, KL should be > 0
-        let student_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
-        let teacher_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
-        let teacher_log_probs = teacher_logits.log_softmax(-1, Kind::Float);
-        let loss = kd_loss(&student_logits, &teacher_log_probs, 1.0);
+    fn test_kd_loss_topk_different_distributions_full_support() {
+        // When student and teacher differ, KL should be > 0.
+        let batch = 4;
+        let vocab = 50;
+        let student_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_top_indices = Tensor::arange(vocab, (Kind::Int64, Device::Cpu))
+            .unsqueeze(0)
+            .repeat(&[batch, 1]);
+        let teacher_top_values = teacher_logits.shallow_clone();
+        let loss = kd_loss_topk(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            1.0,
+        );
         let loss_val = loss.double_value(&[]);
         assert!(
             loss_val > 0.0,
@@ -567,29 +985,41 @@ mod tests {
     }
 
     #[test]
-    fn test_kd_loss_temperature_scaling() {
-        // Higher temperature should soften the distribution, reducing KL
-        let student_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
-        let teacher_logits = Tensor::randn([4, 100], (Kind::Float, Device::Cpu));
+    fn test_kd_loss_topk_temperature_is_finite() {
+        let batch = 4;
+        let vocab = 50;
+        let student_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_logits = Tensor::randn([batch, vocab], (Kind::Float, Device::Cpu));
+        let teacher_top_indices = Tensor::arange(vocab, (Kind::Int64, Device::Cpu))
+            .unsqueeze(0)
+            .repeat(&[batch, 1]);
+        let teacher_top_values = teacher_logits.shallow_clone();
 
-        let teacher_log_probs_t1 = teacher_logits.log_softmax(-1, Kind::Float);
-        let loss_t1 = kd_loss(&student_logits, &teacher_log_probs_t1, 1.0).double_value(&[]);
+        let loss_t1 = kd_loss_topk(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            1.0,
+        )
+        .double_value(&[]);
+        let loss_t2 = kd_loss_topk(
+            &student_logits,
+            &teacher_top_indices,
+            &teacher_top_values,
+            2.0,
+        )
+        .double_value(&[]);
 
-        // For T=2, we need to compute teacher log probs at that temperature
-        let teacher_log_probs_t2 = (&teacher_logits / 2.0).log_softmax(-1, Kind::Float);
-        let loss_t2 = kd_loss(&student_logits, &teacher_log_probs_t2, 2.0).double_value(&[]);
-
-        // Both should be positive
-        assert!(loss_t1 > 0.0);
-        assert!(loss_t2 > 0.0);
+        assert!(loss_t1.is_finite());
+        assert!(loss_t2.is_finite());
     }
 
     #[test]
-    fn test_teacher_logit_targets_reconstruction() {
+    fn test_teacher_logit_targets_shift_and_flatten_shapes() {
         let batch = 2;
         let seq = 4;
         let top_k = 3;
-        let vocab_size = 10;
+        let vocab_size = 10; // only used for student logits in this test
 
         // Create known top-k targets
         let top_indices = Tensor::from_slice(&[
@@ -616,37 +1046,329 @@ mod tests {
         ])
         .reshape([batch, seq, top_k]);
 
+        let logsumexp = Tensor::full([batch, seq], 10.0, (Kind::Float, Device::Cpu));
         let targets = TeacherLogitTargets {
             top_indices,
             top_values,
+            logsumexp,
             temperature: 2.0,
             top_k,
-            vocab_size,
+            combine_mode: DistillationCombineMode::Mix,
+            min_teacher_topk_mass: None,
+            kd_q_topk_mass_floor: 0.05,
         };
 
-        let log_probs = targets.to_shifted_log_probs(Device::Cpu);
-        // Should be [batch * (seq-1), vocab_size]
-        assert_eq!(log_probs.size(), vec![batch * (seq - 1), vocab_size]);
+        // Shift by 1 to match causal LM convention and flatten.
+        let idx_shift = targets
+            .top_indices
+            .slice(1, 0, -1, 1)
+            .contiguous()
+            .view([-1, top_k]);
+        let val_shift = targets
+            .top_values
+            .slice(1, 0, -1, 1)
+            .contiguous()
+            .view([-1, top_k]);
 
-        // All log probs should be <= 0
-        let max_lp = log_probs.max().double_value(&[]);
-        assert!(
-            max_lp <= 0.0 + 1e-6,
-            "log probs should be <= 0, got max {}",
-            max_lp
+        assert_eq!(idx_shift.size(), vec![batch * (seq - 1), top_k]);
+        assert_eq!(val_shift.size(), vec![batch * (seq - 1), top_k]);
+
+        let student_logits =
+            Tensor::randn([batch * (seq - 1), vocab_size], (Kind::Float, Device::Cpu));
+        let loss = kd_loss_topk(&student_logits, &idx_shift, &val_shift, targets.temperature);
+        assert!(loss.double_value(&[]).is_finite());
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct ToyConfig {
+        hidden_size: usize,
+        vocab_size: usize,
+        max_position_embeddings: usize,
+    }
+
+    impl ModelConfig for ToyConfig {
+        fn get_parameter_names(&self) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    impl LanguageModelConfig for ToyConfig {
+        fn tie_word_embeddings(&self) -> bool {
+            false
+        }
+
+        fn set_max_position_embeddings(&mut self, set: usize) {
+            self.max_position_embeddings = set;
+        }
+
+        fn hidden_size(&self) -> usize {
+            self.hidden_size
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+
+        fn rope_config(&self) -> Option<RoPEConfig> {
+            None
+        }
+
+        fn num_attention_heads(&self) -> usize {
+            1
+        }
+
+        fn rope_theta(&self) -> f32 {
+            10000.0
+        }
+
+        fn max_position_embeddings(&self) -> usize {
+            self.max_position_embeddings
+        }
+
+        fn bos_token_id(&self) -> Option<i64> {
+            None
+        }
+
+        fn eos_token_ids(&self) -> Option<EosToks> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct ToyModel {
+        wte: nn::Embedding,
+    }
+
+    impl LanguageModelForward for ToyModel {
+        fn forward(
+            &self,
+            x: &Tensor,
+            _position_ids: Option<&Tensor>,
+            _sequence_lengths: Option<&Vec<Vec<i32>>>,
+            _training: bool,
+        ) -> Tensor {
+            self.wte.forward(x)
+        }
+    }
+
+    #[test]
+    fn test_forward_with_distillation_truncated_teacher_seq_len() {
+        let batch = 2;
+        let student_seq = 16;
+        let teacher_seq = 8; // last-N distillation window
+        let hidden = 8;
+        let vocab = 32;
+        let top_k = 4;
+
+        let mut cfg = ToyConfig {
+            hidden_size: hidden,
+            vocab_size: vocab,
+            max_position_embeddings: student_seq,
+        };
+        // ensure config trait method is exercised
+        cfg.set_max_position_embeddings(student_seq);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let root = vs.root();
+        let wte = nn::embedding(
+            &root / "wte",
+            vocab as i64,
+            hidden as i64,
+            Default::default(),
+        );
+        let model = ToyModel { wte };
+        let lm_head = nn::linear(
+            &root / "lm_head",
+            hidden as i64,
+            vocab as i64,
+            Default::default(),
         );
 
-        // Exponentiated probs should sum to ~1
-        let probs = log_probs.exp();
-        let sums = probs.sum_dim_intlist(-1, false, Kind::Float);
-        for i in 0..sums.size()[0] {
-            let s = sums.double_value(&[i]);
-            assert!(
-                (s - 1.0).abs() < 0.01,
-                "probs should sum to ~1, got {} at position {}",
-                s,
-                i
-            );
-        }
+        let clm = CausalLanguageModel {
+            model,
+            config: cfg,
+            variables: StableVarStoreIterator::new(&vs, None),
+            device: Device::Cpu,
+            lm_head,
+            comm: None,
+            training: AtomicBool::new(true),
+        };
+
+        let input_ids = Tensor::randint(
+            vocab as i64,
+            [batch as i64, student_seq as i64],
+            (Kind::Int64, Device::Cpu),
+        );
+        let labels = input_ids.shallow_clone();
+
+        let teacher_top_indices = Tensor::randint(
+            vocab as i64,
+            [batch as i64, teacher_seq as i64, top_k as i64],
+            (Kind::Int64, Device::Cpu),
+        );
+        let teacher_top_values = Tensor::randn(
+            [batch as i64, teacher_seq as i64, top_k as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let teacher_logsumexp = Tensor::full(
+            [batch as i64, teacher_seq as i64],
+            10.0,
+            (Kind::Float, Device::Cpu),
+        );
+        let teacher_targets = TeacherLogitTargets {
+            top_indices: teacher_top_indices,
+            top_values: teacher_top_values,
+            logsumexp: teacher_logsumexp,
+            temperature: 2.0,
+            top_k: top_k as i64,
+            combine_mode: DistillationCombineMode::Mix,
+            min_teacher_topk_mass: None,
+            kd_q_topk_mass_floor: 0.05,
+        };
+
+        let (_logits, loss) = clm.forward_with_distillation(
+            &input_ids,
+            Some(&labels),
+            None,
+            None,
+            None,
+            &teacher_targets,
+            0.5,
+        );
+        let loss = loss.expect("loss should be present for valid truncated teacher targets");
+        assert!(loss.double_value(&[]).is_finite());
+    }
+
+    #[test]
+    fn test_forward_with_distillation_invalid_teacher_payload_returns_none() {
+        let batch = 2;
+        let student_seq = 12;
+        let teacher_seq = 6;
+        let hidden = 8;
+        let vocab = 24;
+        let top_k = 4;
+
+        let mut cfg = ToyConfig {
+            hidden_size: hidden,
+            vocab_size: vocab,
+            max_position_embeddings: student_seq,
+        };
+        cfg.set_max_position_embeddings(student_seq);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let root = vs.root();
+        let wte = nn::embedding(
+            &root / "wte",
+            vocab as i64,
+            hidden as i64,
+            Default::default(),
+        );
+        let model = ToyModel { wte };
+        let lm_head = nn::linear(
+            &root / "lm_head",
+            hidden as i64,
+            vocab as i64,
+            Default::default(),
+        );
+        let clm = CausalLanguageModel {
+            model,
+            config: cfg,
+            variables: StableVarStoreIterator::new(&vs, None),
+            device: Device::Cpu,
+            lm_head,
+            comm: None,
+            training: AtomicBool::new(true),
+        };
+
+        let input_ids = Tensor::randint(
+            vocab as i64,
+            [batch as i64, student_seq as i64],
+            (Kind::Int64, Device::Cpu),
+        );
+        let labels = input_ids.shallow_clone();
+
+        let invalid_teacher_top_indices = Tensor::full(
+            [batch as i64, teacher_seq as i64, top_k as i64],
+            vocab as i64,
+            (Kind::Int64, Device::Cpu),
+        );
+        let invalid_teacher_top_values = Tensor::randn(
+            [batch as i64, teacher_seq as i64, top_k as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let teacher_logsumexp = Tensor::full(
+            [batch as i64, teacher_seq as i64],
+            0.0,
+            (Kind::Float, Device::Cpu),
+        );
+        let invalid_teacher_targets = TeacherLogitTargets {
+            top_indices: invalid_teacher_top_indices,
+            top_values: invalid_teacher_top_values,
+            logsumexp: teacher_logsumexp,
+            temperature: 2.0,
+            top_k: top_k as i64,
+            combine_mode: DistillationCombineMode::Add,
+            min_teacher_topk_mass: None,
+            kd_q_topk_mass_floor: 0.05,
+        };
+
+        let (_, invalid_loss) = clm.forward_with_distillation(
+            &input_ids,
+            Some(&labels),
+            None,
+            None,
+            None,
+            &invalid_teacher_targets,
+            1.0,
+        );
+        assert!(
+            invalid_loss.is_none(),
+            "loss should be None when teacher payload is invalid"
+        );
+
+        let nan_teacher_top_values = Tensor::full(
+            [batch as i64, teacher_seq as i64, top_k as i64],
+            f64::NAN,
+            (Kind::Float, Device::Cpu),
+        );
+        let non_finite_teacher_targets = TeacherLogitTargets {
+            top_indices: Tensor::randint(
+                vocab as i64,
+                [batch as i64, teacher_seq as i64, top_k as i64],
+                (Kind::Int64, Device::Cpu),
+            ),
+            top_values: nan_teacher_top_values,
+            logsumexp: Tensor::full(
+                [batch as i64, teacher_seq as i64],
+                f64::NAN,
+                (Kind::Float, Device::Cpu),
+            ),
+            temperature: 2.0,
+            top_k: top_k as i64,
+            combine_mode: DistillationCombineMode::Add,
+            min_teacher_topk_mass: None,
+            kd_q_topk_mass_floor: 0.05,
+        };
+        let (_, nan_loss) = clm.forward_with_distillation(
+            &input_ids,
+            Some(&labels),
+            None,
+            None,
+            None,
+            &non_finite_teacher_targets,
+            1.0,
+        );
+        assert!(
+            nan_loss.is_none(),
+            "loss should be None when teacher payload is non-finite"
+        );
+    }
+
+    #[test]
+    fn test_kd_scale_from_q_topk_mass_mean() {
+        assert_eq!(kd_scale_from_q_topk_mass_mean(0.5, 0.0), 1.0);
+        assert!((kd_scale_from_q_topk_mass_mean(0.5, 0.05) - 2.0).abs() < 1e-12);
+        assert!((kd_scale_from_q_topk_mass_mean(0.01, 0.05) - 20.0).abs() < 1e-12);
+        assert!((kd_scale_from_q_topk_mass_mean(1.2, 0.05) - 1.0).abs() < 1e-12);
     }
 }

@@ -1,4 +1,4 @@
-use psyche_coordinator::{Coordinator, get_batch_ids_for_node};
+use psyche_coordinator::{get_batch_ids_for_node, Coordinator};
 use psyche_core::{BatchId, NodeIdentity};
 use psyche_data_provider::{DataProvider, TokenizedDataProvider};
 use psyche_modeling::{Batch, BatchData, BatchDataCPU};
@@ -10,11 +10,11 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
     task::JoinHandle,
     time::sleep,
 };
-use tracing::{Instrument, debug, error, trace, trace_span, warn};
+use tracing::{debug, error, info, trace, trace_span, warn, Instrument};
 
 pub type BatchStep = u32;
 pub type BatchIdSet = HashSet<BatchId>;
@@ -26,17 +26,34 @@ pub struct DataFetcher<T: NodeIdentity, A: AuthenticatableIdentity> {
     data_provider: Arc<Mutex<DataProvider<A>>>,
     active_fetch_task: Option<(BatchStep, JoinHandle<()>)>,
     buffer_size: usize,
+    same_batch_warmup_steps: u32,
+    same_batch_warmup_started_logged: bool,
+    same_batch_warmup_ended_logged: bool,
     _phantom: PhantomData<T>,
 }
 
 impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
-    pub fn new(data_provider: DataProvider<A>, buffer_size: usize) -> Self {
+    pub fn new(
+        data_provider: DataProvider<A>,
+        buffer_size: usize,
+        same_batch_warmup_steps: u32,
+    ) -> Self {
         Self {
             data_provider: Arc::new(Mutex::new(data_provider)),
             active_fetch_task: None,
             buffer_size,
+            same_batch_warmup_steps,
+            same_batch_warmup_started_logged: false,
+            same_batch_warmup_ended_logged: false,
             _phantom: Default::default(),
         }
+    }
+
+    /// Returns a handle to the underlying data provider, for ad-hoc batch fetches.
+    ///
+    /// This is used for tier-0 teacher-logit production (fetching batches not assigned to self).
+    pub fn data_provider_handle(&self) -> Arc<Mutex<DataProvider<A>>> {
+        self.data_provider.clone()
     }
 
     pub fn fetch_data(
@@ -46,6 +63,26 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
         identity: &T,
     ) -> TrainingDataForStep {
         let step = state.progress.step;
+        let same_batch_warmup_active =
+            self.same_batch_warmup_steps > 0 && step <= self.same_batch_warmup_steps;
+
+        if self.same_batch_warmup_steps > 0 && !self.same_batch_warmup_started_logged {
+            info!(
+                "[data] same-batch warmup enabled: steps 1..={} will fetch the same canonical batch for all trainers",
+                self.same_batch_warmup_steps
+            );
+            self.same_batch_warmup_started_logged = true;
+        }
+        if self.same_batch_warmup_steps > 0
+            && !self.same_batch_warmup_ended_logged
+            && step == self.same_batch_warmup_steps.saturating_add(1)
+        {
+            info!(
+                "[data] same-batch warmup ended at step {}; fetching assigned batches normally",
+                step
+            );
+            self.same_batch_warmup_ended_logged = true;
+        }
 
         let mut assigned_batch_ids = get_batch_ids_for_node(data_assignments, identity);
         trace!(
@@ -60,6 +97,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
 
         let (tx_next_sample, next_sample) = mpsc::channel(self.buffer_size);
 
+        let canonical_batch_id = if same_batch_warmup_active {
+            data_assignments.keys().next().copied()
+        } else {
+            None
+        };
+
         if let Some((last_step, task)) = self.active_fetch_task.take() {
             trace!("Killing previous fetch task from step {last_step}.");
             task.abort(); // we don't need it anymore :)
@@ -70,35 +113,38 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
             tokio::spawn({
                 trace!("New fetch task for step {step} has been spawned");
                 let data_provider = self.data_provider.clone(); // only one of these tasks will acquire the lock at once. once one dies, the lock is released for sure.
+                let canonical_batch_id = canonical_batch_id;
 
                 async move {
                     loop {
-                        let batch_id = {
-                            match assigned_batch_ids.pop() {
+                        let assigned_batch_id = match assigned_batch_ids.pop() {
                                 Some(assigned) => assigned,
                                 None => {
                                     // out of assigned data!
                                     return;
                                 }
-                            }
                         };
+                        let fetch_batch_id = canonical_batch_id.unwrap_or(assigned_batch_id);
 
                         let mut retry_count = 0;
                         let batch = loop {
-                            match data_provider.lock().await.get_samples(batch_id).await {
+                            match data_provider.lock().await.get_samples(fetch_batch_id).await {
                                 Ok(batch) => break batch,
                                 Err(err) if retry_count < MAX_RETRIES => {
                                     retry_count += 1;
                                     let delay_ms = BASE_DELAY_MS * (retry_count as u64 - 1);
                                     warn!(
-                                        "Data fetch error for batch_id={} (attempt {}/{}): \"{:#}\". Retrying in {}ms",
-                                        batch_id, retry_count, MAX_RETRIES, err, delay_ms
+                                        "Data fetch error for assigned_batch_id={} fetch_batch_id={} (attempt {}/{}): \"{:#}\". Retrying in {}ms",
+                                        assigned_batch_id, fetch_batch_id, retry_count, MAX_RETRIES, err, delay_ms
                                     );
                                     sleep(Duration::from_millis(delay_ms)).await;
                                     continue;
                                 }
                                 Err(err) => {
-                                    error!("Data fetch failed for batch_id={} after {} attempts: {err:#}", batch_id, MAX_RETRIES);
+                                    error!(
+                                        "Data fetch failed for assigned_batch_id={} fetch_batch_id={} after {} attempts: {err:#}",
+                                        assigned_batch_id, fetch_batch_id, MAX_RETRIES
+                                    );
                                     return;
                                 }
                             }
@@ -106,7 +152,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
 
                         if tx_next_sample
                             .send(Batch {
-                                id: batch_id,
+                                id: assigned_batch_id,
                                 data: BatchData::CPU(batch.into_iter().map(|batch| {
                                     BatchDataCPU {
                                         input_ids: batch.input_ids,

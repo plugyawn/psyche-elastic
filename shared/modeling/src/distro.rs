@@ -1,8 +1,333 @@
-use crate::{CausalLM, StableVariableIterator, Variable};
+use crate::{
+    CausalLM, StableVariableIterator, Variable,
+    optimizer::{
+        DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig,
+        DistroRawMissingSidecarPolicy, DistroRawNormMode, DistroValueMode,
+    },
+};
 
-use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    f64::consts::PI,
+    sync::{OnceLock, atomic::AtomicU32, atomic::Ordering as AtomicOrdering},
+};
 use tch::{COptimizer, Device, Kind, Tensor};
-use tracing::warn;
+use tracing::{info, warn};
+
+fn cosine_mixer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let v = std::env::var("PSYCHE_DISTRO_COSINE_MIXER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
+    })
+}
+
+fn cosine_mixer_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let v = std::env::var("PSYCHE_DISTRO_COSINE_MIXER_SHADOW")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
+    })
+}
+
+fn sign_flip_sample_elems() -> i64 {
+    static SAMPLE: OnceLock<i64> = OnceLock::new();
+    *SAMPLE.get_or_init(|| {
+        std::env::var("PSYCHE_DISTRO_SIGN_FLIP_SAMPLE_ELEMS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            // Cheap, stable default for per-step diagnostics.
+            .unwrap_or(4096)
+    })
+}
+
+fn raw_align_sign_scale_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let raw = std::env::var("PSYCHE_DISTRO_RAW_ALIGN_SIGN_SCALE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if raw.is_empty() {
+            // Raw mode otherwise under-updates badly vs sign at the same LR.
+            true
+        } else {
+            matches!(raw.as_str(), "1" | "true" | "yes" | "y" | "on")
+        }
+    })
+}
+
+fn raw_align_sign_scale_multiplier() -> f64 {
+    static MULTIPLIER: OnceLock<f64> = OnceLock::new();
+    *MULTIPLIER.get_or_init(|| {
+        let raw = std::env::var("PSYCHE_DISTRO_RAW_ALIGN_SIGN_SCALE_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0);
+        raw.unwrap_or(1.0)
+    })
+}
+
+fn raw_align_sign_scale_max() -> f64 {
+    static MAX_SCALE: OnceLock<f64> = OnceLock::new();
+    *MAX_SCALE.get_or_init(|| {
+        std::env::var("PSYCHE_DISTRO_RAW_ALIGN_SIGN_SCALE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            // Guardrail against exploding tiny-norm tensors in raw mode.
+            // Tuned to avoid hard under-updates while still capping pathological scales.
+            .unwrap_or(1.0e7)
+    })
+}
+
+fn raw_align_abs_clip() -> f64 {
+    static ABS_CLIP: OnceLock<f64> = OnceLock::new();
+    *ABS_CLIP.get_or_init(|| {
+        std::env::var("PSYCHE_DISTRO_RAW_ALIGN_ABS_CLIP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            // Keep magnitude info, but suppress outlier coordinates that sign() would saturate.
+            // Slightly looser than sign to preserve useful magnitude detail.
+            .unwrap_or(4.0)
+    })
+}
+
+fn modular_geometry_align_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let v = std::env::var("PSYCHE_DISTRO_MATFORMER_GEOMETRY_ALIGN")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "y" | "on")
+    })
+}
+
+fn modular_geometry_scale_power() -> f64 {
+    static POWER: OnceLock<f64> = OnceLock::new();
+    *POWER.get_or_init(|| {
+        std::env::var("PSYCHE_DISTRO_MATFORMER_GEOMETRY_SCALE_POWER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.5)
+    })
+}
+
+fn modular_geometry_transport_scale(
+    name: &str,
+    full_shape: &[i64],
+    active_shape: &[i64],
+) -> Option<f64> {
+    if !modular_geometry_align_enabled() {
+        return None;
+    }
+
+    let prefix_dim = matformer_prefix_dim(name)?;
+    if full_shape.len() != 2 || active_shape.len() != 2 {
+        return None;
+    }
+    let full_len = full_shape[prefix_dim] as f64;
+    let active_len = active_shape.get(prefix_dim).copied().unwrap_or(0) as f64;
+    if !(full_len > 0.0) || !(active_len > 0.0) || !full_len.is_finite() || !active_len.is_finite()
+    {
+        return None;
+    }
+
+    let ratio = (active_len / full_len).min(1.0).max(0.0);
+    if ratio <= 0.0 {
+        return None;
+    }
+
+    let power = modular_geometry_scale_power();
+    let base_scale = ratio.powf(power);
+    if !base_scale.is_finite() {
+        return None;
+    }
+
+    // For W1-type matrices (gate/up, rows) we transport from width m_t to m_f
+    // by √(m_t / m_f); for W2 (down) we need the inverse mapping.
+    if prefix_dim == 0 {
+        Some(base_scale)
+    } else {
+        Some(1.0 / base_scale)
+    }
+}
+
+static LAST_APPLY_INFO_STEP: AtomicU32 = AtomicU32::new(u32::MAX);
+static RAW_HEAVY_CLIP_STREAK: AtomicU32 = AtomicU32::new(0);
+
+fn sign_flip_stats_sampled(
+    combined: &Tensor,
+    reference: &Tensor,
+    prefix_dim: i64,
+    shared_len: i64,
+    sample_elems: i64,
+) -> Option<(f64, f64)> {
+    if shared_len <= 0 {
+        return None;
+    }
+    let combined = combined
+        .narrow(prefix_dim, 0, shared_len)
+        .to_kind(Kind::Float)
+        .contiguous()
+        .view([-1]);
+    let reference = reference
+        .narrow(prefix_dim, 0, shared_len)
+        .to_kind(Kind::Float)
+        .contiguous()
+        .view([-1]);
+    let n = combined.numel().max(0) as i64;
+    if n <= 0 {
+        return None;
+    }
+    let n_sample = if sample_elems > 0 {
+        n.min(sample_elems)
+    } else {
+        n
+    };
+    let combined = if n_sample < n {
+        combined.narrow(0, 0, n_sample)
+    } else {
+        combined
+    };
+    let reference = if n_sample < n {
+        reference.narrow(0, 0, n_sample)
+    } else {
+        reference
+    };
+
+    // In sign-mode, only sign changes matter. Count sign mismatches (including 0 vs +/- 1).
+    let diff = (&combined.sign() - &reference.sign()).ne(0);
+    let flips = diff.to_kind(Kind::Float).sum(Kind::Float).double_value(&[]);
+    Some((flips, n_sample as f64))
+}
+
+fn diloco_peer_metadata(
+    results: &[Vec<DistroResult>],
+    parameter_index: usize,
+) -> Vec<DistroPeerMetadata> {
+    results
+        .iter()
+        .map(|peer| {
+            peer.get(parameter_index)
+                .and_then(|r| r.peer_metadata)
+                .unwrap_or_else(|| DistroPeerMetadata {
+                    inner_steps_used: 1,
+                    sum_local_lr: 1.0,
+                    tokens_processed: 1,
+                    delta_l2_preclip: 0.0,
+                    delta_l2_postclip: 0.0,
+                })
+        })
+        .collect()
+}
+
+fn diloco_peer_weights(
+    metas: &[DistroPeerMetadata],
+    tier_weight_cap: f64,
+) -> (Vec<f64>, f64, f64, f64) {
+    if metas.is_empty() {
+        return (Vec::new(), 0.0, 0.0, 0.0);
+    }
+
+    let raw_weights = metas
+        .iter()
+        .map(|meta| {
+            let tokens = meta.tokens_processed.max(1) as f64;
+            let inner_steps = meta.inner_steps_used.max(1) as f64;
+            let lr_sum = if meta.sum_local_lr.is_finite() && meta.sum_local_lr > 1.0e-8 {
+                meta.sum_local_lr as f64
+            } else {
+                inner_steps
+            };
+            tokens / lr_sum.max(1.0e-8)
+        })
+        .collect::<Vec<_>>();
+
+    let sum = raw_weights.iter().sum::<f64>();
+    if !sum.is_finite() || sum <= 0.0 {
+        let uniform = vec![1.0; raw_weights.len()];
+        return (uniform, 1.0, 1.0, 1.0);
+    }
+
+    // Normalize to mean-1 with an explicit upper bound projection so the cap is truly enforced.
+    let n = raw_weights.len();
+    let cap = tier_weight_cap.max(1.0);
+    let mut normalized = vec![0.0f64; n];
+    let mut capped = vec![false; n];
+    let mut active: Vec<usize> = (0..n).collect();
+    let mut remaining_sum = n as f64;
+
+    loop {
+        if active.is_empty() {
+            break;
+        }
+
+        let active_raw_sum = active.iter().map(|&i| raw_weights[i]).sum::<f64>();
+        if !active_raw_sum.is_finite() || active_raw_sum <= 0.0 {
+            let fill = (remaining_sum / active.len() as f64).max(0.0);
+            for &i in &active {
+                normalized[i] = fill;
+            }
+            break;
+        }
+
+        let scale = remaining_sum / active_raw_sum;
+        let mut newly_capped = Vec::new();
+        for &i in &active {
+            let candidate = raw_weights[i] * scale;
+            if candidate > cap {
+                newly_capped.push(i);
+            }
+        }
+
+        if newly_capped.is_empty() {
+            for &i in &active {
+                normalized[i] = (raw_weights[i] * scale).max(0.0);
+            }
+            break;
+        }
+
+        for i in newly_capped {
+            if !capped[i] {
+                capped[i] = true;
+                normalized[i] = cap;
+                remaining_sum = (remaining_sum - cap).max(0.0);
+            }
+        }
+        active.retain(|&i| !capped[i]);
+    }
+
+    let normalized_sum = normalized.iter().sum::<f64>();
+    if !normalized_sum.is_finite() || normalized_sum <= 0.0 {
+        let uniform = vec![1.0; n];
+        return (uniform, 1.0, 1.0, 1.0);
+    }
+
+    let mean = normalized_sum / n as f64;
+    let min = normalized
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0);
+    let max = normalized
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(0.0);
+    (normalized, mean, min, max)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PrefixAlignError {
@@ -160,6 +485,31 @@ fn align_matformer_prefix_grad(
         prefix_view.copy_(&grad);
         Ok(expanded)
     }
+}
+
+fn scale_matformer_prefix_grad_for_geometry(
+    grad: &mut Tensor,
+    name: &str,
+    full_shape: &[i64],
+    active_shape: &[i64],
+    telemetry_sum: &mut f64,
+    telemetry_min: &mut f64,
+    telemetry_max: &mut f64,
+    telemetry_count: &mut u64,
+) {
+    let Some(scale) = modular_geometry_transport_scale(name, full_shape, active_shape) else {
+        return;
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    if (scale - 1.0).abs() > f64::EPSILON {
+        let _ = grad.g_mul_scalar_(scale);
+    }
+    *telemetry_sum += scale;
+    *telemetry_min = telemetry_min.min(scale);
+    *telemetry_max = telemetry_max.max(scale);
+    *telemetry_count += 1;
 }
 
 pub struct TransformDCT {
@@ -613,6 +963,7 @@ fn decompress_idx(max_value: i64, idx: &Tensor) -> Tensor {
 
 struct State {
     delta: Box<dyn Variable>,
+    outer_momentum: Box<dyn Variable>,
 }
 
 #[derive(Debug)]
@@ -621,7 +972,26 @@ pub struct DistroResult {
     pub sparse_val: Tensor,
     pub xshape: Vec<i64>,
     pub totalk: i64,
+    pub norm_sidecar: Option<DistroNormSidecar>,
+    pub peer_metadata: Option<DistroPeerMetadata>,
     pub stats: Option<HashMap<String, f64>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistroNormSidecar {
+    pub full_pre_l2: f32,
+    pub full_pre_abs_mean: f32,
+    pub numel: u32,
+    pub nnz: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DistroPeerMetadata {
+    pub inner_steps_used: u16,
+    pub sum_local_lr: f32,
+    pub tokens_processed: u32,
+    pub delta_l2_preclip: f32,
+    pub delta_l2_postclip: f32,
 }
 
 impl Clone for DistroResult {
@@ -631,6 +1001,8 @@ impl Clone for DistroResult {
             sparse_val: self.sparse_val.shallow_clone(),
             xshape: self.xshape.clone(),
             totalk: self.totalk,
+            norm_sidecar: self.norm_sidecar,
+            peer_metadata: self.peer_metadata,
             stats: self.stats.clone(),
         }
     }
@@ -641,6 +1013,11 @@ pub struct Distro {
     compression_decay: f64,
     compression_topk: i64,
     weight_decay: f64,
+    apply_mode: DistroApplyMode,
+    aggregate_mode: DistroAggregateMode,
+    value_mode: DistroValueMode,
+    raw_config: DistroRawConfig,
+    diloco_lite_config: DistroDilocoLiteConfig,
     state: Vec<State>,
     transform: TransformDCT,
 }
@@ -652,6 +1029,11 @@ impl Distro {
         compression_chunk: i64,
         compression_topk: i64,
         weight_decay: f64,
+        apply_mode: DistroApplyMode,
+        aggregate_mode: DistroAggregateMode,
+        value_mode: DistroValueMode,
+        raw_config: DistroRawConfig,
+        diloco_lite_config: DistroDilocoLiteConfig,
     ) -> Self {
         let _no_grad = tch::no_grad_guard();
         let mut sgd = COptimizer::sgd(0.1, 0.0, 0.0, 0.0, false).unwrap();
@@ -660,6 +1042,7 @@ impl Distro {
         for variable in vs.variables() {
             state.push(State {
                 delta: variable.zeros_like(format!("{}.delta", variable.name())),
+                outer_momentum: variable.zeros_like(format!("{}.outer_momentum", variable.name())),
             });
 
             let logical_tensor = variable.logical_tensor();
@@ -674,8 +1057,20 @@ impl Distro {
             compression_decay,
             compression_topk,
             weight_decay,
+            apply_mode,
+            aggregate_mode,
+            value_mode,
+            raw_config,
+            diloco_lite_config,
             state,
             transform,
+        }
+    }
+
+    fn lookahead_delta(delta: &Tensor, mode: DistroApplyMode) -> Tensor {
+        match mode {
+            DistroApplyMode::Sign => delta.sign(),
+            DistroApplyMode::Raw => delta.shallow_clone(),
         }
     }
 
@@ -707,7 +1102,8 @@ impl Distro {
             let delta_var = &mut self.state.get_mut(index).unwrap().delta;
             let mut delta = delta_var.logical_tensor();
 
-            let _t = variable.g_add_(&delta.sign().multiply_scalar(prev_lr));
+            let lookahead = Self::lookahead_delta(&delta, self.apply_mode).multiply_scalar(prev_lr);
+            let _t = variable.g_add_(&lookahead);
 
             if !prev_self_results.is_empty() {
                 let device = variable.device();
@@ -772,11 +1168,36 @@ impl Distro {
                 false => None,
             };
 
+            let norm_sidecar = if self.raw_config.enabled || self.value_mode == DistroValueMode::Raw
+            {
+                let numel = full_delta.numel();
+                let nnz = sparse_val.numel();
+                Some(DistroNormSidecar {
+                    full_pre_l2: full_delta
+                        .to_kind(Kind::Float)
+                        .pow_tensor_scalar(2)
+                        .sum(Kind::Float)
+                        .sqrt()
+                        .double_value(&[]) as f32,
+                    full_pre_abs_mean: full_delta
+                        .to_kind(Kind::Float)
+                        .abs()
+                        .mean(Kind::Float)
+                        .double_value(&[]) as f32,
+                    numel: (numel.min(u32::MAX as usize)) as u32,
+                    nnz: (nnz.min(u32::MAX as usize)) as u32,
+                })
+            } else {
+                None
+            };
+
             ret.push(DistroResult {
                 sparse_idx,
                 sparse_val,
                 xshape,
                 totalk,
+                norm_sidecar,
+                peer_metadata: None,
                 stats: match stats {
                     true => {
                         let name = var.name();
@@ -798,6 +1219,81 @@ impl Distro {
             return;
         }
 
+        let use_cosine_mixer = cosine_mixer_enabled();
+        let shadow_cosine_mixer = cosine_mixer_shadow_enabled();
+        let want_cosine_stats = use_cosine_mixer || shadow_cosine_mixer;
+        let want_sign_flip_stats = want_cosine_stats && self.apply_mode == DistroApplyMode::Sign;
+        let sign_flip_sample = if want_sign_flip_stats {
+            sign_flip_sample_elems()
+        } else {
+            0
+        };
+        let step = crate::matformer_c2::current_step();
+        let mut mixer_cos_sum: f64 = 0.0;
+        let mut mixer_cos_count: u64 = 0;
+        let mut mixer_cos_min: f64 = 1.0;
+        let mut mixer_cos_max: f64 = -1.0;
+        let mut mixer_cos_dropped: u64 = 0;
+        let mut telemetry_sign_flip_flips: f64 = 0.0;
+        let mut telemetry_sign_flip_total: f64 = 0.0;
+        let mut telemetry_sign_flip_params: u64 = 0;
+        let mut telemetry_sign_flip_min: f64 = f64::INFINITY;
+        let mut telemetry_sign_flip_max: f64 = 0.0;
+        let mut telemetry_pre_grad_l2_sq: f64 = 0.0;
+        let mut telemetry_pre_grad_linf: f64 = 0.0;
+        let mut telemetry_post_grad_l2_sq: f64 = 0.0;
+        let mut telemetry_post_grad_linf: f64 = 0.0;
+        let mut telemetry_param_l2_sq: f64 = 0.0;
+        let mut telemetry_nonfinite_skipped: u64 = 0;
+        let mut telemetry_grad_tensors: u64 = 0;
+        let raw_legacy_scale = if lr.abs() > 1.0e-12 {
+            Some(1.0 / lr)
+        } else {
+            None
+        };
+        let raw_align_sign_scale = raw_align_sign_scale_enabled();
+        let raw_align_scale_multiplier = raw_align_sign_scale_multiplier();
+        let raw_align_scale_cap = raw_align_sign_scale_max();
+        let raw_align_abs_clip = raw_align_abs_clip();
+        let raw_v2_enabled = self.raw_config.enabled && self.apply_mode == DistroApplyMode::Raw;
+        let raw_v2_match_pre_l2 =
+            raw_v2_enabled && self.raw_config.norm_mode == DistroRawNormMode::MatchPreL2;
+        let raw_v2_match_sign_equiv =
+            raw_v2_enabled && self.raw_config.norm_mode == DistroRawNormMode::MatchSignEquivalent;
+        let raw_v2_match_sign_equiv_nnz = raw_v2_enabled
+            && self.raw_config.norm_mode == DistroRawNormMode::MatchSignEquivalentNnz;
+        let raw_v2_match_target_l2 =
+            raw_v2_match_pre_l2 || raw_v2_match_sign_equiv || raw_v2_match_sign_equiv_nnz;
+        let mut telemetry_raw_align_scale_sum: f64 = 0.0;
+        let mut telemetry_raw_align_scale_min: f64 = f64::INFINITY;
+        let mut telemetry_raw_align_scale_max: f64 = 0.0;
+        let mut telemetry_raw_align_scale_count: u64 = 0;
+        let mut telemetry_raw_align_scale_clamped: u64 = 0;
+        let mut telemetry_raw_clip_tensors: u64 = 0;
+        let mut telemetry_raw_v2_missing_sidecar: u64 = 0;
+        let mut telemetry_raw_v2_invalid_sidecar: u64 = 0;
+        let mut telemetry_raw_v2_target_l2_sum: f64 = 0.0;
+        let mut telemetry_raw_v2_target_support_sum: f64 = 0.0;
+        let mut telemetry_raw_v2_obs_l2_sum: f64 = 0.0;
+        let mut telemetry_raw_v2_target_l2_count: u64 = 0;
+        let mut telemetry_raw_v2_target_to_obs_ratio_sum: f64 = 0.0;
+        let mut telemetry_raw_preclip_l2_sq: f64 = 0.0;
+        let mut telemetry_raw_preclip_linf: f64 = 0.0;
+        let mut telemetry_raw_preclip_tensors: u64 = 0;
+        let mut telemetry_modular_scale_sum: f64 = 0.0;
+        let mut telemetry_modular_scale_min: f64 = f64::INFINITY;
+        let mut telemetry_modular_scale_max: f64 = 0.0;
+        let mut telemetry_modular_scale_count: u64 = 0;
+        let diloco_lite_enabled = self.aggregate_mode == DistroAggregateMode::DilocoLite;
+        let mut telemetry_diloco_weight_mean_sum: f64 = 0.0;
+        let mut telemetry_diloco_weight_min: f64 = f64::INFINITY;
+        let mut telemetry_diloco_weight_max: f64 = 0.0;
+        let mut telemetry_diloco_weight_params: u64 = 0;
+        let mut telemetry_diloco_trust_scale_sum: f64 = 0.0;
+        let mut telemetry_diloco_trust_scale_min: f64 = f64::INFINITY;
+        let mut telemetry_diloco_trust_scale_max: f64 = 0.0;
+        let mut telemetry_diloco_trust_scale_count: u64 = 0;
+
         for (index, var) in vars.variables().enumerate() {
             let variable = var.logical_tensor();
             let device = variable.device();
@@ -807,18 +1303,112 @@ impl Distro {
                 .map(|x| x[index].sparse_idx.to_device(device))
                 .collect::<Vec<_>>();
 
+            let diloco_peer_weights = if diloco_lite_enabled {
+                let metas = diloco_peer_metadata(results, index);
+                let (weights, mean_w, min_w, max_w) =
+                    diloco_peer_weights(&metas, self.diloco_lite_config.tier_weight_cap);
+                if !weights.is_empty() {
+                    telemetry_diloco_weight_mean_sum += mean_w;
+                    telemetry_diloco_weight_min = telemetry_diloco_weight_min.min(min_w);
+                    telemetry_diloco_weight_max = telemetry_diloco_weight_max.max(max_w);
+                    telemetry_diloco_weight_params += 1;
+                }
+                Some(weights)
+            } else {
+                None
+            };
+
             let val_kind: Kind = variable.kind();
             let values = results
                 .iter()
-                .map(|x| {
+                .enumerate()
+                .map(|(peer_idx, x)| {
                     let sparse_val = x[index].sparse_val.to_device(device);
-                    if sparse_val.kind() == Kind::Bool {
+                    let mut value = if sparse_val.kind() == Kind::Bool {
                         Self::unpack_tensor_sign_from_boolean(sparse_val, val_kind)
                     } else {
                         sparse_val
+                    };
+                    if let Some(weights) = &diloco_peer_weights {
+                        let w = weights.get(peer_idx).copied().unwrap_or(1.0);
+                        if w.is_finite() && (w - 1.0).abs() > f64::EPSILON {
+                            value = value.multiply_scalar(w);
+                        }
                     }
+                    value
                 })
                 .collect::<Vec<_>>();
+
+            let mut raw_v2_target_l2: Option<f64> = None;
+            let mut raw_v2_target_numel: Option<f64> = None;
+            let mut raw_v2_target_support: Option<f64> = None;
+            let mut raw_v2_target_clip_basis: Option<f64> = None;
+            if raw_v2_enabled {
+                let mut valid_sidecars = 0u64;
+                let mut target_l2_sum = 0.0f64;
+                let mut numel_sum = 0.0f64;
+                let mut nnz_sum = 0.0f64;
+                for peer_results in results {
+                    match peer_results[index].norm_sidecar {
+                        Some(sc)
+                            if sc.full_pre_l2.is_finite()
+                                && sc.full_pre_l2 >= 0.0
+                                && sc.full_pre_abs_mean.is_finite()
+                                && sc.numel > 0 =>
+                        {
+                            valid_sidecars += 1;
+                            target_l2_sum += sc.full_pre_l2 as f64;
+                            numel_sum += sc.numel as f64;
+                            nnz_sum += sc.nnz.max(1) as f64;
+                        }
+                        Some(_) => {
+                            telemetry_raw_v2_invalid_sidecar += 1;
+                        }
+                        None => {
+                            telemetry_raw_v2_missing_sidecar += 1;
+                        }
+                    }
+                }
+
+                let numel_effective = if valid_sidecars > 0 {
+                    numel_sum / valid_sidecars as f64
+                } else {
+                    variable.numel() as f64
+                }
+                .max(1.0);
+                let nnz_effective = if valid_sidecars > 0 {
+                    nnz_sum / valid_sidecars as f64
+                } else {
+                    numel_effective
+                }
+                .max(1.0);
+                raw_v2_target_numel = Some(numel_effective);
+                raw_v2_target_clip_basis = Some(numel_effective);
+
+                if raw_v2_match_pre_l2 {
+                    if valid_sidecars > 0 {
+                        raw_v2_target_l2 = Some(target_l2_sum / valid_sidecars as f64);
+                    } else if self.raw_config.missing_sidecar_policy
+                        == DistroRawMissingSidecarPolicy::Fail
+                    {
+                        panic!(
+                            "DisTrO raw-v2(match-pre-l2) requires valid norm sidecars, but none were available for parameter {} at step {}",
+                            var.name(),
+                            step
+                        );
+                    }
+                } else if raw_v2_match_sign_equiv {
+                    raw_v2_target_support = Some(numel_effective);
+                    raw_v2_target_clip_basis = Some(numel_effective);
+                    raw_v2_target_l2 =
+                        Some(self.raw_config.sign_equiv_mult.max(0.0) * numel_effective.sqrt());
+                } else if raw_v2_match_sign_equiv_nnz {
+                    raw_v2_target_support = Some(nnz_effective);
+                    raw_v2_target_clip_basis = Some(nnz_effective);
+                    raw_v2_target_l2 =
+                        Some(self.raw_config.sign_equiv_mult.max(0.0) * nnz_effective.sqrt());
+                }
+            }
 
             let same_shape = results.iter().all(|x| {
                 x[index].xshape == results[0][index].xshape
@@ -826,48 +1416,255 @@ impl Distro {
             });
 
             if same_shape {
-                // Decode grad from all nodes (fast path)
-                let decompressed = CompressDCT::batch_decompress(
-                    &indicies,
-                    &values,
-                    &results[0][index].xshape,
-                    results[0][index].totalk,
-                    val_kind,
-                    device,
-                );
+                let prefix_dim = matformer_prefix_dim(var.name());
+                let want_stats_for_param =
+                    want_cosine_stats && prefix_dim.is_some() && results.len() > 1;
+                let apply_mixer_for_param =
+                    use_cosine_mixer && prefix_dim.is_some() && results.len() > 1;
 
-                let decoded = self.transform.decode(&decompressed);
-                let aligned = match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
-                    Ok(tensor) => tensor,
-                    Err(err) => {
+                if apply_mixer_for_param {
+                    // Same-shape MatFormer: decode per-peer so we can do a cosine-weighted mix.
+                    // This is a soft guardrail to downweight negatively-aligned updates.
+                    let prefix_dim = prefix_dim.expect("checked above") as i64;
+                    let mut grads: Vec<Tensor> = Vec::new();
+                    let mut grad_norms_sq: Vec<f64> = Vec::new();
+
+                    for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+                        let res = &peer_results[index];
+                        let sparse_idx = res.sparse_idx.to_device(device);
+                        let decompressed = CompressDCT::decompress(
+                            &sparse_idx,
+                            sparse_val,
+                            &res.xshape,
+                            res.totalk,
+                            val_kind,
+                            device,
+                        );
+                        let decoded = self.transform.decode(&decompressed);
+                        let decoded_shape = decoded.size();
+                        let mut aligned = match align_matformer_prefix_grad(
+                            var.name(),
+                            &full_shape,
+                            decoded,
+                        ) {
+                            Ok(tensor) => tensor,
+                            Err(err) => {
+                                warn!(
+                                    parameter = var.name(),
+                                    full_shape = ?full_shape,
+                                    "Skipping incompatible grad shape in DisTrO apply (cosine mixer): {err:?}"
+                                );
+                                continue;
+                            }
+                        };
+                        scale_matformer_prefix_grad_for_geometry(
+                            &mut aligned,
+                            var.name(),
+                            &full_shape,
+                            &decoded_shape,
+                            &mut telemetry_modular_scale_sum,
+                            &mut telemetry_modular_scale_min,
+                            &mut telemetry_modular_scale_max,
+                            &mut telemetry_modular_scale_count,
+                        );
+                        let n_sq = aligned
+                            .to_kind(Kind::Float)
+                            .pow_tensor_scalar(2)
+                            .sum(Kind::Float)
+                            .double_value(&[]);
+                        grads.push(aligned);
+                        grad_norms_sq.push(n_sq);
+                    }
+
+                    if grads.is_empty() {
                         warn!(
                             parameter = var.name(),
-                            full_shape = ?full_shape,
-                            "Skipping incompatible grad shape in DisTrO apply: {err:?}"
+                            "Skipping DisTrO apply: no compatible grads found (cosine mixer enabled)"
                         );
                         continue;
                     }
-                };
+                    if grads.len() == 1 {
+                        var.set_grad(grads.pop().expect("len==1"));
+                    } else {
+                        // Reference: largest-norm gradient. In MatFormer, this is typically the
+                        // full-width tier, but we don't assume peer ordering.
+                        let ref_idx = grad_norms_sq
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let ref_grad = grads[ref_idx].shallow_clone();
 
-                // Set the gradients!!!
-                var.set_grad(aligned);
-            } else {
-                // Heterogeneous shapes: decode individually, then align to local shape.
-                let mut combined: Option<Tensor> = None;
-                let mut contributing_peers: usize = 0;
-                for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
-                    let res = &peer_results[index];
-                    let sparse_idx = res.sparse_idx.to_device(device);
-                    let decompressed = CompressDCT::decompress(
-                        &sparse_idx,
-                        sparse_val,
-                        &res.xshape,
-                        res.totalk,
+                        let mut combined = Tensor::zeros(&full_shape, (Kind::Float, device));
+                        let mut weight_sum = Tensor::zeros([], (Kind::Float, device));
+
+                        let len = full_shape[prefix_dim as usize].clamp(1, i64::MAX);
+                        for (i, g) in grads.iter().enumerate() {
+                            let a = g
+                                .narrow(prefix_dim, 0, len)
+                                .to_kind(Kind::Float)
+                                .contiguous()
+                                .view([-1]);
+                            let b = ref_grad
+                                .narrow(prefix_dim, 0, len)
+                                .to_kind(Kind::Float)
+                                .contiguous()
+                                .view([-1]);
+
+                            let dot = (&a * &b).sum(Kind::Float);
+                            let norm_a = a.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                            let norm_b = b.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                            let cos = dot / (norm_a * norm_b + 1.0e-12);
+
+                            let w = cos.clamp_min(0.0);
+                            combined += g.to_kind(Kind::Float) * &w;
+                            weight_sum += &w;
+
+                            if i != ref_idx {
+                                let cos_v = cos.double_value(&[]);
+                                mixer_cos_sum += cos_v;
+                                mixer_cos_count += 1;
+                                mixer_cos_min = mixer_cos_min.min(cos_v);
+                                mixer_cos_max = mixer_cos_max.max(cos_v);
+                                if cos_v <= 0.0 {
+                                    mixer_cos_dropped += 1;
+                                }
+                            }
+                        }
+
+                        let weight_sum = weight_sum.clamp_min(1.0e-6);
+                        let normalized = (combined / weight_sum).to_kind(val_kind);
+                        if want_sign_flip_stats {
+                            if let Some((flips, total)) = sign_flip_stats_sampled(
+                                &normalized,
+                                &ref_grad,
+                                prefix_dim,
+                                len,
+                                sign_flip_sample,
+                            ) {
+                                let frac = flips / total.max(1.0);
+                                telemetry_sign_flip_flips += flips;
+                                telemetry_sign_flip_total += total;
+                                telemetry_sign_flip_params += 1;
+                                telemetry_sign_flip_min = telemetry_sign_flip_min.min(frac);
+                                telemetry_sign_flip_max = telemetry_sign_flip_max.max(frac);
+                            }
+                        }
+                        var.set_grad(normalized);
+                    }
+                } else {
+                    let mut sign_flip_ref_grad: Option<Tensor> = None;
+                    let mut sign_flip_prefix_dim: i64 = 0;
+                    let mut sign_flip_shared_len: i64 = 0;
+
+                    if want_stats_for_param {
+                        // Shadow-mode: compute cosine stats exactly as the mixer would, but do
+                        // not change the aggregation behavior.
+                        let prefix_dim = prefix_dim.expect("checked above") as i64;
+                        let mut grads: Vec<Tensor> = Vec::new();
+                        let mut grad_norms_sq: Vec<f64> = Vec::new();
+
+                        for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+                            let res = &peer_results[index];
+                            let sparse_idx = res.sparse_idx.to_device(device);
+                            let decompressed = CompressDCT::decompress(
+                                &sparse_idx,
+                                sparse_val,
+                                &res.xshape,
+                                res.totalk,
+                                val_kind,
+                                device,
+                            );
+                            let decoded = self.transform.decode(&decompressed);
+                            let decoded_shape = decoded.size();
+                            let mut aligned =
+                                match align_matformer_prefix_grad(var.name(), &full_shape, decoded)
+                                {
+                                    Ok(tensor) => tensor,
+                                    Err(_err) => {
+                                        // Keep behavior unchanged; just skip stats for this param.
+                                        continue;
+                                    }
+                                };
+                            scale_matformer_prefix_grad_for_geometry(
+                                &mut aligned,
+                                var.name(),
+                                &full_shape,
+                                &decoded_shape,
+                                &mut telemetry_modular_scale_sum,
+                                &mut telemetry_modular_scale_min,
+                                &mut telemetry_modular_scale_max,
+                                &mut telemetry_modular_scale_count,
+                            );
+                            let n_sq = aligned
+                                .to_kind(Kind::Float)
+                                .pow_tensor_scalar(2)
+                                .sum(Kind::Float)
+                                .double_value(&[]);
+                            grads.push(aligned);
+                            grad_norms_sq.push(n_sq);
+                        }
+
+                        if grads.len() > 1 {
+                            let ref_idx = grad_norms_sq
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let ref_grad = grads[ref_idx].shallow_clone();
+                            let len = full_shape[prefix_dim as usize].clamp(1, i64::MAX);
+                            if want_sign_flip_stats {
+                                sign_flip_ref_grad = Some(ref_grad.shallow_clone());
+                                sign_flip_prefix_dim = prefix_dim;
+                                sign_flip_shared_len = len;
+                            }
+                            for (i, g) in grads.iter().enumerate() {
+                                if i == ref_idx {
+                                    continue;
+                                }
+                                let a = g
+                                    .narrow(prefix_dim, 0, len)
+                                    .to_kind(Kind::Float)
+                                    .contiguous()
+                                    .view([-1]);
+                                let b = ref_grad
+                                    .narrow(prefix_dim, 0, len)
+                                    .to_kind(Kind::Float)
+                                    .contiguous()
+                                    .view([-1]);
+
+                                let dot = (&a * &b).sum(Kind::Float);
+                                let norm_a = a.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                                let norm_b = b.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                                let cos = dot / (norm_a * norm_b + 1.0e-12);
+
+                                let cos_v = cos.double_value(&[]);
+                                mixer_cos_sum += cos_v;
+                                mixer_cos_count += 1;
+                                mixer_cos_min = mixer_cos_min.min(cos_v);
+                                mixer_cos_max = mixer_cos_max.max(cos_v);
+                                if cos_v <= 0.0 {
+                                    mixer_cos_dropped += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // Decode grad from all nodes (fast path)
+                    let decompressed = CompressDCT::batch_decompress(
+                        &indicies,
+                        &values,
+                        &results[0][index].xshape,
+                        results[0][index].totalk,
                         val_kind,
                         device,
                     );
+
                     let decoded = self.transform.decode(&decompressed);
-                    let aligned =
+                    let decoded_shape = decoded.size();
+                    let mut aligned =
                         match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
                             Ok(tensor) => tensor,
                             Err(err) => {
@@ -879,32 +1676,809 @@ impl Distro {
                                 continue;
                             }
                         };
-                    combined = Some(match combined {
-                        Some(acc) => acc + aligned,
-                        None => aligned,
-                    });
-                    contributing_peers += 1;
-                }
-
-                if let Some(combined) = combined {
-                    // Normalize by contributing peer count (consistent with "mean" in batch_decompress)
-                    let normalized = if contributing_peers > 1 {
-                        combined / (contributing_peers as f64)
-                    } else {
-                        combined
-                    };
-                    var.set_grad(normalized);
-                } else {
-                    warn!(
-                        parameter = var.name(),
-                        "Skipping DisTrO apply: no compatible grads found"
+                    scale_matformer_prefix_grad_for_geometry(
+                        &mut aligned,
+                        var.name(),
+                        &full_shape,
+                        &decoded_shape,
+                        &mut telemetry_modular_scale_sum,
+                        &mut telemetry_modular_scale_min,
+                        &mut telemetry_modular_scale_max,
+                        &mut telemetry_modular_scale_count,
                     );
-                    continue;
+                    if want_sign_flip_stats {
+                        if let Some(ref_grad) = sign_flip_ref_grad.take() {
+                            if let Some((flips, total)) = sign_flip_stats_sampled(
+                                &aligned,
+                                &ref_grad,
+                                sign_flip_prefix_dim,
+                                sign_flip_shared_len,
+                                sign_flip_sample,
+                            ) {
+                                let frac = flips / total.max(1.0);
+                                telemetry_sign_flip_flips += flips;
+                                telemetry_sign_flip_total += total;
+                                telemetry_sign_flip_params += 1;
+                                telemetry_sign_flip_min = telemetry_sign_flip_min.min(frac);
+                                telemetry_sign_flip_max = telemetry_sign_flip_max.max(frac);
+                            }
+                        }
+                    }
+
+                    // Set the gradients!!!
+                    var.set_grad(aligned);
+                }
+            } else {
+                // Heterogeneous shapes: decode individually, then align to local shape.
+                let prefix_dim = matformer_prefix_dim(var.name());
+                let want_stats_for_param =
+                    want_cosine_stats && prefix_dim.is_some() && results.len() > 1;
+                let apply_mixer_for_param =
+                    use_cosine_mixer && prefix_dim.is_some() && results.len() > 1;
+
+                if want_stats_for_param {
+                    let prefix_dim = prefix_dim.expect("checked above") as i64;
+                    let mut grads: Vec<(Tensor, i64)> = Vec::new();
+                    for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+                        let res = &peer_results[index];
+                        let sparse_idx = res.sparse_idx.to_device(device);
+                        let decompressed = CompressDCT::decompress(
+                            &sparse_idx,
+                            sparse_val,
+                            &res.xshape,
+                            res.totalk,
+                            val_kind,
+                            device,
+                        );
+                        let decoded = self.transform.decode(&decompressed);
+                        let decoded_shape = decoded.size();
+                        let active_len =
+                            decoded_shape.get(prefix_dim as usize).copied().unwrap_or(0);
+                        let mut aligned = match align_matformer_prefix_grad(
+                            var.name(),
+                            &full_shape,
+                            decoded,
+                        ) {
+                            Ok(tensor) => tensor,
+                            Err(err) => {
+                                warn!(
+                                    parameter = var.name(),
+                                    full_shape = ?full_shape,
+                                    "Skipping incompatible grad shape in DisTrO apply (cosine stats): {err:?}"
+                                );
+                                continue;
+                            }
+                        };
+                        scale_matformer_prefix_grad_for_geometry(
+                            &mut aligned,
+                            var.name(),
+                            &full_shape,
+                            &decoded_shape,
+                            &mut telemetry_modular_scale_sum,
+                            &mut telemetry_modular_scale_min,
+                            &mut telemetry_modular_scale_max,
+                            &mut telemetry_modular_scale_count,
+                        );
+                        grads.push((aligned, active_len));
+                    }
+
+                    if grads.is_empty() {
+                        warn!(
+                            parameter = var.name(),
+                            "Skipping DisTrO apply: no compatible grads found (cosine stats enabled)"
+                        );
+                        continue;
+                    }
+                    if grads.len() == 1 {
+                        var.set_grad(grads.pop().expect("len==1").0);
+                    } else {
+                        // Reference: the widest variant for this parameter (largest active_len).
+                        let ref_idx = grads
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_i, (_g, active_len))| *active_len)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let ref_grad = grads[ref_idx].0.shallow_clone();
+                        let shared_len = grads
+                            .iter()
+                            .map(|(_g, active_len)| *active_len)
+                            .min()
+                            .unwrap_or(0)
+                            .clamp(1, full_shape[prefix_dim as usize]);
+
+                        let mut combined = Tensor::zeros(&full_shape, (Kind::Float, device));
+                        let mut weight_sum = Tensor::zeros([], (Kind::Float, device));
+
+                        for (i, (g, active_len)) in grads.iter().enumerate() {
+                            let len = (*active_len).clamp(1, full_shape[prefix_dim as usize]);
+                            let a = g
+                                .narrow(prefix_dim, 0, len)
+                                .to_kind(Kind::Float)
+                                .contiguous()
+                                .view([-1]);
+                            let b = ref_grad
+                                .narrow(prefix_dim, 0, len)
+                                .to_kind(Kind::Float)
+                                .contiguous()
+                                .view([-1]);
+
+                            let dot = (&a * &b).sum(Kind::Float);
+                            let norm_a = a.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                            let norm_b = b.pow_tensor_scalar(2).sum(Kind::Float).sqrt();
+                            let cos = dot / (norm_a * norm_b + 1.0e-12);
+
+                            if apply_mixer_for_param {
+                                // Soft guardrail: drop negatively-aligned updates.
+                                let w = cos.clamp_min(0.0);
+                                combined += g.to_kind(Kind::Float) * &w;
+                                weight_sum += &w;
+                            } else {
+                                combined += g.to_kind(Kind::Float);
+                            }
+
+                            if i != ref_idx {
+                                let cos_v = cos.double_value(&[]);
+                                mixer_cos_sum += cos_v;
+                                mixer_cos_count += 1;
+                                mixer_cos_min = mixer_cos_min.min(cos_v);
+                                mixer_cos_max = mixer_cos_max.max(cos_v);
+                                if cos_v <= 0.0 {
+                                    mixer_cos_dropped += 1;
+                                }
+                            }
+                        }
+
+                        let denom = if apply_mixer_for_param {
+                            weight_sum.clamp_min(1.0e-6)
+                        } else {
+                            Tensor::from(grads.len() as f64).to_device(device)
+                        };
+                        let normalized = (combined / denom).to_kind(val_kind);
+                        if want_sign_flip_stats {
+                            if let Some((flips, total)) = sign_flip_stats_sampled(
+                                &normalized,
+                                &ref_grad,
+                                prefix_dim,
+                                shared_len,
+                                sign_flip_sample,
+                            ) {
+                                let frac = flips / total.max(1.0);
+                                telemetry_sign_flip_flips += flips;
+                                telemetry_sign_flip_total += total;
+                                telemetry_sign_flip_params += 1;
+                                telemetry_sign_flip_min = telemetry_sign_flip_min.min(frac);
+                                telemetry_sign_flip_max = telemetry_sign_flip_max.max(frac);
+                            }
+                        }
+                        var.set_grad(normalized);
+                    }
+                } else {
+                    let mut combined: Option<Tensor> = None;
+                    let mut contributing_peers: usize = 0;
+                    for (peer_results, sparse_val) in results.iter().zip(values.iter()) {
+                        let res = &peer_results[index];
+                        let sparse_idx = res.sparse_idx.to_device(device);
+                        let decompressed = CompressDCT::decompress(
+                            &sparse_idx,
+                            sparse_val,
+                            &res.xshape,
+                            res.totalk,
+                            val_kind,
+                            device,
+                        );
+                        let decoded = self.transform.decode(&decompressed);
+                        let decoded_shape = decoded.size();
+                        let mut aligned =
+                            match align_matformer_prefix_grad(var.name(), &full_shape, decoded) {
+                                Ok(tensor) => tensor,
+                                Err(err) => {
+                                    warn!(
+                                        parameter = var.name(),
+                                        full_shape = ?full_shape,
+                                        "Skipping incompatible grad shape in DisTrO apply: {err:?}"
+                                    );
+                                    continue;
+                                }
+                            };
+                        scale_matformer_prefix_grad_for_geometry(
+                            &mut aligned,
+                            var.name(),
+                            &full_shape,
+                            &decoded_shape,
+                            &mut telemetry_modular_scale_sum,
+                            &mut telemetry_modular_scale_min,
+                            &mut telemetry_modular_scale_max,
+                            &mut telemetry_modular_scale_count,
+                        );
+                        combined = Some(match combined {
+                            Some(acc) => acc + aligned,
+                            None => aligned,
+                        });
+                        contributing_peers += 1;
+                    }
+
+                    if let Some(combined) = combined {
+                        // Normalize by contributing peer count (consistent with "mean" in batch_decompress)
+                        let normalized = if contributing_peers > 1 {
+                            combined / (contributing_peers as f64)
+                        } else {
+                            combined
+                        };
+                        var.set_grad(normalized);
+                    } else {
+                        warn!(
+                            parameter = var.name(),
+                            "Skipping DisTrO apply: no compatible grads found"
+                        );
+                        continue;
+                    }
                 }
             }
 
-            // Sign-SGD
-            let _t = variable.grad().sign_();
+            let mut grad = variable.grad();
+            if !grad.defined() {
+                continue;
+            }
+
+            if diloco_lite_enabled {
+                let state = self.state.get_mut(index).expect("state len matches vars");
+                let mut outer_momentum = state.outer_momentum.logical_tensor();
+                let beta = self.diloco_lite_config.outer_momentum.clamp(0.0, 0.999_999);
+                let one_minus_beta = 1.0 - beta;
+                let grad_f32 = grad.to_kind(Kind::Float);
+                let _ = outer_momentum.g_mul_scalar_(beta);
+                let _ = outer_momentum.g_add_(&grad_f32.multiply_scalar(one_minus_beta));
+
+                let mut aggregate = outer_momentum.shallow_clone();
+                let param_l2 = variable
+                    .to_kind(Kind::Float)
+                    .pow_tensor_scalar(2)
+                    .sum(Kind::Float)
+                    .sqrt()
+                    .double_value(&[]);
+                let agg_l2 = aggregate
+                    .pow_tensor_scalar(2)
+                    .sum(Kind::Float)
+                    .sqrt()
+                    .double_value(&[]);
+                let mut trust_scale = 1.0f64;
+                let target_ratio = self.diloco_lite_config.trust_region_target.max(0.0);
+                if target_ratio > 0.0 && param_l2 > 0.0 && agg_l2 > 0.0 {
+                    let target_l2 = param_l2 * target_ratio;
+                    trust_scale = target_l2 / agg_l2;
+                    let max_scale = self.diloco_lite_config.trust_region_max_scale.max(1.0);
+                    trust_scale = trust_scale.clamp(1.0 / max_scale, max_scale);
+                }
+
+                let outer_lr_multiplier = self.diloco_lite_config.outer_lr_multiplier;
+                let final_scale = trust_scale * outer_lr_multiplier;
+                if final_scale.is_finite() && (final_scale - 1.0).abs() > f64::EPSILON {
+                    aggregate = aggregate.multiply_scalar(final_scale);
+                }
+
+                if final_scale.is_finite() {
+                    telemetry_diloco_trust_scale_sum += final_scale;
+                    telemetry_diloco_trust_scale_min =
+                        telemetry_diloco_trust_scale_min.min(final_scale);
+                    telemetry_diloco_trust_scale_max =
+                        telemetry_diloco_trust_scale_max.max(final_scale);
+                    telemetry_diloco_trust_scale_count += 1;
+                }
+
+                grad.copy_(&aggregate.to_kind(grad.kind()));
+            }
+
+            let pre_grad = grad.to_kind(Kind::Float);
+            let pre_finite = pre_grad.isfinite().all().int64_value(&[]) != 0;
+            if !pre_finite {
+                telemetry_nonfinite_skipped += 1;
+                warn!(
+                    step = step,
+                    parameter = var.name(),
+                    apply_mode = ?self.apply_mode,
+                    "Skipping non-finite DisTrO grad before apply-mode transform"
+                );
+                let _ = grad.zero_();
+                continue;
+            }
+            let pre_grad_l2_sq_this = pre_grad
+                .pow_tensor_scalar(2)
+                .sum(Kind::Float)
+                .double_value(&[]);
+            let pre_grad_l2_this = pre_grad_l2_sq_this.sqrt();
+            telemetry_pre_grad_l2_sq += pre_grad_l2_sq_this;
+            telemetry_pre_grad_linf =
+                telemetry_pre_grad_linf.max(pre_grad.abs().max().double_value(&[]));
+
+            match self.apply_mode {
+                DistroApplyMode::Sign => {
+                    let _ = grad.sign_();
+                }
+                DistroApplyMode::Raw => {
+                    if raw_v2_match_target_l2 {
+                        let target_l2 = raw_v2_target_l2.unwrap_or(0.0);
+                        let target_numel = raw_v2_target_clip_basis
+                            .or(raw_v2_target_numel)
+                            .unwrap_or_else(|| pre_grad.numel() as f64)
+                            .max(1.0);
+                        if target_l2 <= 0.0 || !target_l2.is_finite() {
+                            telemetry_nonfinite_skipped += 1;
+                            if self.raw_config.missing_sidecar_policy
+                                == DistroRawMissingSidecarPolicy::Fail
+                            {
+                                panic!(
+                                    "DisTrO raw-v2 got invalid target_l2 for parameter {} at step {}: {}",
+                                    var.name(),
+                                    step,
+                                    target_l2
+                                );
+                            }
+                            warn!(
+                                step = step,
+                                parameter = var.name(),
+                                target_l2 = target_l2,
+                                "Skipping raw-v2 norm matching for invalid sidecar target"
+                            );
+                        } else if pre_grad_l2_this > 1.0e-20 {
+                            let mut align_scale = (target_l2 / pre_grad_l2_this)
+                                * self.raw_config.scale_multiplier.max(0.0);
+                            if align_scale > self.raw_config.scale_max {
+                                align_scale = self.raw_config.scale_max;
+                                telemetry_raw_align_scale_clamped += 1;
+                            }
+                            if align_scale.is_finite() && align_scale > 0.0 {
+                                let _ = grad.g_mul_scalar_(align_scale);
+                                let raw_preclip = grad.to_kind(Kind::Float);
+                                let raw_preclip_l2_sq_this = raw_preclip
+                                    .pow_tensor_scalar(2)
+                                    .sum(Kind::Float)
+                                    .double_value(&[]);
+                                telemetry_raw_preclip_l2_sq += raw_preclip_l2_sq_this;
+                                telemetry_raw_preclip_linf = telemetry_raw_preclip_linf
+                                    .max(raw_preclip.abs().max().double_value(&[]));
+                                telemetry_raw_preclip_tensors += 1;
+                                let clip_abs = self.raw_config.abs_clip_mult.max(0.0) * target_l2
+                                    / target_numel.sqrt();
+                                if clip_abs.is_finite() && clip_abs > 0.0 {
+                                    let max_abs_before_clip =
+                                        grad.to_kind(Kind::Float).abs().max().double_value(&[]);
+                                    if max_abs_before_clip > clip_abs {
+                                        telemetry_raw_clip_tensors += 1;
+                                        let clipped = grad.clamp(-clip_abs, clip_abs);
+                                        grad.copy_(&clipped);
+                                    }
+                                }
+                                telemetry_raw_align_scale_sum += align_scale;
+                                telemetry_raw_align_scale_min =
+                                    telemetry_raw_align_scale_min.min(align_scale);
+                                telemetry_raw_align_scale_max =
+                                    telemetry_raw_align_scale_max.max(align_scale);
+                                telemetry_raw_align_scale_count += 1;
+                                telemetry_raw_v2_target_l2_sum += target_l2;
+                                telemetry_raw_v2_target_support_sum += raw_v2_target_support
+                                    .or(raw_v2_target_numel)
+                                    .unwrap_or(variable.numel() as f64);
+                                telemetry_raw_v2_obs_l2_sum += pre_grad_l2_this;
+                                telemetry_raw_v2_target_to_obs_ratio_sum +=
+                                    target_l2 / pre_grad_l2_this;
+                                telemetry_raw_v2_target_l2_count += 1;
+                            } else {
+                                telemetry_nonfinite_skipped += 1;
+                                if self.raw_config.missing_sidecar_policy
+                                    == DistroRawMissingSidecarPolicy::Fail
+                                {
+                                    panic!(
+                                        "DisTrO raw-v2 got non-finite align scale for parameter {} at step {}: {}",
+                                        var.name(),
+                                        step,
+                                        align_scale
+                                    );
+                                }
+                                warn!(
+                                    step = step,
+                                    parameter = var.name(),
+                                    align_scale = align_scale,
+                                    "Skipping raw-v2 DisTrO apply for non-finite align scale"
+                                );
+                                let _ = grad.zero_();
+                                continue;
+                            }
+                        } else {
+                            telemetry_nonfinite_skipped += 1;
+                            if self.raw_config.missing_sidecar_policy
+                                == DistroRawMissingSidecarPolicy::Fail
+                            {
+                                panic!(
+                                    "DisTrO raw-v2 got tiny gradient norm for parameter {} at step {}: {}",
+                                    var.name(),
+                                    step,
+                                    pre_grad_l2_this
+                                );
+                            }
+                            warn!(
+                                step = step,
+                                parameter = var.name(),
+                                pre_grad_l2 = pre_grad_l2_this,
+                                "Skipping raw-v2 DisTrO apply for tiny gradient norm"
+                            );
+                            let _ = grad.zero_();
+                            continue;
+                        }
+                    } else if raw_align_sign_scale {
+                        let numel = pre_grad.numel() as f64;
+                        if pre_grad_l2_this > 1.0e-20 && numel > 0.0 {
+                            // Match the sign-mode norm scale per tensor:
+                            // sign(g) has ||.||2 ~= sqrt(numel), so normalize raw grads to that.
+                            // This keeps LR schedules comparable across sign/raw modes.
+                            let target_l2 = numel.sqrt();
+                            let mut align_scale =
+                                (target_l2 / pre_grad_l2_this) * raw_align_scale_multiplier;
+                            if align_scale > raw_align_scale_cap {
+                                align_scale = raw_align_scale_cap;
+                                telemetry_raw_align_scale_clamped += 1;
+                            }
+                            if align_scale.is_finite() && align_scale > 0.0 {
+                                let _ = grad.g_mul_scalar_(align_scale);
+                                let raw_preclip = grad.to_kind(Kind::Float);
+                                let raw_preclip_l2_sq_this = raw_preclip
+                                    .pow_tensor_scalar(2)
+                                    .sum(Kind::Float)
+                                    .double_value(&[]);
+                                telemetry_raw_preclip_l2_sq += raw_preclip_l2_sq_this;
+                                telemetry_raw_preclip_linf = telemetry_raw_preclip_linf
+                                    .max(raw_preclip.abs().max().double_value(&[]));
+                                telemetry_raw_preclip_tensors += 1;
+                                if raw_align_abs_clip > 0.0 {
+                                    let max_abs_before_clip =
+                                        grad.to_kind(Kind::Float).abs().max().double_value(&[]);
+                                    if max_abs_before_clip > raw_align_abs_clip {
+                                        telemetry_raw_clip_tensors += 1;
+                                        let clipped =
+                                            grad.clamp(-raw_align_abs_clip, raw_align_abs_clip);
+                                        grad.copy_(&clipped);
+                                    }
+                                }
+                                telemetry_raw_align_scale_sum += align_scale;
+                                telemetry_raw_align_scale_min =
+                                    telemetry_raw_align_scale_min.min(align_scale);
+                                telemetry_raw_align_scale_max =
+                                    telemetry_raw_align_scale_max.max(align_scale);
+                                telemetry_raw_align_scale_count += 1;
+                            } else {
+                                telemetry_nonfinite_skipped += 1;
+                                warn!(
+                                    step = step,
+                                    parameter = var.name(),
+                                    align_scale = align_scale,
+                                    "Skipping raw DisTrO apply for non-finite align scale"
+                                );
+                                let _ = grad.zero_();
+                                continue;
+                            }
+                        } else {
+                            telemetry_nonfinite_skipped += 1;
+                            warn!(
+                                step = step,
+                                parameter = var.name(),
+                                pre_grad_l2 = pre_grad_l2_this,
+                                numel = numel,
+                                "Skipping raw DisTrO apply for tiny gradient norm"
+                            );
+                            let _ = grad.zero_();
+                            continue;
+                        }
+                    } else {
+                        if let Some(scale) = raw_legacy_scale {
+                            // Legacy raw behavior: decode lr-scaled residuals back to grad-space.
+                            let _ = grad.g_mul_scalar_(scale);
+                            let raw_preclip = grad.to_kind(Kind::Float);
+                            let raw_preclip_l2_sq_this = raw_preclip
+                                .pow_tensor_scalar(2)
+                                .sum(Kind::Float)
+                                .double_value(&[]);
+                            telemetry_raw_preclip_l2_sq += raw_preclip_l2_sq_this;
+                            telemetry_raw_preclip_linf = telemetry_raw_preclip_linf
+                                .max(raw_preclip.abs().max().double_value(&[]));
+                            telemetry_raw_preclip_tensors += 1;
+                        } else {
+                            telemetry_nonfinite_skipped += 1;
+                            warn!(
+                                step = step,
+                                lr = lr,
+                                parameter = var.name(),
+                                "Skipping raw DisTrO apply for near-zero lr"
+                            );
+                            let _ = grad.zero_();
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let post_grad = grad.to_kind(Kind::Float);
+            let post_finite = post_grad.isfinite().all().int64_value(&[]) != 0;
+            if !post_finite {
+                telemetry_nonfinite_skipped += 1;
+                warn!(
+                    step = step,
+                    parameter = var.name(),
+                    apply_mode = ?self.apply_mode,
+                    "Skipping non-finite DisTrO grad after apply-mode transform"
+                );
+                let _ = grad.zero_();
+                continue;
+            }
+            telemetry_post_grad_l2_sq += post_grad
+                .pow_tensor_scalar(2)
+                .sum(Kind::Float)
+                .double_value(&[]);
+            telemetry_post_grad_linf =
+                telemetry_post_grad_linf.max(post_grad.abs().max().double_value(&[]));
+            telemetry_param_l2_sq += variable
+                .to_kind(Kind::Float)
+                .pow_tensor_scalar(2)
+                .sum(Kind::Float)
+                .double_value(&[]);
+            telemetry_grad_tensors += 1;
+        }
+
+        if want_cosine_stats && mixer_cos_count > 0 {
+            let mean_cos = mixer_cos_sum / (mixer_cos_count as f64);
+            let dropped_frac = mixer_cos_dropped as f64 / (mixer_cos_count as f64);
+            info!(
+                step = step,
+                enabled = use_cosine_mixer,
+                shadow = shadow_cosine_mixer,
+                mean_cos = mean_cos,
+                min_cos = mixer_cos_min,
+                max_cos = mixer_cos_max,
+                would_drop = mixer_cos_dropped,
+                would_drop_frac = dropped_frac,
+                count = mixer_cos_count,
+                "DisTrO cosine mixer stats (MatFormer prefix params)"
+            );
+        }
+        if telemetry_grad_tensors > 0 {
+            let should_log = {
+                let prev = LAST_APPLY_INFO_STEP.load(AtomicOrdering::Relaxed);
+                prev != step
+                    && LAST_APPLY_INFO_STEP
+                        .compare_exchange(
+                            prev,
+                            step,
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                        )
+                        .is_ok()
+            };
+            if should_log {
+                let pre_grad_l2 = telemetry_pre_grad_l2_sq.sqrt();
+                let post_grad_l2 = telemetry_post_grad_l2_sq.sqrt();
+                let param_l2 = telemetry_param_l2_sq.sqrt();
+                let effective_update_l2 = post_grad_l2 * lr.abs();
+                let update_to_param_ratio = if param_l2 > 0.0 {
+                    effective_update_l2 / param_l2
+                } else {
+                    0.0
+                };
+                let raw_align_scale_mean = if telemetry_raw_align_scale_count > 0 {
+                    telemetry_raw_align_scale_sum / telemetry_raw_align_scale_count as f64
+                } else {
+                    0.0
+                };
+                let raw_align_scale_min = if telemetry_raw_align_scale_count > 0 {
+                    telemetry_raw_align_scale_min
+                } else {
+                    0.0
+                };
+                let raw_align_scale_observed_max = if telemetry_raw_align_scale_count > 0 {
+                    telemetry_raw_align_scale_max
+                } else {
+                    0.0
+                };
+                let raw_v2_target_l2_mean = if telemetry_raw_v2_target_l2_count > 0 {
+                    telemetry_raw_v2_target_l2_sum / telemetry_raw_v2_target_l2_count as f64
+                } else {
+                    0.0
+                };
+                let raw_v2_obs_l2_mean = if telemetry_raw_v2_target_l2_count > 0 {
+                    telemetry_raw_v2_obs_l2_sum / telemetry_raw_v2_target_l2_count as f64
+                } else {
+                    0.0
+                };
+                let raw_v2_target_to_obs_ratio_mean = if telemetry_raw_v2_target_l2_count > 0 {
+                    telemetry_raw_v2_target_to_obs_ratio_sum
+                        / telemetry_raw_v2_target_l2_count as f64
+                } else {
+                    0.0
+                };
+                let raw_v2_target_support_mean = if telemetry_raw_v2_target_l2_count > 0 {
+                    telemetry_raw_v2_target_support_sum / telemetry_raw_v2_target_l2_count as f64
+                } else {
+                    0.0
+                };
+                let modular_scale_mean = if telemetry_modular_scale_count > 0 {
+                    telemetry_modular_scale_sum / telemetry_modular_scale_count as f64
+                } else {
+                    0.0
+                };
+                let modular_scale_min = if telemetry_modular_scale_count > 0 {
+                    telemetry_modular_scale_min
+                } else {
+                    0.0
+                };
+                let modular_scale_max = if telemetry_modular_scale_count > 0 {
+                    telemetry_modular_scale_max
+                } else {
+                    0.0
+                };
+                let diloco_weight_mean = if telemetry_diloco_weight_params > 0 {
+                    telemetry_diloco_weight_mean_sum / telemetry_diloco_weight_params as f64
+                } else {
+                    0.0
+                };
+                let diloco_weight_min = if telemetry_diloco_weight_params > 0 {
+                    telemetry_diloco_weight_min
+                } else {
+                    0.0
+                };
+                let diloco_weight_max = if telemetry_diloco_weight_params > 0 {
+                    telemetry_diloco_weight_max
+                } else {
+                    0.0
+                };
+                let diloco_trust_scale_mean = if telemetry_diloco_trust_scale_count > 0 {
+                    telemetry_diloco_trust_scale_sum / telemetry_diloco_trust_scale_count as f64
+                } else {
+                    0.0
+                };
+                let diloco_trust_scale_min = if telemetry_diloco_trust_scale_count > 0 {
+                    telemetry_diloco_trust_scale_min
+                } else {
+                    0.0
+                };
+                let diloco_trust_scale_max = if telemetry_diloco_trust_scale_count > 0 {
+                    telemetry_diloco_trust_scale_max
+                } else {
+                    0.0
+                };
+                let raw_v2_target_mode = if raw_v2_match_pre_l2 {
+                    "match-pre-l2"
+                } else if raw_v2_match_sign_equiv {
+                    "match-sign-equivalent"
+                } else if raw_v2_match_sign_equiv_nnz {
+                    "match-sign-equivalent-nnz"
+                } else {
+                    "off"
+                };
+                let raw_clip_frac = if telemetry_raw_align_scale_count > 0 {
+                    telemetry_raw_clip_tensors as f64 / telemetry_raw_align_scale_count as f64
+                } else {
+                    0.0
+                };
+                let raw_preclip_l2 = telemetry_raw_preclip_l2_sq.sqrt();
+                let raw_preclip_linf = if telemetry_raw_preclip_tensors > 0 {
+                    telemetry_raw_preclip_linf
+                } else {
+                    0.0
+                };
+                let sign_flip_frac = if telemetry_sign_flip_total > 0.0 {
+                    telemetry_sign_flip_flips / telemetry_sign_flip_total
+                } else {
+                    0.0
+                };
+                let sign_flip_min = if telemetry_sign_flip_params > 0 {
+                    telemetry_sign_flip_min
+                } else {
+                    0.0
+                };
+                let sign_flip_max = if telemetry_sign_flip_params > 0 {
+                    telemetry_sign_flip_max
+                } else {
+                    0.0
+                };
+                info!(
+                    step = step,
+                    apply_mode = ?self.apply_mode,
+                    peer_count = results.len(),
+                    raw_v2_enabled = raw_v2_enabled,
+                    raw_v2_target_mode = raw_v2_target_mode,
+                    raw_v2_norm_mode = ?self.raw_config.norm_mode,
+                    raw_v2_missing_sidecar_policy = ?self.raw_config.missing_sidecar_policy,
+                    raw_v2_scale_multiplier = self.raw_config.scale_multiplier,
+                    raw_v2_scale_max = self.raw_config.scale_max,
+                    raw_v2_abs_clip_mult = self.raw_config.abs_clip_mult,
+                    raw_v2_sign_equiv_mult = self.raw_config.sign_equiv_mult,
+                    raw_v2_missing_sidecar = telemetry_raw_v2_missing_sidecar,
+                    raw_v2_invalid_sidecar = telemetry_raw_v2_invalid_sidecar,
+                    raw_v2_target_l2_mean = raw_v2_target_l2_mean,
+                    raw_v2_target_support_mean = raw_v2_target_support_mean,
+                    raw_v2_obs_l2_mean = raw_v2_obs_l2_mean,
+                    raw_v2_target_to_obs_ratio_mean = raw_v2_target_to_obs_ratio_mean,
+                    raw_align_sign_scale = raw_align_sign_scale,
+                    raw_align_scale_multiplier = raw_align_scale_multiplier,
+                    raw_align_scale_cap = raw_align_scale_cap,
+                    raw_align_abs_clip = raw_align_abs_clip,
+                    raw_align_scale_count = telemetry_raw_align_scale_count,
+                    raw_align_scale_clamped = telemetry_raw_align_scale_clamped,
+                    raw_clip_tensors = telemetry_raw_clip_tensors,
+                    raw_clip_frac = raw_clip_frac,
+                    raw_preclip_tensors = telemetry_raw_preclip_tensors,
+                    raw_preclip_l2 = raw_preclip_l2,
+                    raw_preclip_linf = raw_preclip_linf,
+                    raw_align_scale_mean = raw_align_scale_mean,
+                    raw_align_scale_min = raw_align_scale_min,
+                    raw_align_scale_max = raw_align_scale_observed_max,
+                    sign_flip_sample_elems = sign_flip_sample,
+                    sign_flip_params = telemetry_sign_flip_params,
+                    sign_flip_frac = sign_flip_frac,
+                    sign_flip_min = sign_flip_min,
+                    sign_flip_max = sign_flip_max,
+                    aggregate_mode = ?self.aggregate_mode,
+                    diloco_lite_enabled = diloco_lite_enabled,
+                    diloco_outer_momentum = self.diloco_lite_config.outer_momentum,
+                    diloco_outer_lr_multiplier = self.diloco_lite_config.outer_lr_multiplier,
+                    diloco_trust_region_target = self.diloco_lite_config.trust_region_target,
+                    diloco_trust_region_max_scale = self.diloco_lite_config.trust_region_max_scale,
+                    diloco_tier_weight_cap = self.diloco_lite_config.tier_weight_cap,
+                    diloco_weight_params = telemetry_diloco_weight_params,
+                    diloco_weight_mean = diloco_weight_mean,
+                    diloco_weight_min = diloco_weight_min,
+                    diloco_weight_max = diloco_weight_max,
+                    diloco_trust_scale_count = telemetry_diloco_trust_scale_count,
+                    diloco_trust_scale_mean = diloco_trust_scale_mean,
+                    diloco_trust_scale_min = diloco_trust_scale_min,
+                    diloco_trust_scale_max = diloco_trust_scale_max,
+                    modular_geometry_align = modular_geometry_align_enabled(),
+                    modular_geometry_scale_power = modular_geometry_scale_power(),
+                    modular_geometry_scale_count = telemetry_modular_scale_count,
+                    modular_geometry_scale_mean = modular_scale_mean,
+                    modular_geometry_scale_min = modular_scale_min,
+                    modular_geometry_scale_max = modular_scale_max,
+                    lr = lr,
+                    grad_tensors = telemetry_grad_tensors,
+                    skipped_nonfinite_tensors = telemetry_nonfinite_skipped,
+                    pre_apply_grad_l2 = pre_grad_l2,
+                    pre_apply_grad_linf = telemetry_pre_grad_linf,
+                    post_mode_grad_l2 = post_grad_l2,
+                    post_mode_grad_linf = telemetry_post_grad_linf,
+                    effective_update_l2 = effective_update_l2,
+                    param_l2 = param_l2,
+                    update_to_param_ratio = update_to_param_ratio,
+                    "DisTrO apply norm stats"
+                );
+                if raw_v2_enabled && telemetry_raw_align_scale_count > 0 {
+                    let clamp_frac = telemetry_raw_align_scale_clamped as f64
+                        / telemetry_raw_align_scale_count as f64;
+                    if clamp_frac >= 0.5 {
+                        warn!(
+                            step = step,
+                            clamp_frac = clamp_frac,
+                            raw_v2_scale_max = self.raw_config.scale_max,
+                            raw_v2_target_mode = raw_v2_target_mode,
+                            "DisTrO raw-v2 is heavily scale-clamped; increase distro_raw_scale_max or adjust target mode/multiplier"
+                        );
+                    }
+                    if raw_clip_frac > 0.5 {
+                        let streak =
+                            RAW_HEAVY_CLIP_STREAK.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                        if streak == 5 || streak % 10 == 0 {
+                            warn!(
+                                step = step,
+                                clip_frac = raw_clip_frac,
+                                clip_streak = streak,
+                                raw_v2_abs_clip_mult = self.raw_config.abs_clip_mult,
+                                "DisTrO raw-v2 is heavily clipping for sustained steps; increase distro_raw_abs_clip_mult or disable per-tensor clipping"
+                            );
+                        }
+                    } else {
+                        RAW_HEAVY_CLIP_STREAK.store(0, AtomicOrdering::Relaxed);
+                    }
+                } else {
+                    RAW_HEAVY_CLIP_STREAK.store(0, AtomicOrdering::Relaxed);
+                }
+            }
         }
         // SGD step
         self.sgd.set_learning_rate(lr).unwrap();
@@ -921,14 +2495,17 @@ impl Distro {
 
             let state = self.state.get_mut(index).unwrap();
 
-            // Apply lookahead, the signed delta, multiplied by lr
-            let _t = variable.g_sub_(&state.delta.logical_tensor().sign().multiply_scalar(prev_lr));
+            // Remove the lookahead delta that was applied in `generate`.
+            let lookahead = Self::lookahead_delta(&state.delta.logical_tensor(), self.apply_mode)
+                .multiply_scalar(prev_lr);
+            let _t = variable.g_sub_(&lookahead);
         }
     }
 
     pub fn zero_optim(&mut self) {
         for state in &mut self.state {
             let _ = state.delta.logical_tensor().zero_();
+            let _ = state.outer_momentum.logical_tensor().zero_();
         }
     }
 
@@ -950,7 +2527,7 @@ unsafe impl Send for Distro {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{set_torch_rng_seed, Variable};
+    use crate::{Variable, set_torch_rng_seed};
     use itertools::iproduct;
 
     impl Variable for Tensor {
@@ -1000,6 +2577,58 @@ mod tests {
 
     fn vars(vars: Vec<Tensor>) -> StableVariableIterator {
         Box::new(vars.into_iter().map(|x| Box::new(x) as Box<dyn Variable>))
+    }
+
+    #[test]
+    fn test_diloco_peer_weights_normalized() {
+        let metas = vec![
+            DistroPeerMetadata {
+                inner_steps_used: 1,
+                sum_local_lr: 1.0,
+                tokens_processed: 100,
+                delta_l2_preclip: 0.0,
+                delta_l2_postclip: 0.0,
+            },
+            DistroPeerMetadata {
+                inner_steps_used: 2,
+                sum_local_lr: 2.0,
+                tokens_processed: 100,
+                delta_l2_preclip: 0.0,
+                delta_l2_postclip: 0.0,
+            },
+        ];
+        let (weights, mean, min_w, max_w) = diloco_peer_weights(&metas, 2.0);
+        assert_eq!(weights.len(), 2);
+        assert!((mean - 1.0).abs() < 1.0e-6);
+        assert!(min_w > 0.0);
+        assert!(max_w < 2.0);
+        assert!((weights[0] - (4.0 / 3.0)).abs() < 1.0e-5);
+        assert!((weights[1] - (2.0 / 3.0)).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn test_diloco_peer_weights_cap_enforced() {
+        let metas = vec![
+            DistroPeerMetadata {
+                inner_steps_used: 1,
+                sum_local_lr: 1.0,
+                tokens_processed: 1000,
+                delta_l2_preclip: 0.0,
+                delta_l2_postclip: 0.0,
+            },
+            DistroPeerMetadata {
+                inner_steps_used: 1,
+                sum_local_lr: 1.0,
+                tokens_processed: 10,
+                delta_l2_preclip: 0.0,
+                delta_l2_postclip: 0.0,
+            },
+        ];
+        let cap = 1.2;
+        let (weights, mean, _min_w, max_w) = diloco_peer_weights(&metas, cap);
+        assert_eq!(weights.len(), 2);
+        assert!((mean - 1.0).abs() < 1.0e-6);
+        assert!(max_w <= cap + 1.0e-6);
     }
 
     #[test]

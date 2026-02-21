@@ -173,6 +173,12 @@ pub async fn build_app(
         eval_tasks,
         eval_task_max_docs: p.eval_task_max_docs,
         prompt_task: p.prompt_task,
+        heldout_eval_config: (p.heldout_eval_batches > 0).then_some(
+            psyche_client::HeldoutEvalConfig {
+                batches: p.heldout_eval_batches,
+                batch_size: p.heldout_eval_batch_size,
+            },
+        ),
         checkpoint_config,
         hub_read_token,
         hub_max_concurrent_downloads: p.hub_max_concurrent_downloads,
@@ -237,6 +243,14 @@ pub async fn build_app(
             psyche_client::DistroApplyMode::Sign => psyche_modeling::DistroApplyMode::Sign,
             psyche_client::DistroApplyMode::Raw => psyche_modeling::DistroApplyMode::Raw,
         },
+        distro_aggregate_mode: match p.distro_aggregate_mode {
+            psyche_client::DistroAggregateMode::Legacy => {
+                psyche_modeling::DistroAggregateMode::Legacy
+            }
+            psyche_client::DistroAggregateMode::DilocoLite => {
+                psyche_modeling::DistroAggregateMode::DilocoLite
+            }
+        },
         distro_value_mode: match p.distro_value_mode {
             psyche_client::DistroValueMode::Auto => psyche_modeling::DistroValueMode::Auto,
             psyche_client::DistroValueMode::Sign => psyche_modeling::DistroValueMode::Sign,
@@ -269,6 +283,13 @@ pub async fn build_app(
                     psyche_modeling::DistroRawMissingSidecarPolicy::Fail
                 }
             },
+        },
+        distro_diloco_lite_config: psyche_modeling::DistroDilocoLiteConfig {
+            outer_momentum: p.distro_diloco_outer_momentum,
+            outer_lr_multiplier: p.distro_diloco_outer_lr_multiplier,
+            trust_region_target: p.distro_diloco_trust_region_target,
+            trust_region_max_scale: p.distro_diloco_trust_region_max_scale,
+            tier_weight_cap: p.distro_diloco_tier_weight_cap,
         },
     };
     let app = App {

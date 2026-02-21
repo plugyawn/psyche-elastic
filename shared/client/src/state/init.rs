@@ -10,16 +10,16 @@ use psyche_core::{
 use psyche_data_provider::{
     download_dataset_repo_async, download_model_repo_async,
     http::{FileURLs, HttpDataProvider},
-    DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider,
+    DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider, LocalDataSplit,
     PreprocessedDataProvider, Split, WeightedDataProvider,
 };
 use psyche_metrics::ClientMetrics;
 use psyche_modeling::{
     auto_tokenizer, AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM,
-    CommunicatorId, DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices, DistroApplyMode,
-    DistroRawConfig, DistroValueMode, DummyModel, LlamaConfig, LlamaForCausalLM, LocalTrainer,
-    ModelConfig, ModelLoadError, NanoGPTConfig, NanoGPTForCausalLM, ParallelModels,
-    PretrainedSource, Trainer,
+    CommunicatorId, DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices,
+    DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig, DistroValueMode,
+    DummyModel, LlamaConfig, LlamaForCausalLM, LocalTrainer, ModelConfig, ModelLoadError,
+    NanoGPTConfig, NanoGPTForCausalLM, ParallelModels, PretrainedSource, Trainer,
 };
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
 use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
@@ -39,7 +39,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::{
-    cooldown::{CooldownStepMetadata, MatformerCheckpointInfo},
+    cooldown::{
+        CooldownStepMetadata, HeldoutEvalConfig, HeldoutEvaluator, MatformerCheckpointInfo,
+    },
     evals::ModelTaskRunner,
     stats::StatsLogger,
     steps::StepStateMachine,
@@ -84,6 +86,7 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     pub eval_task_max_docs: Option<usize>,
     pub eval_tasks: Vec<psyche_eval::Task>,
     pub prompt_task: bool,
+    pub heldout_eval_config: Option<HeldoutEvalConfig>,
 
     // logging
     pub wandb_info: Option<WandBInfo>,
@@ -108,6 +111,9 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     /// DisTrO apply mode (`sign` default or `raw`).
     pub distro_apply_mode: DistroApplyMode,
 
+    /// DisTrO aggregation mode (`legacy` default or `diloco-lite`).
+    pub distro_aggregate_mode: DistroAggregateMode,
+
     /// DisTrO value mode (`auto`, `sign`, `raw`).
     pub distro_value_mode: DistroValueMode,
 
@@ -116,6 +122,9 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
 
     /// Guarded raw-v2 config.
     pub distro_raw_config: DistroRawConfig,
+
+    /// DiLoCo-lite aggregation config.
+    pub distro_diloco_lite_config: DistroDilocoLiteConfig,
 }
 
 #[cfg(test)]
@@ -525,7 +534,9 @@ pub enum InitRunError {
     #[error("Required MatFormer tier checkpoint for tier {tier} not found at {path}")]
     MissingMatformerTierCheckpoint { path: String, tier: u8 },
 
-    #[error("Double-slicing detected: checkpoint is tier {checkpoint_tier}, CLI requests tier {cli_tier}. {hint}")]
+    #[error(
+        "Double-slicing detected: checkpoint is tier {checkpoint_tier}, CLI requests tier {cli_tier}. {hint}"
+    )]
     DoubleSlicingDetected {
         checkpoint_tier: u8,
         cli_tier: u8,
@@ -800,16 +811,26 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
 
         let hub_read_token = init_config.hub_read_token.clone();
         let hub_max_concurrent_downloads = init_config.hub_max_concurrent_downloads;
+        let heldout_eval_config = init_config.heldout_eval_config;
         let data_future = async {
             debug!("Setting up data provider from {:?}", llm.data_location);
-            let data_provider = match llm.data_location {
-                LLMTrainingDataLocation::Server(data_server) => DataProvider::Server(
-                    DataProviderTcpClient::connect(
-                        (&data_server).into(),
-                        init_config.network_identity,
-                        init_config.private_key,
-                    )
-                    .await?,
+            let (data_provider, heldout_evaluator) = match llm.data_location {
+                LLMTrainingDataLocation::Server(data_server) => (
+                    DataProvider::Server(
+                        DataProviderTcpClient::connect(
+                            (&data_server).into(),
+                            init_config.network_identity,
+                            init_config.private_key,
+                        )
+                        .await?,
+                    ),
+                    if heldout_eval_config.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "heldout eval is not supported for server-backed datasets"
+                        ));
+                    } else {
+                        None
+                    },
                 ),
                 LLMTrainingDataLocation::Local(url) => {
                     let url: String = (&url).into();
@@ -831,37 +852,87 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         .unwrap()
                         .into()
                     };
-                    DataProvider::Local(LocalDataProvider::new_from_directory(
-                        dir,
+                    let train_split = if heldout_eval_config.is_some() {
+                        LocalDataSplit::Train
+                    } else {
+                        LocalDataSplit::All
+                    };
+                    let train_provider = LocalDataProvider::new_from_directory_with_split(
+                        dir.clone(),
                         TokenSize::TwoBytes,
                         llm.max_seq_len as usize,
                         Shuffle::DontShuffle,
-                    )?)
+                        train_split,
+                    )?;
+                    let heldout = if let Some(cfg) = heldout_eval_config {
+                        Some(Arc::new(tokio::sync::Mutex::new(
+                            HeldoutEvaluator::new_local(
+                                LocalDataProvider::new_from_directory_with_split(
+                                    dir,
+                                    TokenSize::TwoBytes,
+                                    llm.max_seq_len as usize,
+                                    Shuffle::DontShuffle,
+                                    LocalDataSplit::Validation,
+                                )?,
+                                cfg,
+                            ),
+                        )))
+                    } else {
+                        None
+                    };
+                    (DataProvider::Local(train_provider), heldout)
                 }
-                LLMTrainingDataLocation::Dummy => DataProvider::Dummy(DummyDataProvider::new(
-                    TokenSize::TwoBytes,
-                    llm.max_seq_len as usize,
-                    u64::MAX,
-                )),
+                LLMTrainingDataLocation::Dummy => (
+                    DataProvider::Dummy(DummyDataProvider::new(
+                        TokenSize::TwoBytes,
+                        llm.max_seq_len as usize,
+                        u64::MAX,
+                    )),
+                    if heldout_eval_config.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "heldout eval is not supported for dummy datasets"
+                        ));
+                    } else {
+                        None
+                    },
+                ),
                 LLMTrainingDataLocation::Http(HttpLLMTrainingDataLocation {
                     location,
                     token_size_in_bytes,
                     shuffle,
                 }) => {
                     let file_urls = FileURLs::from_location(&location).await?;
-                    DataProvider::Http(HttpDataProvider::new(
-                        file_urls,
-                        token_size_in_bytes,
-                        llm.max_seq_len,
-                        shuffle,
-                    )?)
-                }
-                LLMTrainingDataLocation::WeightedHttp(config_url) => DataProvider::WeightedHttp(
-                    WeightedDataProvider::<HttpDataProvider>::from_config_url(
-                        &String::from(&config_url),
-                        llm.max_seq_len,
+                    (
+                        DataProvider::Http(HttpDataProvider::new(
+                            file_urls,
+                            token_size_in_bytes,
+                            llm.max_seq_len,
+                            shuffle,
+                        )?),
+                        if heldout_eval_config.is_some() {
+                            return Err(anyhow::anyhow!(
+                                "heldout eval is not supported for HTTP datasets"
+                            ));
+                        } else {
+                            None
+                        },
                     )
-                    .await?,
+                }
+                LLMTrainingDataLocation::WeightedHttp(config_url) => (
+                    DataProvider::WeightedHttp(
+                        WeightedDataProvider::<HttpDataProvider>::from_config_url(
+                            &String::from(&config_url),
+                            llm.max_seq_len,
+                        )
+                        .await?,
+                    ),
+                    if heldout_eval_config.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "heldout eval is not supported for weighted HTTP datasets"
+                        ));
+                    } else {
+                        None
+                    },
                 ),
                 LLMTrainingDataLocation::Preprocessed(url) => {
                     let url: String = (&url).into();
@@ -883,16 +954,33 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                         .unwrap()
                         .into()
                     };
-                    DataProvider::Preprocessed(PreprocessedDataProvider::new_from_directory(
-                        dir,
+                    let train_provider = PreprocessedDataProvider::new_from_directory(
+                        dir.clone(),
                         llm.max_seq_len as usize,
                         Shuffle::DontShuffle,
                         Some(Split::Train),
                         None,
-                    )?)
+                    )?;
+                    let heldout = if let Some(cfg) = heldout_eval_config {
+                        Some(Arc::new(tokio::sync::Mutex::new(
+                            HeldoutEvaluator::new_preprocessed(
+                                PreprocessedDataProvider::new_from_directory(
+                                    dir,
+                                    llm.max_seq_len as usize,
+                                    Shuffle::DontShuffle,
+                                    Some(Split::Validation),
+                                    None,
+                                )?,
+                                cfg,
+                            ),
+                        )))
+                    } else {
+                        None
+                    };
+                    (DataProvider::Preprocessed(train_provider), heldout)
                 }
             };
-            Ok(data_provider)
+            Ok((data_provider, heldout_evaluator))
         };
 
         // Avoid moving these out of `init_config` into spawned tasks; we still need the originals
@@ -1578,7 +1666,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
         } = models.map_err(InitRunError::ModelLoadingThreadCrashed)??;
 
         // TODO add data fetching for verifying, too..
-        let data_provider = data.map_err(InitRunError::DataProviderConnect)?;
+        let (data_provider, heldout_evaluator) = data.map_err(InitRunError::DataProviderConnect)?;
         let data_fetcher = DataFetcher::<T, A>::new(
             data_provider,
             init_config.data_parallelism * 2,
@@ -1653,8 +1741,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                             llm.lr_schedule,
                             llm.optimizer,
                             init_config.distro_apply_mode,
+                            init_config.distro_aggregate_mode,
                             init_config.distro_value_mode,
                             init_config.distro_raw_config,
+                            init_config.distro_diloco_lite_config,
                             init_config.micro_batch_size,
                             init_config.optim_stats_every_n_steps,
                             init_config.grad_accum_in_fp32,
@@ -1674,8 +1764,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     llm.lr_schedule,
                     llm.optimizer,
                     init_config.distro_apply_mode,
+                    init_config.distro_aggregate_mode,
                     init_config.distro_value_mode,
                     init_config.distro_raw_config,
+                    init_config.distro_diloco_lite_config,
                     init_config.micro_batch_size,
                     init_config.optim_stats_every_n_steps,
                     init_config.grad_accum_in_fp32,
@@ -1689,8 +1781,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                     llm.lr_schedule,
                     llm.optimizer,
                     init_config.distro_apply_mode,
+                    init_config.distro_aggregate_mode,
                     init_config.distro_value_mode,
                     init_config.distro_raw_config,
+                    init_config.distro_diloco_lite_config,
                     init_config.micro_batch_size,
                     init_config.optim_stats_every_n_steps,
                     init_config.grad_accum_in_fp32,
@@ -1741,6 +1835,7 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             distro_value_mode: init_config.distro_value_mode,
             matformer_local_inner_steps: init_config.matformer_local_inner_steps,
         };
+        let wandb_run_for_cooldown = training.wandb_run.clone();
 
         let witness = WitnessStepMetadata {
             model_task_runner: model_task_runner.clone(),
@@ -1757,6 +1852,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
                 effective_tier: matformer_effective_tier,
                 base_intermediate_size: matformer_base_intermediate_size,
             },
+            heldout_evaluator,
+            wandb_run_for_cooldown,
             model_task_runner,
         );
 

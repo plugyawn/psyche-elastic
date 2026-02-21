@@ -22,6 +22,14 @@ pub struct CompressedTeacherLogits {
     /// Stored as u16 (IEEE 754 half-precision bit representation).
     pub top_values_f16: Vec<u16>,
 
+    /// Per-token log-normalizer: `logZ = logsumexp(logits / T)` over the full vocab.
+    ///
+    /// Stored as raw f16 bits, flattened: [batch × seq].
+    ///
+    /// This enables a "top-k + tail bucket" KL on the student side without transmitting
+    /// full logits (fixes the distortion from renormalizing top-k to sum to 1.0).
+    pub logsumexp_f16: Vec<u16>,
+
     pub batch_size: u16,
     pub seq_len: u16,
     pub top_k: u16,
@@ -34,6 +42,10 @@ impl CompressedTeacherLogits {
     /// Expected number of elements in top_indices / top_values_f16.
     pub fn expected_len(&self) -> usize {
         (self.batch_size as usize) * (self.seq_len as usize) * (self.top_k as usize)
+    }
+
+    pub fn expected_logsumexp_len(&self) -> usize {
+        (self.batch_size as usize) * (self.seq_len as usize)
     }
 
     /// Validate internal consistency.
@@ -51,6 +63,14 @@ impl CompressedTeacherLogits {
                 field: "top_values_f16",
                 expected,
                 actual: self.top_values_f16.len(),
+            });
+        }
+        let expected_lse = self.expected_logsumexp_len();
+        if self.logsumexp_f16.len() != expected_lse {
+            return Err(TeacherLogitsError::ShapeMismatch {
+                field: "logsumexp_f16",
+                expected: expected_lse,
+                actual: self.logsumexp_f16.len(),
             });
         }
         if self.top_k == 0 {
@@ -88,14 +108,19 @@ impl TransmittableTeacherLogits {
         for val in &self.logits.top_values_f16 {
             hasher.update(val.to_be_bytes());
         }
+        // Hash logsumexp
+        for val in &self.logits.logsumexp_f16 {
+            hasher.update(val.to_be_bytes());
+        }
         hasher.finalize().into()
     }
 
     /// Serialized size estimate in bytes.
     pub fn estimated_size(&self) -> usize {
         let n = self.logits.expected_len();
-        // 2 bytes per index + 2 bytes per value + metadata overhead
-        n * 4 + 64
+        let lse_n = self.logits.expected_logsumexp_len();
+        // 2 bytes per index + 2 bytes per value + 2 bytes per logsumexp + metadata overhead
+        n * 4 + lse_n * 2 + 64
     }
 }
 
@@ -118,9 +143,11 @@ mod tests {
 
     fn make_test_logits(batch_size: u16, seq_len: u16, top_k: u16) -> CompressedTeacherLogits {
         let n = (batch_size as usize) * (seq_len as usize) * (top_k as usize);
+        let lse_n = (batch_size as usize) * (seq_len as usize);
         CompressedTeacherLogits {
             top_indices: (0..n).map(|i| (i % 1000) as u16).collect(),
             top_values_f16: vec![0x3C00; n], // f16 representation of 1.0
+            logsumexp_f16: vec![0x4900; lse_n], // f16 representation of ~10.0
             batch_size,
             seq_len,
             top_k,
@@ -146,6 +173,7 @@ mod tests {
         let logits = CompressedTeacherLogits {
             top_indices: vec![],
             top_values_f16: vec![],
+            logsumexp_f16: vec![],
             batch_size: 1,
             seq_len: 1,
             top_k: 0,
@@ -197,8 +225,18 @@ mod tests {
         assert_eq!(decoded.logits.batch_size, transmittable.logits.batch_size);
         assert_eq!(decoded.logits.seq_len, transmittable.logits.seq_len);
         assert_eq!(decoded.logits.top_k, transmittable.logits.top_k);
-        assert_eq!(decoded.logits.top_indices.len(), transmittable.logits.top_indices.len());
-        assert_eq!(decoded.logits.top_values_f16.len(), transmittable.logits.top_values_f16.len());
+        assert_eq!(
+            decoded.logits.top_indices.len(),
+            transmittable.logits.top_indices.len()
+        );
+        assert_eq!(
+            decoded.logits.top_values_f16.len(),
+            transmittable.logits.top_values_f16.len()
+        );
+        assert_eq!(
+            decoded.logits.logsumexp_f16.len(),
+            transmittable.logits.logsumexp_f16.len()
+        );
         // Hash should match after roundtrip
         assert_eq!(decoded.compute_hash(), transmittable.compute_hash());
     }
@@ -211,7 +249,7 @@ mod tests {
             batch_id: BatchId(ClosedInterval::new(0, 4)),
             logits,
         };
-        // 4 * 2048 * 32 * 4 + 64 = 1,048,640
-        assert_eq!(transmittable.estimated_size(), 1_048_640);
+        // 4 * 2048 * 32 * 4 + (4 * 2048 * 2) + 64 = 1,065,024
+        assert_eq!(transmittable.estimated_size(), 1_065_024);
     }
 }

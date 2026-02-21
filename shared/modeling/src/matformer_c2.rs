@@ -28,6 +28,14 @@ pub struct MatformerStabilizationConfig {
     #[serde(default)]
     pub residual_scale: Option<ResidualScaleConfig>,
 
+    /// Learnable per-tier residual gates: per-layer scalars that scale FFN/attn
+    /// residual branch outputs.
+    ///
+    /// These are actual trainable parameters (stored in the model VarStore),
+    /// unlike `residual_scale` / `norm_tier_gain` which are fixed scalars.
+    #[serde(default)]
+    pub residual_gates: Option<ResidualGatesConfig>,
+
     /// Per-tier RMSNorm gain scalar: gain = (active/full)^power.
     /// Tier-0 (active==full) always gets gain=1.0 (no change).
     #[serde(default)]
@@ -50,6 +58,7 @@ impl Default for MatformerStabilizationConfig {
             width_rescale_power: default_width_rescale_power(),
             suffix_gate: None,
             residual_scale: None,
+            residual_gates: None,
             norm_tier_gain: None,
             distillation: None,
         }
@@ -95,6 +104,106 @@ impl Default for ResidualScaleConfig {
     }
 }
 
+/// Learnable per-tier residual gates for FFN and/or attention outputs.
+///
+/// For each Transformer block, we add one small vector parameter per gated branch:
+/// `log_alpha[tier]`, and apply `alpha = exp(log_alpha[tier])` to the branch output
+/// before adding it to the residual stream.
+///
+/// This targets width-induced distribution shifts directly, while keeping overhead tiny:
+/// O(num_layers * num_tiers) scalars.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ResidualGatesConfig {
+    /// Apply residual gates to MLP output. Default true.
+    #[serde(default = "default_true")]
+    pub apply_to_mlp: bool,
+
+    /// Apply residual gates to attention output. Default false (attention is typically full-width).
+    #[serde(default)]
+    pub apply_to_attn: bool,
+
+    /// Initialize per-tier gates using the width ratio:
+    /// `alpha_init[tier] = (active/full)^init_power`.
+    ///
+    /// Safe default is `0.0` (all ones). Values in `[0.25, 0.5]` are a reasonable starting point
+    /// if you want a width-aware initialization.
+    #[serde(default)]
+    pub init_power: f64,
+}
+
+impl Default for ResidualGatesConfig {
+    fn default() -> Self {
+        Self {
+            apply_to_mlp: default_true(),
+            apply_to_attn: false,
+            init_power: 0.0,
+        }
+    }
+}
+
+/// Maximum number of MatFormer tiers supported by residual gates.
+///
+/// This bounds the size of the per-layer gate vectors. Overhead is negligible.
+pub(crate) const RESIDUAL_GATES_MAX_TIERS: i64 = 32;
+
+/// Infer MatFormer tier from `(full_intermediate, active_intermediate)` sizes.
+///
+/// Works for both universal checkpoints (tier applied by runtime slicing) and tier-sliced checkpoints
+/// (`matformer_tier` forced to 0 but `active_intermediate` already reflects the slice).
+pub(crate) fn infer_matformer_tier_from_intermediate_sizes(
+    full_intermediate_size: i64,
+    active_intermediate_size: i64,
+) -> u8 {
+    assert!(
+        full_intermediate_size > 0 && active_intermediate_size > 0,
+        "invalid intermediate sizes: full={}, active={}",
+        full_intermediate_size,
+        active_intermediate_size
+    );
+    assert!(
+        full_intermediate_size % active_intermediate_size == 0,
+        "active_intermediate_size {} must divide full_intermediate_size {}",
+        active_intermediate_size,
+        full_intermediate_size
+    );
+    let ratio = (full_intermediate_size / active_intermediate_size) as u64;
+    assert!(ratio >= 1, "invalid width ratio {}", ratio);
+    assert!(
+        ratio.is_power_of_two(),
+        "width ratio (full/active) must be a power of two, got {} (full={}, active={})",
+        ratio,
+        full_intermediate_size,
+        active_intermediate_size
+    );
+    let tier = ratio.trailing_zeros() as u8;
+    assert!(
+        (tier as i64) < RESIDUAL_GATES_MAX_TIERS,
+        "matformer tier {} exceeds RESIDUAL_GATES_MAX_TIERS {}",
+        tier,
+        RESIDUAL_GATES_MAX_TIERS
+    );
+    tier
+}
+
+pub(crate) fn residual_gates_init_log_alphas(init_power: f64) -> Vec<f32> {
+    assert!(
+        init_power.is_finite(),
+        "init_power must be finite (got {})",
+        init_power
+    );
+    (0..(RESIDUAL_GATES_MAX_TIERS as u64))
+        .map(|tier| {
+            // active/full = 1 / 2^tier
+            let denom = 1_u64
+                .checked_shl(tier as u32)
+                .expect("tier too large for shift");
+            let ratio = 1.0f64 / (denom as f64);
+            let alpha = ratio.powf(init_power);
+            alpha.ln() as f32
+        })
+        .collect()
+}
+
 /// Per-tier RMSNorm gain scalar.
 ///
 /// Different FFN widths produce different activation magnitudes flowing through
@@ -121,7 +230,10 @@ impl Default for NormTierGainConfig {
 
 /// In-place distillation: student (tier > 0) matches teacher (tier-0) output.
 ///
-/// The student loss becomes: `(1 - β) * CE(student, labels) + β * KL(student/T, teacher/T) * T²`
+/// The student loss uses one of:
+/// - `Mix`: `(1 - β) * CE(student, labels) + β * KL(student/T, teacher/T) * T²`
+/// - `Add`: `CE(student, labels) + β * KL(student/T, teacher/T) * T²`
+///
 /// where β ramps from 0 to `beta_max` over `warmup_steps` starting at `start_step`.
 /// Teacher logits are compressed to top-k per token (~1MB per batch).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -129,6 +241,15 @@ pub struct DistillationConfig {
     /// Number of top logits to transmit per token. Default 32.
     #[serde(default = "default_top_k")]
     pub top_k: u16,
+
+    /// If set, the teacher only transmits logits for the last N tokens in the sequence.
+    ///
+    /// This reduces WAN bandwidth and student-side KD memory by limiting distillation
+    /// to a contiguous suffix of the token window.
+    ///
+    /// NOTE: CE loss is still computed on the full sequence; only KD is truncated.
+    #[serde(default)]
+    pub logits_to_keep: Option<u16>,
 
     /// Temperature for KL divergence softening. Default 2.0.
     #[serde(default = "default_temperature")]
@@ -146,17 +267,43 @@ pub struct DistillationConfig {
     #[serde(default = "default_distill_warmup_steps")]
     pub warmup_steps: u32,
 
+    /// Distillation objective combine mode:
+    /// - `mix`: `(1-β)CE + βKD`
+    /// - `add`: `CE + βKD`
+    #[serde(default)]
+    pub combine_mode: DistillationCombineMode,
+
+    /// Optional teacher-confidence gate.
+    ///
+    /// If set, and the teacher's mean top-k probability mass for the step is below this
+    /// threshold, distillation is disabled for that step (`β_eff = 0`).
+    ///
+    /// This helps avoid training on near-uniform teacher distributions early in training.
+    #[serde(default)]
+    pub min_teacher_topk_mass: Option<f64>,
+
+    /// Optional KD scaling to avoid "KD vanishes when teacher is high-entropy".
+    ///
+    /// If `kd_q_topk_mass_floor > 0`, scale the KD term by:
+    /// `1 / clamp(mean_q_topk_mass, kd_q_topk_mass_floor, 1.0)`,
+    /// where `mean_q_topk_mass` is the teacher's mean probability mass on the transmitted
+    /// top-k support for the step.
+    ///
+    /// This is bounded (no explosions) and WAN-friendly (no extra payload).
+    #[serde(default = "default_kd_q_topk_mass_floor")]
+    pub kd_q_topk_mass_floor: f64,
+
     /// Schedule shape for the β ramp.
     #[serde(default)]
     pub schedule: SuffixGateSchedule,
 }
 
 fn default_top_k() -> u16 {
-    32
+    64
 }
 
 fn default_temperature() -> f32 {
-    2.0
+    1.0
 }
 
 fn default_beta_max() -> f64 {
@@ -167,16 +314,39 @@ fn default_distill_warmup_steps() -> u32 {
     100
 }
 
+fn default_kd_q_topk_mass_floor() -> f64 {
+    0.05
+}
+
 impl Default for DistillationConfig {
     fn default() -> Self {
         Self {
             top_k: default_top_k(),
+            logits_to_keep: None,
             temperature: default_temperature(),
             beta_max: default_beta_max(),
             start_step: 0,
             warmup_steps: default_distill_warmup_steps(),
+            combine_mode: DistillationCombineMode::Add,
+            min_teacher_topk_mass: None,
+            kd_q_topk_mass_floor: default_kd_q_topk_mass_floor(),
             schedule: Default::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DistillationCombineMode {
+    /// `(1-β)CE + βKD`
+    Mix,
+    /// `CE + βKD`
+    Add,
+}
+
+impl Default for DistillationCombineMode {
+    fn default() -> Self {
+        Self::Add
     }
 }
 
@@ -230,6 +400,16 @@ pub struct SuffixGateConfig {
 
     #[serde(default)]
     pub schedule: SuffixGateSchedule,
+
+    /// If true, additionally scale the scheduled beta by a learned per-layer scalar in (0,1)
+    /// via `sigmoid(logit)`. This lets training dial suffix contribution up/down without
+    /// changing bandwidth or adding heavy compute.
+    #[serde(default)]
+    pub learnable: bool,
+
+    /// Initial value for the learned logit (higher => closer to 1.0 after sigmoid).
+    #[serde(default = "default_suffix_gate_learnable_init_logit")]
+    pub learnable_init_logit: f64,
 }
 
 fn default_gate_tier() -> u8 {
@@ -240,6 +420,11 @@ fn default_warmup_steps() -> u32 {
     100
 }
 
+fn default_suffix_gate_learnable_init_logit() -> f64 {
+    // sigmoid(6) ~= 0.9975, i.e. nearly identity unless training learns otherwise.
+    6.0
+}
+
 impl Default for SuffixGateConfig {
     fn default() -> Self {
         Self {
@@ -247,6 +432,8 @@ impl Default for SuffixGateConfig {
             start_step: 0,
             warmup_steps: default_warmup_steps(),
             schedule: Default::default(),
+            learnable: false,
+            learnable_init_logit: default_suffix_gate_learnable_init_logit(),
         }
     }
 }
@@ -357,6 +544,7 @@ mod tests {
             start_step: 10,
             warmup_steps: 10,
             schedule: SuffixGateSchedule::Linear,
+            ..Default::default()
         };
         assert_eq!(suffix_beta(&cfg, 0), 0.0);
         assert_eq!(suffix_beta(&cfg, 10), 0.0);
@@ -372,6 +560,7 @@ mod tests {
             start_step: 10,
             warmup_steps: 10,
             schedule: SuffixGateSchedule::Cosine,
+            ..Default::default()
         };
         assert_eq!(suffix_beta(&cfg, 10), 0.0);
         assert!((suffix_beta(&cfg, 20) - 1.0).abs() < 1e-12);
@@ -408,6 +597,22 @@ mod tests {
         // Tier-1: active = full/2, power=0.25 → (0.5)^0.25 ≈ 0.8409
         let factor = residual_scale_factor(3072, 1536, 0.25);
         assert!((factor - 0.5_f64.powf(0.25)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_infer_matformer_tier_from_intermediate_sizes() {
+        assert_eq!(infer_matformer_tier_from_intermediate_sizes(1024, 1024), 0);
+        assert_eq!(infer_matformer_tier_from_intermediate_sizes(1024, 512), 1);
+        assert_eq!(infer_matformer_tier_from_intermediate_sizes(1024, 256), 2);
+        assert_eq!(infer_matformer_tier_from_intermediate_sizes(3072, 768), 2);
+    }
+
+    #[test]
+    fn test_residual_gates_init_log_alphas_default_is_identity() {
+        let logs = residual_gates_init_log_alphas(0.0);
+        assert_eq!(logs.len(), RESIDUAL_GATES_MAX_TIERS as usize);
+        // init_power=0 => alpha=1 => log_alpha=0
+        assert!(logs.iter().all(|&x| x.abs() < 1e-6));
     }
 
     #[test]

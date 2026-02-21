@@ -1,21 +1,21 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use psyche_centralized_shared::{
     ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage, TrainingAssignment,
 };
-use psyche_coordinator::model::{self, Checkpoint, LLM, LLMTrainingDataLocation, Model};
+use psyche_coordinator::model::{self, Checkpoint, LLMTrainingDataLocation, Model, LLM};
 use psyche_coordinator::{
-    Client, ClientState, Coordinator, CoordinatorError, HealthChecks, Round, RunState,
-    SOLANA_MAX_NUM_CLIENTS, TickResult,
+    Client, ClientState, Coordinator, CoordinatorError, HealthChecks, Round, RunState, TickResult,
+    SOLANA_MAX_NUM_CLIENTS,
 };
 
-use psyche_core::{FixedVec, Shuffle, SizedIterator, TokenSize};
+use psyche_core::{sha256, sha256v, FixedVec, Shuffle, SizedIterator, TokenSize};
 use psyche_data_provider::{
-    DataProviderTcpServer, DataServerTui, LocalDataProvider, download_model_repo_async,
+    download_model_repo_async, DataProviderTcpServer, DataServerTui, LocalDataProvider,
 };
 use psyche_network::{ClientNotification, TcpServer};
 use psyche_tui::{
-    CustomWidget, MaybeTui, TabbedWidget, logging::LoggerWidget, maybe_start_render_loop,
+    logging::LoggerWidget, maybe_start_render_loop, CustomWidget, MaybeTui, TabbedWidget,
 };
 use psyche_watcher::{CoordinatorTui, ModelSchemaInfo, OpportunisticData};
 use rand::RngCore;
@@ -26,12 +26,12 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio::{select, time::Interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::dashboard::{DashboardState, DashboardTui};
 
@@ -102,6 +102,8 @@ pub struct App {
     save_state_dir: Option<PathBuf>,
     original_warmup_time: u64,
     withdraw_on_disconnect: bool,
+    aligned_batches: bool,
+    aligned_batches_seed: u64,
     pause: Option<Arc<Notify>>,
     expected_schema: Option<ModelSchemaInfo>,
     client_schemas: HashMap<ClientId, ModelSchemaInfo>,
@@ -170,6 +172,8 @@ impl App {
         save_state_dir: Option<PathBuf>,
         init_warmup_time: Option<u64>,
         withdraw_on_disconnect: bool,
+        aligned_batches: bool,
+        aligned_batches_seed: Option<u64>,
     ) -> Result<Self> {
         if !coordinator.config.check() {
             bail!("Coordinator sanity check failed");
@@ -275,6 +279,15 @@ impl App {
                 coordinator.config.warmup_time = init_warmup_time;
             }
 
+            let aligned_batches_seed = if aligned_batches {
+                aligned_batches_seed.unwrap_or_else(|| {
+                    let run_id = String::from(&coordinator.run_id);
+                    Self::derive_seed_from_run_id(&run_id)
+                })
+            } else {
+                0
+            };
+
             Ok(Self {
                 cancel,
                 training_data_server,
@@ -290,6 +303,8 @@ impl App {
                 save_state_dir,
                 original_warmup_time,
                 withdraw_on_disconnect,
+                aligned_batches,
+                aligned_batches_seed,
                 pause,
                 expected_schema: None,
                 client_schemas: HashMap::new(),
@@ -396,14 +411,19 @@ impl App {
                         "added pending client"
                     );
                     self.backend.pending_clients.insert(from);
-                    self.backend.client_capabilities.insert(from, capabilities.clone());
+                    self.backend
+                        .client_capabilities
+                        .insert(from, capabilities.clone());
                     let assignment = TrainingAssignment {
                         matformer_tier: capabilities.matformer_tier,
                     };
                     if let Err(err) = self
                         .backend
                         .net_server
-                        .send_to(from, ServerToClientMessage::TrainingAssignment { assignment })
+                        .send_to(
+                            from,
+                            ServerToClientMessage::TrainingAssignment { assignment },
+                        )
                         .await
                     {
                         warn!("Failed to send training assignment to {from}: {err}");
@@ -487,7 +507,11 @@ impl App {
                         &from,
                         witness,
                         Self::get_timestamp(),
-                        rand::rng().next_u64(),
+                        if self.aligned_batches {
+                            self.aligned_round_seed()
+                        } else {
+                            rand::rng().next_u64()
+                        },
                     ),
                 } {
                     warn!("Error when processing witness: {error}");
@@ -532,13 +556,42 @@ impl App {
 
     async fn on_tick(&mut self) {
         self.kick_unhealthy_clients();
+
+        let random_seed = if self.aligned_batches {
+            self.aligned_round_seed()
+        } else {
+            rand::rng().next_u64()
+        };
+
+        let mut pending_clients: Vec<ClientId> =
+            self.backend.pending_clients.iter().copied().collect();
+        if self.aligned_batches {
+            // Stable order across runs: tier first, then id bytes.
+            pending_clients.sort_by(|a, b| {
+                let tier_a = self
+                    .backend
+                    .client_capabilities
+                    .get(a)
+                    .map(|c| c.matformer_tier)
+                    .unwrap_or(u8::MAX);
+                let tier_b = self
+                    .backend
+                    .client_capabilities
+                    .get(b)
+                    .map(|c| c.matformer_tier)
+                    .unwrap_or(u8::MAX);
+
+                tier_a.cmp(&tier_b).then_with(|| a.as_ref().cmp(b.as_ref()))
+            });
+        }
+
         match self.coordinator.tick(
             Some(SizedIterator::new(
-                self.backend.pending_clients.iter(),
-                self.backend.pending_clients.len(),
+                pending_clients.iter(),
+                pending_clients.len(),
             )),
             Self::get_timestamp(),
-            rand::rng().next_u64(),
+            random_seed,
         ) {
             Ok(TickResult::EpochEnd(result)) => {
                 if result {
@@ -578,6 +631,44 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    fn derive_seed_from_run_id(run_id: &str) -> u64 {
+        let digest = sha256(run_id.as_bytes());
+        u64::from_le_bytes(digest[..8].try_into().expect("sha256 output length"))
+    }
+
+    fn aligned_round_seed(&self) -> u64 {
+        // Produce a deterministic seed for the *next* round that may be started by this tick.
+        // This makes committee selection + data assignment reproducible and aligned across runs.
+        let base = self.aligned_batches_seed.to_le_bytes();
+        let epoch = self.coordinator.progress.epoch.to_le_bytes();
+
+        let (planned_step, planned_round_height) = match self.coordinator.run_state {
+            RunState::Warmup => (self.coordinator.progress.step, 0u32),
+            RunState::RoundWitness => {
+                let next_step = self.coordinator.progress.step.saturating_add(1);
+                let next_height = self
+                    .coordinator
+                    .current_round()
+                    .map(|r| r.height.saturating_add(1))
+                    .unwrap_or(0);
+                (next_step, next_height)
+            }
+            _ => (
+                self.coordinator.progress.step,
+                self.coordinator
+                    .current_round()
+                    .map(|r| r.height)
+                    .unwrap_or(0),
+            ),
+        };
+
+        let step = planned_step.to_le_bytes();
+        let height = planned_round_height.to_le_bytes();
+
+        let digest = sha256v(&[b"aligned-batches", &base, &epoch, &step, &height]);
+        u64::from_le_bytes(digest[..8].try_into().expect("sha256 output length"))
     }
 
     async fn post_state_change(&mut self, broadcast: bool) {
