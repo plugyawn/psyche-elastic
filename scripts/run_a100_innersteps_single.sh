@@ -29,6 +29,7 @@ TIER1_INNER_STEPS="${TIER1_INNER_STEPS:-4}"
 SERVER_PORT="${SERVER_PORT:-23620}"
 METRICS_BASE_PORT="${METRICS_BASE_PORT:-7110}"
 P2P_BASE_PORT="${P2P_BASE_PORT:-36120}"
+CLIENT_START_DELAY_SECS="${CLIENT_START_DELAY_SECS:-3}"
 
 WANDB_PROJECT="${WANDB_PROJECT:-psyche-a100}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
@@ -106,6 +107,7 @@ echo "[inner] run_id=${RUN_ID} total_steps=${TOTAL_STEPS}"
 echo "[inner] log_root=${LOG_ROOT}"
 echo "[inner] tier1_inner_steps=${TIER1_INNER_STEPS}"
 echo "[inner] heldout_eval_batches=${HELDOUT_EVAL_BATCHES} heldout_eval_batch_size=${HELDOUT_EVAL_BATCH_SIZE}"
+echo "[inner] client_start_delay_secs=${CLIENT_START_DELAY_SECS}"
 echo "[inner] wandb_group=${WANDB_GROUP}"
 
 server_pid=""
@@ -163,6 +165,10 @@ done
 if (( retries == 0 )); then
   echo "[inner] Timed out waiting for server port ${SERVER_PORT}." >&2
   exit 1
+fi
+
+if (( CLIENT_START_DELAY_SECS > 0 )); then
+  sleep "${CLIENT_START_DELAY_SECS}"
 fi
 
 export RUST_LOG="warn,psyche_client=info,psyche_modeling=info,psyche_centralized_client=info"
