@@ -63,18 +63,35 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   cargo build --release -p psyche-centralized-server -p psyche-centralized-client
 fi
 
-PY="${PYO3_PYTHON:-python3}"
-read -r RUN_ID TOTAL_STEPS < <("${PY}" - "${CFG_PATH}" <<'PY'
-import sys
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
-with open(sys.argv[1], "rb") as f:
-    cfg = tomllib.load(f)
-print(cfg["run_id"], cfg["config"]["total_steps"])
-PY
-)
+RUN_ID="$(
+  awk -F'=' '
+    /^run_id[[:space:]]*=/ {
+      val=$2
+      gsub(/"/, "", val)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      print val
+      exit
+    }
+  ' "${CFG_PATH}"
+)"
+
+TOTAL_STEPS="$(
+  awk -F'=' '
+    /^\[config\]$/ { in_config=1; next }
+    /^\[/ { if (in_config) exit }
+    in_config && /^total_steps[[:space:]]*=/ {
+      val=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      print val
+      exit
+    }
+  ' "${CFG_PATH}"
+)"
+
+if [[ -z "${RUN_ID}" || -z "${TOTAL_STEPS}" ]]; then
+  echo "[inner] Failed to parse run_id/total_steps from ${CFG_PATH}" >&2
+  exit 1
+fi
 
 if [[ -z "${LOG_ROOT}" ]]; then
   LOG_ROOT="${ROOT}/logs/a100_innersteps_single/${RUN_ID}/$(date -u +%Y%m%d_%H%M%S)"
@@ -125,7 +142,7 @@ server_pid=$!
 
 retries=240
 while (( retries > 0 )); do
-  if "${PY}" - <<'PY' "${SERVER_PORT}"
+  if python3 - <<'PY' "${SERVER_PORT}"
 import socket,sys
 port=int(sys.argv[1])
 s=socket.socket(); s.settimeout(0.4)
@@ -207,7 +224,7 @@ done
 has_loss_at_step() {
   local path="$1"
   local target_step="$2"
-  "${PY}" - "$path" "$target_step" <<'PY'
+  python3 - "$path" "$target_step" <<'PY'
 import sys
 path = sys.argv[1]
 target = str(int(sys.argv[2]))
