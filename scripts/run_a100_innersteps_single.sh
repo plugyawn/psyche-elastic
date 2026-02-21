@@ -25,6 +25,15 @@ IROH_RELAY="${IROH_RELAY:-disabled}"
 HELDOUT_EVAL_BATCHES="${HELDOUT_EVAL_BATCHES:-32}"
 HELDOUT_EVAL_BATCH_SIZE="${HELDOUT_EVAL_BATCH_SIZE:-16}"
 TIER1_INNER_STEPS="${TIER1_INNER_STEPS:-4}"
+MATFORMER_DISTILLATION_BETA_MAX="${MATFORMER_DISTILLATION_BETA_MAX:-0.0}"
+MATFORMER_DISTILLATION_TOP_K="${MATFORMER_DISTILLATION_TOP_K:-64}"
+MATFORMER_DISTILLATION_TEMPERATURE="${MATFORMER_DISTILLATION_TEMPERATURE:-1.0}"
+MATFORMER_DISTILLATION_START_STEP="${MATFORMER_DISTILLATION_START_STEP:-0}"
+MATFORMER_DISTILLATION_WARMUP_STEPS="${MATFORMER_DISTILLATION_WARMUP_STEPS:-100}"
+MATFORMER_DISTILLATION_COMBINE_MODE="${MATFORMER_DISTILLATION_COMBINE_MODE:-add}"
+MATFORMER_DISTILLATION_LOGITS_TO_KEEP="${MATFORMER_DISTILLATION_LOGITS_TO_KEEP:-}"
+MATFORMER_DISTILLATION_MIN_TEACHER_TOPK_MASS="${MATFORMER_DISTILLATION_MIN_TEACHER_TOPK_MASS:-}"
+MATFORMER_DISTILLATION_KD_Q_TOPK_MASS_FLOOR="${MATFORMER_DISTILLATION_KD_Q_TOPK_MASS_FLOOR:-0.05}"
 
 SERVER_PORT="${SERVER_PORT:-23620}"
 METRICS_BASE_PORT="${METRICS_BASE_PORT:-7110}"
@@ -114,6 +123,9 @@ echo "[inner] run_id=${RUN_ID} total_steps=${TOTAL_STEPS}"
 echo "[inner] log_root=${LOG_ROOT}"
 echo "[inner] tier1_inner_steps=${TIER1_INNER_STEPS}"
 echo "[inner] heldout_eval_batches=${HELDOUT_EVAL_BATCHES} heldout_eval_batch_size=${HELDOUT_EVAL_BATCH_SIZE}"
+echo "[inner] distill_beta_max=${MATFORMER_DISTILLATION_BETA_MAX} distill_top_k=${MATFORMER_DISTILLATION_TOP_K} distill_temp=${MATFORMER_DISTILLATION_TEMPERATURE}"
+echo "[inner] distill_start_step=${MATFORMER_DISTILLATION_START_STEP} distill_warmup_steps=${MATFORMER_DISTILLATION_WARMUP_STEPS} distill_combine=${MATFORMER_DISTILLATION_COMBINE_MODE}"
+echo "[inner] distill_logits_to_keep=${MATFORMER_DISTILLATION_LOGITS_TO_KEEP:-<none>} distill_min_teacher_topk_mass=${MATFORMER_DISTILLATION_MIN_TEACHER_TOPK_MASS:-<none>} distill_kd_floor=${MATFORMER_DISTILLATION_KD_Q_TOPK_MASS_FLOOR}"
 echo "[inner] client_start_delay_secs=${CLIENT_START_DELAY_SECS}"
 echo "[inner] wandb_group=${WANDB_GROUP}"
 
@@ -183,6 +195,22 @@ if [[ "${COSINE_SHADOW}" == "1" ]]; then
   export PSYCHE_DISTRO_COSINE_MIXER_SHADOW=1
 fi
 
+distill_args=(
+  --matformer-distillation-beta-max "${MATFORMER_DISTILLATION_BETA_MAX}"
+  --matformer-distillation-top-k "${MATFORMER_DISTILLATION_TOP_K}"
+  --matformer-distillation-temperature "${MATFORMER_DISTILLATION_TEMPERATURE}"
+  --matformer-distillation-start-step "${MATFORMER_DISTILLATION_START_STEP}"
+  --matformer-distillation-warmup-steps "${MATFORMER_DISTILLATION_WARMUP_STEPS}"
+  --matformer-distillation-combine-mode "${MATFORMER_DISTILLATION_COMBINE_MODE}"
+  --matformer-distillation-kd-q-topk-mass-floor "${MATFORMER_DISTILLATION_KD_Q_TOPK_MASS_FLOOR}"
+)
+if [[ -n "${MATFORMER_DISTILLATION_LOGITS_TO_KEEP}" ]]; then
+  distill_args+=(--matformer-distillation-logits-to-keep "${MATFORMER_DISTILLATION_LOGITS_TO_KEEP}")
+fi
+if [[ -n "${MATFORMER_DISTILLATION_MIN_TEACHER_TOPK_MASS}" ]]; then
+  distill_args+=(--matformer-distillation-min-teacher-topk-mass "${MATFORMER_DISTILLATION_MIN_TEACHER_TOPK_MASS}")
+fi
+
 for tier in 0 1; do
   key_int=$((18000 + tier))
   raw_key="$(printf '%064x' "${key_int}")"
@@ -219,6 +247,7 @@ for tier in 0 1; do
       --matformer-local-inner-steps "${inner_steps}" \
       --matformer-helper-fraction 0 \
       --matformer-helper-rotation-interval 16 \
+      "${distill_args[@]}" \
       --bind-p2p-port "${p2p_port}" \
       --iroh-discovery "${IROH_DISCOVERY}" \
       --iroh-relay "${IROH_RELAY}" \
