@@ -1,12 +1,12 @@
 use crate::{
-    Broadcast, BroadcastType, ClientTUIState, IntegrationTestLogMarker,
     state::{train::FinishedTrainers, types::DeserializeError},
+    Broadcast, BroadcastType, ClientTUIState, IntegrationTestLogMarker,
 };
 
 use iroh_blobs::api::Tag;
 use psyche_coordinator::{Committee, Coordinator, RunState, Witness, WitnessProof};
-use psyche_core::{MerkleRoot, MerkleTree, NodeIdentity, sha256};
-use psyche_modeling::{DistroResult, Trainer};
+use psyche_core::{sha256, MerkleRoot, MerkleTree, NodeIdentity};
+use psyche_modeling::{DistroPeerMetadata, DistroResult, Trainer};
 use psyche_network::{
     AuthenticatableIdentity, BlobTicket, Hash, P2PEndpointInfo, TransmittableDistroResult,
     TransmittableTeacherLogits,
@@ -23,19 +23,19 @@ use tokio::{
     sync::mpsc::{self},
     task::JoinHandle,
 };
-use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
+use tracing::{debug, info, trace, trace_span, warn, Instrument};
 
 use super::{
-    FinishedBroadcast, RunInitConfigAndIO,
     cooldown::{CooldownError, CooldownStep, CooldownStepMetadata},
     evals::EvalError,
     init::InitRunError,
-    round_state::RoundState,
+    round_state::{RoundState, TeacherLogitsDownloadState},
     stats::StatsLogger,
     train::{TrainError, TrainingStep, TrainingStepMetadata},
     types::PayloadState,
     warmup::{WarmupStep, WarmupStepMetadata},
     witness::{WitnessStep, WitnessStepMetadata, WitnessingError},
+    FinishedBroadcast, RunInitConfigAndIO,
 };
 
 pub struct StepStateMachine<T: NodeIdentity, A: AuthenticatableIdentity + 'static> {
@@ -502,11 +502,27 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                 }
             }
             BroadcastType::TeacherLogits(teacher_logits_result) => {
-                // Teacher logits are informational (for distillation), not verified via witnesses.
-                // Students download them and store for use in subsequent training steps.
+                // Teacher logits are informational (for distillation), but MUST be commitment-verified.
                 let ticket = teacher_logits_result.ticket.clone();
                 let hash = ticket.hash();
-                if round_state.downloads.lock().unwrap().contains_key(&hash) {
+                if round_state
+                    .teacher_logits
+                    .lock()
+                    .unwrap()
+                    .contains_key(&teacher_logits_result.batch_id)
+                {
+                    trace!(
+                        "Already have teacher logits for batch {}, ignoring",
+                        teacher_logits_result.batch_id
+                    );
+                    return Ok(ApplyMessageOutcome::Ignored);
+                }
+                if round_state
+                    .teacher_logits_downloads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&hash)
+                {
                     trace!(
                         "Already downloading teacher logits for batch {}, ignoring",
                         teacher_logits_result.batch_id
@@ -514,21 +530,17 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                     return Ok(ApplyMessageOutcome::Ignored);
                 }
 
-                // Store download state
-                let download_state = PayloadState::Downloading((
-                    from_client_id,
-                    teacher_logits_result.batch_id,
-                    ticket.clone(),
-                ));
-                round_state
-                    .downloads
-                    .lock()
-                    .unwrap()
-                    .insert(hash, download_state);
+                round_state.teacher_logits_downloads.lock().unwrap().insert(
+                    hash,
+                    TeacherLogitsDownloadState {
+                        from: from_client_id,
+                        batch_id: teacher_logits_result.batch_id,
+                        expected_commitment_hash: broadcast.commitment.data_hash,
+                    },
+                );
 
                 // Start download if from another client
-                let tag_name =
-                    format!("teacher-logits-{from_client_id}_{result_step}");
+                let tag_name = format!("teacher-logits-{from_client_id}_{result_step}");
                 if from_client_id != self.identity {
                     self.tx_request_download
                         .send((ticket, Tag::from(tag_name)))
@@ -614,13 +626,15 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
         if let Some(self_result) = self_result {
             trace!(
                 "Processing our own distro result for batch {} in step {} with hash {hash}",
-                distro_result.batch_id, distro_result.step
+                distro_result.batch_id,
+                distro_result.step
             );
             round_state.self_distro_results.push(self_result);
         } else {
             trace!(
                 "Finished download of distro result for batch {} in step {} with hash {hash}",
-                distro_result.batch_id, distro_result.step
+                distro_result.batch_id,
+                distro_result.step
             );
         }
 
@@ -646,14 +660,14 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
 
         let Some(commitment) = commitments_for_batch
             .iter()
-            .find(|comm| comm.0 == from && comm.1.1.ticket.hash() == hash)
+            .find(|comm| comm.0 == from && comm.1 .1.ticket.hash() == hash)
         else {
             info!("No commitment for payload from {}", from);
             return;
         };
 
         // TODO: verify shape of distro_results
-        let commitment = commitment.1.0;
+        let commitment = commitment.1 .0;
         let batch_ids_not_yet_trained_on = round_state.batch_ids_not_yet_trained_on.clone();
         let blooms = round_state.blooms.clone();
         let downloads = round_state.downloads.clone();
@@ -700,7 +714,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                     remaining_batch_ids.remove(&batch_id);
                     trace!(
                         "Remaining batches to download for step {}: {:?}",
-                        distro_result.step, remaining_batch_ids
+                        distro_result.step,
+                        remaining_batch_ids
                     );
                     remaining_batch_ids.is_empty()
                 } else {
@@ -720,12 +735,12 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                         return Ok((Vec::new(), distro_result.trainer_nonce));
                     }
 
-                    let mut results: Vec<Option<DistroResult>> =
-                        vec![None; parameter_names.len()];
+                    let mut results: Vec<Option<DistroResult>> = vec![None; parameter_names.len()];
+                    let peer_metadata =
+                        DistroPeerMetadata::from(&distro_result.aggregation_metadata);
 
                     for serialized in &distro_result.distro_results {
-                        let Some(&index) =
-                            parameter_index_by_name.get(&serialized.parameter_name)
+                        let Some(&index) = parameter_index_by_name.get(&serialized.parameter_name)
                         else {
                             return Err(DeserializeError::UnknownParameter(
                                 serialized.parameter_name.clone(),
@@ -737,7 +752,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
                             ));
                         }
 
-                        let result: DistroResult = serialized.try_into()?;
+                        let mut result: DistroResult = serialized.try_into()?;
+                        result.peer_metadata = Some(peer_metadata);
                         results[index] = Some(result);
                     }
 
@@ -787,25 +803,55 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
 
     /// Store received teacher logits for distillation.
     /// Students use these when training on the corresponding batch.
-    pub fn apply_teacher_logits(
-        &mut self,
-        hash: Hash,
-        teacher_logits: TransmittableTeacherLogits,
-    ) {
-        let round_state = if self.current_round.downloads.lock().unwrap().contains_key(&hash) {
+    pub fn apply_teacher_logits(&mut self, hash: Hash, teacher_logits: TransmittableTeacherLogits) {
+        let round_state = if self.current_round.step == teacher_logits.step {
             &mut self.current_round
-        } else if self
-            .previous_round
-            .downloads
-            .lock()
-            .unwrap()
-            .contains_key(&hash)
-        {
+        } else if self.previous_round.step == teacher_logits.step {
             &mut self.previous_round
         } else {
-            warn!("Unknown teacher logits download {}", hash);
+            warn!(
+                "Unknown teacher logits step {} (current step {}, previous step {}), hash {}",
+                teacher_logits.step, self.current_round.step, self.previous_round.step, hash
+            );
             return;
         };
+
+        let expected = {
+            let mut downloads = round_state.teacher_logits_downloads.lock().unwrap();
+            match downloads.remove(&hash) {
+                Some(state) => {
+                    if state.batch_id != teacher_logits.batch_id {
+                        warn!(
+                            "Teacher logits batch mismatch for hash {}: announced batch {}, got batch {}",
+                            hash, state.batch_id, teacher_logits.batch_id
+                        );
+                        return;
+                    }
+                    state.expected_commitment_hash
+                }
+                None => {
+                    warn!(
+                        "Teacher logits download {} had no tracked commitment; dropping",
+                        hash
+                    );
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = teacher_logits.logits.validate() {
+            warn!("Invalid teacher logits payload (hash {}): {}", hash, e);
+            return;
+        }
+
+        let actual = teacher_logits.compute_hash();
+        if actual != expected {
+            warn!(
+                "Teacher logits failed commitment hash verification (hash {} batch {} step {})",
+                hash, teacher_logits.batch_id, teacher_logits.step
+            );
+            return;
+        }
 
         trace!(
             "Storing teacher logits for batch {} step {} (hash {})",
@@ -815,7 +861,10 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
         );
         round_state
             .teacher_logits
-            .insert(teacher_logits.batch_id.clone(), teacher_logits);
+            .lock()
+            .unwrap()
+            .entry(teacher_logits.batch_id)
+            .or_insert_with(|| Arc::new(teacher_logits));
     }
 
     async fn apply_state(&mut self, state: Coordinator<T>) -> Result<(), StepError> {
@@ -987,7 +1036,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> StepStateMachine<T, 
             // cooldown is done, we consider waiting for members and warmup to be basically the same
             (ActiveStep::Cooldown(cooldown), RunState::WaitingForMembers)
             | (ActiveStep::Cooldown(cooldown), RunState::Warmup)
-            | (ActiveStep::Cooldown(cooldown), RunState::Paused) => {
+            | (ActiveStep::Cooldown(cooldown), RunState::Paused)
+            | (ActiveStep::Cooldown(cooldown), RunState::Finished) => {
                 let (trainers, upload_handle) = cooldown.finish().await?;
                 if let Some(handle) = upload_handle {
                     self.pending_upload_handles.push(handle);
@@ -1051,7 +1101,10 @@ impl ActiveStep {
             }
             (
                 ActiveStep::Warmup(..),
-                RunState::Warmup | RunState::WaitingForMembers | RunState::Paused,
+                RunState::Warmup
+                | RunState::WaitingForMembers
+                | RunState::Paused
+                | RunState::Finished,
             ) => true,
             (ActiveStep::Cooldown(..), RunState::Cooldown) => true,
             (ActiveStep::Training(..), RunState::RoundTrain) => true,

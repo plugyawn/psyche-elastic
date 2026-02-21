@@ -1,13 +1,17 @@
-use crate::HubUploadInfo;
+use crate::{HubUploadInfo, IntegrationTestLogMarker};
 
 use psyche_coordinator::{
-    Coordinator,
     model::{self, HubRepo},
+    Coordinator,
 };
-use psyche_core::{FixedString, NodeIdentity};
-use psyche_data_provider::{UploadModelError, upload_model_repo_async};
+use psyche_core::{BatchId, ClosedInterval, FixedString, NodeIdentity};
+use psyche_data_provider::{
+    upload_model_repo_async, LengthKnownDataProvider, LocalDataProvider, PreprocessedDataProvider,
+    TokenizedDataProvider, UploadModelError,
+};
 use psyche_modeling::{
-    SaveSafetensorsError, Trainer, TrainerThreadCommunicationError, save_tensors_into_safetensors,
+    save_tensors_into_safetensors, Batch, BatchData, BatchDataCPU, CausalLM, SaveSafetensorsError,
+    Trainer, TrainerThreadCommunicationError,
 };
 use std::{
     cmp::Reverse,
@@ -18,15 +22,256 @@ use std::{
 use tch::Tensor;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
     task::JoinHandle,
 };
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{error, info, info_span, warn, Instrument};
+use wandb::LogData;
 
 use super::{
-    CheckpointConfig,
     evals::{ModelTaskRunner, RunningEvals},
+    CheckpointConfig,
 };
+
+fn want_log_suffix_gate_stats() -> bool {
+    match std::env::var("PSYCHE_LOG_SUFFIX_GATE_STATS") {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => false,
+    }
+}
+
+fn log_suffix_gate_stats(extracted: &HashMap<String, Tensor>) {
+    if !want_log_suffix_gate_stats() {
+        return;
+    }
+
+    let mut logits: Vec<f64> = Vec::new();
+    for (name, t) in extracted {
+        if name.ends_with(".matformer_suffix_gate_logit") {
+            // Extracted variables are unsharded and on CPU.
+            logits.push(t.double_value(&[]));
+        }
+    }
+    if logits.is_empty() {
+        return;
+    }
+
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    let alphas: Vec<f64> = logits.iter().copied().map(sigmoid).collect();
+    let n = logits.len() as f64;
+    let logit_mean = logits.iter().sum::<f64>() / n;
+    let alpha_mean = alphas.iter().sum::<f64>() / n;
+    let logit_min = logits.iter().copied().fold(f64::INFINITY, |a, b| a.min(b));
+    let logit_max = logits
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, |a, b| a.max(b));
+    let alpha_min = alphas.iter().copied().fold(f64::INFINITY, |a, b| a.min(b));
+    let alpha_max = alphas
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, |a, b| a.max(b));
+
+    info!(
+        suffix_gate_params = logits.len(),
+        suffix_gate_logit_min = logit_min,
+        suffix_gate_logit_mean = logit_mean,
+        suffix_gate_logit_max = logit_max,
+        suffix_gate_alpha_min = alpha_min,
+        suffix_gate_alpha_mean = alpha_mean,
+        suffix_gate_alpha_max = alpha_max,
+        "MatFormer suffix-gate (learnable) stats (from extracted model)"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HeldoutEvalConfig {
+    pub batches: usize,
+    pub batch_size: usize,
+}
+
+pub enum HeldoutEvalDataProvider {
+    Local(LocalDataProvider),
+    Preprocessed(PreprocessedDataProvider),
+}
+
+pub struct HeldoutEvaluator {
+    provider: HeldoutEvalDataProvider,
+    config: HeldoutEvalConfig,
+    next_index: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeldoutEvalSummary {
+    batches: usize,
+    batch_size: usize,
+    mean_loss: f32,
+    min_loss: f32,
+    max_loss: f32,
+}
+
+#[derive(Debug, Error)]
+pub enum HeldoutEvalError {
+    #[error("heldout eval is disabled (batches={batches}, batch_size={batch_size})")]
+    Disabled { batches: usize, batch_size: usize },
+
+    #[error("heldout data provider has no sequences")]
+    EmptyData,
+
+    #[error("failed to read heldout data for {batch_id}: {source:#}")]
+    GetSamples {
+        batch_id: BatchId,
+        #[source]
+        source: anyhow::Error,
+    },
+
+    #[error("model forward did not produce a loss value")]
+    MissingLoss,
+
+    #[error("non-finite heldout loss encountered")]
+    NonFiniteLoss,
+}
+
+impl HeldoutEvaluator {
+    pub fn new_local(provider: LocalDataProvider, config: HeldoutEvalConfig) -> Self {
+        Self {
+            provider: HeldoutEvalDataProvider::Local(provider),
+            config,
+            next_index: 0,
+        }
+    }
+
+    pub fn new_preprocessed(provider: PreprocessedDataProvider, config: HeldoutEvalConfig) -> Self {
+        Self {
+            provider: HeldoutEvalDataProvider::Preprocessed(provider),
+            config,
+            next_index: 0,
+        }
+    }
+
+    fn total_sequences(&self) -> usize {
+        match &self.provider {
+            HeldoutEvalDataProvider::Local(provider) => provider.num_sequences(),
+            HeldoutEvalDataProvider::Preprocessed(provider) => provider.num_sequences(),
+        }
+    }
+
+    async fn next_batch_cpu(&mut self) -> Result<(BatchId, Vec<BatchDataCPU>), HeldoutEvalError> {
+        let total = self.total_sequences();
+        if total == 0 {
+            return Err(HeldoutEvalError::EmptyData);
+        }
+
+        let requested_batch_size = self.config.batch_size.max(1);
+        let batch_size = requested_batch_size.min(total) as u64;
+        let total = total as u64;
+
+        let batch_id = match &self.provider {
+            HeldoutEvalDataProvider::Local(_) => {
+                if self.next_index + batch_size > total {
+                    self.next_index = 0;
+                }
+                let start = self.next_index;
+                let end = start + batch_size - 1;
+                self.next_index = end + 1;
+                BatchId(ClosedInterval::new(start, end))
+            }
+            HeldoutEvalDataProvider::Preprocessed(_) => {
+                let start = self.next_index % total;
+                let end = start + batch_size - 1;
+                self.next_index = (start + batch_size) % total;
+                BatchId(ClosedInterval::new(start, end))
+            }
+        };
+
+        let samples = match &mut self.provider {
+            HeldoutEvalDataProvider::Local(provider) => provider
+                .get_samples(batch_id)
+                .await
+                .map_err(|source| HeldoutEvalError::GetSamples { batch_id, source })?,
+            HeldoutEvalDataProvider::Preprocessed(provider) => provider
+                .get_samples(batch_id)
+                .await
+                .map_err(|source| HeldoutEvalError::GetSamples { batch_id, source })?,
+        };
+
+        let cpu = samples
+            .into_iter()
+            .map(|sample| BatchDataCPU {
+                input_ids: sample.input_ids,
+                labels: sample.labels,
+                position_ids: sample.position_ids,
+                sequence_lengths: sample.sequence_lengths,
+            })
+            .collect();
+
+        Ok((batch_id, cpu))
+    }
+
+    async fn evaluate(
+        &mut self,
+        trainer: &Trainer,
+    ) -> Result<HeldoutEvalSummary, HeldoutEvalError> {
+        if self.config.batches == 0 || self.config.batch_size == 0 {
+            return Err(HeldoutEvalError::Disabled {
+                batches: self.config.batches,
+                batch_size: self.config.batch_size,
+            });
+        }
+
+        let mut losses = Vec::with_capacity(self.config.batches);
+        for _ in 0..self.config.batches {
+            let (batch_id, cpu) = self.next_batch_cpu().await?;
+            let batch = Batch {
+                id: batch_id,
+                data: BatchData::CPU(cpu),
+            }
+            .gpu(trainer.device());
+            let BatchData::GPU(gpu) = batch.data else {
+                unreachable!("Batch::gpu always returns GPU data");
+            };
+
+            let labels_fallback = if gpu.labels.is_none() {
+                Some(gpu.input_ids.shallow_clone())
+            } else {
+                None
+            };
+            let labels = gpu.labels.as_ref().or(labels_fallback.as_ref());
+
+            let (_, loss) = trainer.forward(
+                &gpu.input_ids,
+                labels,
+                gpu.position_ids.as_ref(),
+                gpu.sequence_lengths.as_ref(),
+                None,
+                None,
+            );
+            let Some(loss) = loss else {
+                return Err(HeldoutEvalError::MissingLoss);
+            };
+            let loss_value = loss.double_value(&[]) as f32;
+            if !loss_value.is_finite() {
+                return Err(HeldoutEvalError::NonFiniteLoss);
+            }
+            losses.push(loss_value);
+        }
+
+        let mean_loss = losses.iter().copied().sum::<f32>() / losses.len() as f32;
+        let min_loss = losses.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_loss = losses.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        Ok(HeldoutEvalSummary {
+            batches: self.config.batches,
+            batch_size: self.config.batch_size,
+            mean_loss,
+            min_loss,
+            max_loss,
+        })
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum CooldownError {
@@ -55,6 +300,8 @@ pub struct CooldownStepMetadata {
     checkpoint_info: Option<CheckpointConfig>,
     checkpoint_extra_files: Vec<PathBuf>,
     matformer_info: MatformerCheckpointInfo,
+    heldout_evaluator: Option<Arc<Mutex<HeldoutEvaluator>>>,
+    wandb_run: Option<Arc<wandb::Run>>,
 
     model_task_runner: ModelTaskRunner,
     // use a heap here as a best-effort attempt to ensure we get rid of the lowest step number dir even if we spawn multiple tasks
@@ -73,6 +320,8 @@ impl CooldownStepMetadata {
         checkpoint_info: Option<CheckpointConfig>,
         checkpoint_extra_files: Vec<PathBuf>,
         matformer_info: MatformerCheckpointInfo,
+        heldout_evaluator: Option<Arc<Mutex<HeldoutEvaluator>>>,
+        wandb_run: Option<Arc<wandb::Run>>,
         model_task_runner: ModelTaskRunner,
     ) -> Self {
         Self {
@@ -81,6 +330,8 @@ impl CooldownStepMetadata {
             checkpoint_info,
             checkpoint_extra_files,
             matformer_info,
+            heldout_evaluator,
+            wandb_run,
             model_task_runner,
             delete_queue: Arc::new(Mutex::new(BinaryHeap::new())),
         }
@@ -160,6 +411,8 @@ impl CooldownStepMetadata {
         let checkpoint_extra_files = self.checkpoint_extra_files.clone();
         let checkpoint_info = self.checkpoint_info.clone();
         let matformer_info = self.matformer_info;
+        let heldout_evaluator = self.heldout_evaluator.clone();
+        let wandb_run = self.wandb_run.clone();
         let tx_checkpoint = self.tx_checkpoint.clone();
         let tx_model = self.tx_model.clone();
         let model_task_runner = self.model_task_runner.clone();
@@ -167,6 +420,50 @@ impl CooldownStepMetadata {
 
         let checkpointing_and_evals: CheckpointAndEvalsHandle = tokio::task::spawn(
             async move {
+                if let Some(heldout_evaluator) = heldout_evaluator {
+                    let mut evaluator = heldout_evaluator.lock().await;
+                    match evaluator.evaluate(&trainer).await {
+                        Ok(summary) => {
+                            info!(
+                                integration_test_log_marker = %IntegrationTestLogMarker::HeldoutEval,
+                                step = step,
+                                matformer_tier = matformer_info.effective_tier,
+                                heldout_eval_batches = summary.batches,
+                                heldout_eval_batch_size = summary.batch_size,
+                                heldout_loss = summary.mean_loss,
+                                heldout_perplexity = summary.mean_loss.exp(),
+                                heldout_loss_min = summary.min_loss,
+                                heldout_loss_max = summary.max_loss,
+                                "heldout_eval",
+                            );
+
+                            if let Some(run) = wandb_run.clone() {
+                                let mut val_log = LogData::new();
+                                // Keep validation points on human-friendly 1-based step indices
+                                // so epoch_time=1000 yields points at 1000, 2000, ...
+                                val_log.insert("_step", (step as u64) + 1);
+                                val_log.insert("val/heldout_loss", summary.mean_loss);
+                                val_log.insert("val/heldout_perplexity", summary.mean_loss.exp());
+                                val_log.insert("val/heldout_loss_min", summary.min_loss);
+                                val_log.insert("val/heldout_loss_max", summary.max_loss);
+                                val_log.insert("val/heldout_eval_batches", summary.batches as u64);
+                                val_log.insert(
+                                    "val/heldout_eval_batch_size",
+                                    summary.batch_size as u64,
+                                );
+                                val_log.insert(
+                                    "val/matformer_tier_effective",
+                                    matformer_info.effective_tier as u64,
+                                );
+                                run.log(val_log).await;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(step = step, "Held-out eval failed: {err:#}");
+                        }
+                    }
+                }
+
                 info!("Extracting full model...");
                 let (variables, trainer) =
                     tokio::task::spawn_blocking::<_, Result<_, CheckpointError>>(|| {
@@ -176,6 +473,8 @@ impl CooldownStepMetadata {
                     })
                     .await
                     .map_err(|_| CheckpointError::ExtractThreadCrashed)??;
+
+                log_suffix_gate_stats(&variables);
 
                 let variables_clone: HashMap<String, Tensor> = variables
                     .iter()
@@ -224,9 +523,8 @@ impl CooldownStepMetadata {
                                 .map_err(CheckpointError::ParseConfigJson)?;
 
                             if let Some(obj) = config.as_object_mut() {
-                                let intermediate_size = obj
-                                    .get("intermediate_size")
-                                    .and_then(|v| v.as_u64());
+                                let intermediate_size =
+                                    obj.get("intermediate_size").and_then(|v| v.as_u64());
                                 let base_size = matformer_info
                                     .base_intermediate_size
                                     .or_else(|| {
@@ -237,7 +535,9 @@ impl CooldownStepMetadata {
 
                                 let actual_tier = match (base_size, intermediate_size) {
                                     (Some(base), Some(current))
-                                        if current > 0 && base >= current && base % current == 0 =>
+                                        if current > 0
+                                            && base >= current
+                                            && base % current == 0 =>
                                     {
                                         let ratio = base / current;
                                         if ratio.is_power_of_two() {

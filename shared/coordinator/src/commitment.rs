@@ -1,4 +1,4 @@
-use anchor_lang::{AnchorDeserialize, AnchorSerialize, prelude::borsh};
+use anchor_lang::{prelude::borsh, AnchorDeserialize, AnchorSerialize};
 use bytemuck::Zeroable;
 use serde::{Deserialize, Deserializer, Serialize};
 

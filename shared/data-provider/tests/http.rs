@@ -1,8 +1,8 @@
 use anyhow::Result;
 use psyche_core::{BatchId, Shuffle, TokenSize};
 use psyche_data_provider::{
-    TokenizedDataProvider,
     http::{FileURLs, HttpDataProvider},
+    TokenizedDataProvider,
 };
 use std::io::Write;
 use std::net::SocketAddr;

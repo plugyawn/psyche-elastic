@@ -1,9 +1,9 @@
-use anyhow::{Error, Result, anyhow};
+use anyhow::{anyhow, Error, Result};
 use clap::{Parser, ValueEnum};
 use psyche_data_provider::download_model_repo_sync;
 use psyche_modeling::{
-    AttentionImplementation, CausalLM, CommunicatorId, Devices, LogitsProcessor, Sampling,
-    TokenOutputStream, auto_model_for_causal_lm_from_pretrained, auto_tokenizer,
+    auto_model_for_causal_lm_from_pretrained, auto_tokenizer, AttentionImplementation, CausalLM,
+    CommunicatorId, Devices, LogitsProcessor, Sampling, TokenOutputStream,
 };
 use std::{
     io::Write,

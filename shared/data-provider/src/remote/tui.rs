@@ -8,7 +8,7 @@ use psyche_tui::ratatui::{
 };
 use psyche_watcher::Backend;
 
-use crate::{TokenizedDataProvider, traits::LengthKnownDataProvider};
+use crate::{traits::LengthKnownDataProvider, TokenizedDataProvider};
 
 use super::DataProviderTcpServer;
 

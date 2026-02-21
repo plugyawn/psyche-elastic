@@ -1,17 +1,17 @@
 use crate::LengthKnownDataProvider;
 use crate::{
-    Dataset, Field, Row, Split, TokenizedData, TokenizedDataProvider,
-    file_extensions::PARQUET_EXTENSION,
+    file_extensions::PARQUET_EXTENSION, Dataset, Field, Row, Split, TokenizedData,
+    TokenizedDataProvider,
 };
 use parquet::file::reader::FileReader;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use parquet::record::RowAccessor;
 use psyche_core::{BatchId, Shuffle};
 use rand::seq::SliceRandom;
-use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 fn field_to_int(field: &Field) -> i32 {
     match field {

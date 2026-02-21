@@ -4,9 +4,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use psyche_core::RunningAverage;
 use psyche_data_provider::download_model_repo_sync;
 use psyche_eval::{
-    ALL_TASK_NAMES, EvalTaskOptions, Task, progress_bar_template_with_task, tasktype_from_name,
+    progress_bar_template_with_task, tasktype_from_name, EvalTaskOptions, Task, ALL_TASK_NAMES,
 };
-use psyche_modeling::{CausalLM, auto_model_for_causal_lm_from_pretrained, auto_tokenizer};
+use psyche_modeling::{auto_model_for_causal_lm_from_pretrained, auto_tokenizer, CausalLM};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

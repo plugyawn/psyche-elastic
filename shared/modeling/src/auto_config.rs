@@ -1,6 +1,7 @@
 use crate::{
-    DeepseekConfig, Devices, LlamaConfig, NanoGPTConfig, LoadSafetensorsError, parallelism::tensor_shard,
-    safetensor_utils::load_safetensors_into_variables,
+    parallelism::tensor_shard,
+    safetensor_utils::{is_allowed_missing_checkpoint_variable, load_safetensors_into_variables},
+    DeepseekConfig, Devices, LlamaConfig, LoadSafetensorsError, NanoGPTConfig,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +29,9 @@ pub enum ModelLoadError {
     #[error("this model uses tied embeddings, which aren't supported.")]
     ModelHasTiedEmbeddings,
 
-    #[error("Directly setting attention implementation to FlashAttention-2 is unsupported for now")]
+    #[error(
+        "Directly setting attention implementation to FlashAttention-2 is unsupported for now"
+    )]
     ModelExplicitlyUsesFA2,
 
     #[error("Failed to initialize CNCCL for tensor parallelism {0}")]
@@ -111,7 +114,14 @@ impl<T: ModelConfig + serde::de::DeserializeOwned> PretrainedSource<T> {
                 let mut variables = variables.variables_.lock().unwrap();
                 let shards = variables.shards.clone();
                 for (name, var) in variables.named_variables.iter_mut() {
-                    let tensor = parameters.get(name).unwrap();
+                    let Some(tensor) = parameters.get(name) else {
+                        // Backwards-compatible allowlist for newly-added small MatFormer params.
+                        // Leave the initialized default if missing.
+                        if is_allowed_missing_checkpoint_variable(name) {
+                            continue;
+                        }
+                        continue;
+                    };
                     if let Some(shard) = shards.get(name) {
                         let tensor = tensor_shard(tensor, shard);
                         var.f_copy_(&tensor)?;
@@ -122,8 +132,14 @@ impl<T: ModelConfig + serde::de::DeserializeOwned> PretrainedSource<T> {
                     unmatched.remove(name);
                 }
                 if !unmatched.is_empty() {
-                    return Err(ModelLoadError::LoadTensorError(unmatched));
-                };
+                    let real_missing: HashSet<String> = unmatched
+                        .into_iter()
+                        .filter(|name| !is_allowed_missing_checkpoint_variable(name))
+                        .collect();
+                    if !real_missing.is_empty() {
+                        return Err(ModelLoadError::LoadTensorError(real_missing));
+                    }
+                }
             }
         };
         Ok(())

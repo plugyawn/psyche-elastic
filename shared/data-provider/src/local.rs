@@ -1,15 +1,15 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use psyche_core::{BatchId, ClosedInterval, Shuffle, TokenSize};
 use rand::seq::SliceRandom;
-use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use std::fs;
 use tracing::{debug, info, warn};
 
 use crate::{
-    TokenizedData,
     file_extensions::DATA_FILE_EXTENSIONS,
     traits::{LengthKnownDataProvider, TokenizedDataProvider},
+    TokenizedData,
 };
 
 /// Magic number for modded-nanogpt binary format: 20240520
@@ -23,10 +23,14 @@ pub enum DataFormat {
     /// Raw binary tokens (no header)
     Raw,
     /// modded-nanogpt format with 1024-byte header
-    ModdedNanogpt {
-        version: u32,
-        token_count: u32,
-    },
+    ModdedNanogpt { version: u32, token_count: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDataSplit {
+    All,
+    Train,
+    Validation,
 }
 
 impl DataFormat {
@@ -57,6 +61,16 @@ impl DataFormat {
 
 fn is_truthy_env_bool(value: &str) -> bool {
     matches!(value.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+fn is_validation_filename(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|x| x.to_str())
+        .map(|name| {
+            let name = name.to_ascii_lowercase();
+            name.contains("val") || name.contains("validation")
+        })
+        .unwrap_or(false)
 }
 
 fn mmap_file(p: &std::path::PathBuf) -> Result<Box<dyn AsRef<[u8]> + Send>> {
@@ -118,6 +132,22 @@ impl LocalDataProvider {
         num_tokens_per_sequence: usize, // num tokens per sequence
         shuffle: Shuffle,
     ) -> Result<Self> {
+        Self::new_from_directory_with_split(
+            dir,
+            token_size_in_bytes,
+            num_tokens_per_sequence,
+            shuffle,
+            LocalDataSplit::All,
+        )
+    }
+
+    pub fn new_from_directory_with_split(
+        dir: impl AsRef<std::path::Path>,
+        token_size_in_bytes: TokenSize,
+        num_tokens_per_sequence: usize, // num tokens per sequence
+        shuffle: Shuffle,
+        split: LocalDataSplit,
+    ) -> Result<Self> {
         let dir = std::fs::canonicalize(&dir)
             .map_err(|e| anyhow!("Failed to open data directory {:?}: {e}", dir.as_ref()))?;
 
@@ -149,13 +179,25 @@ impl LocalDataProvider {
             }
         }
         bin_files.sort();
+
+        if split != LocalDataSplit::All {
+            bin_files.retain(|path| {
+                let is_val = is_validation_filename(path);
+                match split {
+                    LocalDataSplit::All => true,
+                    LocalDataSplit::Train => !is_val,
+                    LocalDataSplit::Validation => is_val,
+                }
+            });
+        }
+
         let data_files = bin_files
             .iter()
             .map(mmap_file)
             .collect::<Result<Vec<_>>>()?;
 
         if data_files.is_empty() {
-            bail!("No training data files in directory {:?}", dir);
+            bail!("No {:?} data files in directory {:?}", split, dir);
         }
 
         info!(
@@ -181,7 +223,10 @@ impl LocalDataProvider {
                     DataFormat::Raw => {
                         debug!("File {:?}: Raw binary format (no header)", path.file_name());
                     }
-                    DataFormat::ModdedNanogpt { version, token_count } => {
+                    DataFormat::ModdedNanogpt {
+                        version,
+                        token_count,
+                    } => {
                         info!(
                             "File {:?}: modded-nanogpt format (version={}, tokens={})",
                             path.file_name(),
@@ -218,27 +263,28 @@ impl LocalDataProvider {
                     // Effective data length after skipping header
                     let data_len = file_len.saturating_sub(header_offset);
 
-                    let pointers: Vec<SequencePointer> = match data_len.checked_sub(min_len_in_bytes) {
-                        Some(max_exclusive) => (0..=max_exclusive)
-                            .step_by(seq_len_in_bytes)
-                            .map(move |offset| SequencePointer {
-                                file_index,
-                                // byte_offset is relative to start of token data (after header)
-                                byte_offset: header_offset + offset,
-                            })
-                            .collect(),
-                        None => {
-                            warn!(
-                                file_index,
-                                file_len,
-                                header_offset,
-                                data_len,
-                                min_len_in_bytes,
-                                "Data file too small for seq_len; skipping"
-                            );
-                            Vec::new()
-                        }
-                    };
+                    let pointers: Vec<SequencePointer> =
+                        match data_len.checked_sub(min_len_in_bytes) {
+                            Some(max_exclusive) => (0..=max_exclusive)
+                                .step_by(seq_len_in_bytes)
+                                .map(move |offset| SequencePointer {
+                                    file_index,
+                                    // byte_offset is relative to start of token data (after header)
+                                    byte_offset: header_offset + offset,
+                                })
+                                .collect(),
+                            None => {
+                                warn!(
+                                    file_index,
+                                    file_len,
+                                    header_offset,
+                                    data_len,
+                                    min_len_in_bytes,
+                                    "Data file too small for seq_len; skipping"
+                                );
+                                Vec::new()
+                            }
+                        };
                     pointers.into_iter()
                 })
                 .collect();

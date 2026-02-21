@@ -69,7 +69,11 @@ fn print_comparison(comparison: &MetricsComparison) {
     } else {
         "✗ FAILED"
     };
-    let color = if comparison.passed { "\x1b[32m" } else { "\x1b[31m" };
+    let color = if comparison.passed {
+        "\x1b[32m"
+    } else {
+        "\x1b[31m"
+    };
     println!(
         "║ Status:                   {}{:>30}\x1b[0m ║",
         color, status
@@ -96,7 +100,11 @@ fn main() -> Result<()> {
         anyhow::bail!("Current metrics file is empty");
     }
 
-    println!("Baseline: {} steps from {:?}", baseline.len(), args.baseline);
+    println!(
+        "Baseline: {} steps from {:?}",
+        baseline.len(),
+        args.baseline
+    );
     println!("Current:  {} steps from {:?}", current.len(), args.current);
     println!();
 

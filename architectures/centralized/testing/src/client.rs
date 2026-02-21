@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use anyhow::{Error, Result};
-use psyche_centralized_client::app::App as ClientApp;
 use psyche_centralized_client::app::build_app as build_client_app;
+use psyche_centralized_client::app::App as ClientApp;
 use psyche_centralized_shared::ClientId;
-use psyche_client::NC;
 use psyche_client::RunInitConfig;
+use psyche_client::NC;
 use psyche_network::allowlist;
 use tokio::select;
 use tokio::task::JoinHandle;

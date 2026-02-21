@@ -1,6 +1,6 @@
 use crate::{
     AttentionImplementation, CausalLM, CommunicatorId, DeepseekForCausalLM, LlamaForCausalLM,
-    NanoGPTForCausalLM, ModelLoadError, PretrainedSource,
+    ModelLoadError, NanoGPTForCausalLM, PretrainedSource,
 };
 
 use std::path::PathBuf;

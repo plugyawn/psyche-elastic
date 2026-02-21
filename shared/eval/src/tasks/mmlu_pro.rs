@@ -7,8 +7,9 @@
     MMLU Pro: {"acc": 0.32646278, "acc_norm": 0.32646278}
 */
 use crate::{
-    ASCII_UPPERCASE, TaskType, load_dataset,
+    load_dataset,
     traits::{Document, GenerateUntilTask},
+    TaskType, ASCII_UPPERCASE,
 };
 use anyhow::Result;
 use psyche_data_provider::{Dataset, Row, RowAccessor, Split};

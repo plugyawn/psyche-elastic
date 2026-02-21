@@ -1,12 +1,12 @@
 use crate::{
-    Communicator,
     parallelism::{tensor_shard, unsharded_tensor_size},
+    Communicator,
 };
 
 use std::{iter::Iterator, sync::Arc};
 use tch::{
-    Tensor,
     nn::{Shard, VarStore},
+    Tensor,
 };
 
 #[cfg(feature = "parallelism")]

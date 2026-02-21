@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use psyche_coordinator::{Coordinator, RunState, model::Model};
+use psyche_coordinator::{model::Model, Coordinator, RunState};
 use psyche_core::NodeIdentity;
 use psyche_tui::ratatui::{
     buffer::Buffer,

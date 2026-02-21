@@ -1,12 +1,12 @@
 use crate::traits::{Document, GenerateUntilTask, LogLikelihoodTask};
 use crate::{
-    ASCII_UPPERCASE, ArcChallenge, ArcEasy, BoolQ, Hellaswag, MMLU, MMLUCF, MMLUPro, OpenbookQA,
+    ArcChallenge, ArcEasy, BoolQ, Hellaswag, MMLUPro, OpenbookQA, ASCII_UPPERCASE, MMLU, MMLUCF,
     PIQA,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use psyche_core::RunningAverage;
 use psyche_modeling::{CausalLM, LogitsProcessor, Sampling};
-use rand::{SeedableRng, seq::SliceRandom};
+use rand::{seq::SliceRandom, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use regex::Regex;
 use std::sync::RwLock;

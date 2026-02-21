@@ -7,8 +7,8 @@ use clap::{ArgAction, Parser};
 use psyche_centralized_shared::ClientId;
 use psyche_coordinator::Coordinator;
 use psyche_tui::{
-    LogOutput, ServiceInfo,
     logging::{MetricsDestination, OpenTelemetry, RemoteLogsDestination, TraceDestination},
+    LogOutput, ServiceInfo,
 };
 use std::{
     path::{Path, PathBuf},
@@ -100,6 +100,19 @@ struct RunArgs {
         require_equals = false
     )]
     withdraw_on_disconnect: bool,
+
+    /// Make per-round randomness reproducible and batch assignment stable across runs.
+    ///
+    /// Intended for experiment/debug runs where you want step-by-step comparisons to be
+    /// on the same underlying data shards (e.g. baseline vs. new objective).
+    #[clap(long, env, default_value_t = false)]
+    aligned_batches: bool,
+
+    /// Optional base seed for `--aligned-batches`.
+    ///
+    /// If omitted, the seed is derived from the coordinator `run_id`.
+    #[clap(long, env)]
+    aligned_batches_seed: Option<u64>,
 
     /// An auth header string for an opentelemetry endpoint. Used for both logging and metrics.
     #[clap(long, env)]
@@ -227,6 +240,8 @@ async fn main() -> Result<()> {
                         run_args.save_state_dir,
                         run_args.init_warmup_time,
                         run_args.withdraw_on_disconnect,
+                        run_args.aligned_batches,
+                        run_args.aligned_batches_seed,
                     )
                     .await?
                     .run()

@@ -24,8 +24,8 @@
 //! - "Shampoo: Preconditioned Stochastic Tensor Optimization" (related work)
 
 use crate::{
-    CausalLM,
     kernels::{CpuOrthogonalize, Orthogonalize},
+    CausalLM,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -374,7 +374,7 @@ impl std::fmt::Debug for Muon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CausalLM, EosToks, StableVarStoreIterator, StableVariableIterator, Communicator};
+    use crate::{CausalLM, Communicator, EosToks, StableVarStoreIterator, StableVariableIterator};
     use std::sync::Arc;
     use tch::nn::{self, Module, VarStore};
 
@@ -393,9 +393,15 @@ mod tests {
 
         // Test pattern matching
         assert_eq!(muon.get_param_group("model.embed_tokens.weight"), 0); // embed
-        assert_eq!(muon.get_param_group("model.layers.0.input_layernorm.weight"), 1); // norm
+        assert_eq!(
+            muon.get_param_group("model.layers.0.input_layernorm.weight"),
+            1
+        ); // norm
         assert_eq!(muon.get_param_group("lm_head.weight"), 2); // lm_head
-        assert_eq!(muon.get_param_group("model.layers.0.mlp.gate_proj.weight"), 4); // catch-all
+        assert_eq!(
+            muon.get_param_group("model.layers.0.mlp.gate_proj.weight"),
+            4
+        ); // catch-all
     }
 
     // ==================== Training Convergence Test ====================
@@ -450,11 +456,31 @@ mod tests {
 
             Self {
                 ln1: nn::layer_norm(vs / "ln1", vec![hidden_size], ln_config),
-                attn_qkv: nn::linear(vs / "attn_qkv", hidden_size, 3 * hidden_size, Default::default()),
-                attn_out: nn::linear(vs / "attn_out", hidden_size, hidden_size, Default::default()),
+                attn_qkv: nn::linear(
+                    vs / "attn_qkv",
+                    hidden_size,
+                    3 * hidden_size,
+                    Default::default(),
+                ),
+                attn_out: nn::linear(
+                    vs / "attn_out",
+                    hidden_size,
+                    hidden_size,
+                    Default::default(),
+                ),
                 ln2: nn::layer_norm(vs / "ln2", vec![hidden_size], ln_config),
-                mlp_up: nn::linear(vs / "mlp_up", hidden_size, intermediate_size, Default::default()),
-                mlp_down: nn::linear(vs / "mlp_down", intermediate_size, hidden_size, Default::default()),
+                mlp_up: nn::linear(
+                    vs / "mlp_up",
+                    hidden_size,
+                    intermediate_size,
+                    Default::default(),
+                ),
+                mlp_down: nn::linear(
+                    vs / "mlp_down",
+                    intermediate_size,
+                    hidden_size,
+                    Default::default(),
+                ),
                 num_heads,
                 head_dim,
             }
@@ -524,7 +550,12 @@ mod tests {
 
             let ln_config = nn::LayerNormConfig::default();
             let ln_f = nn::layer_norm(&model_path / "norm", vec![config.hidden_size], ln_config);
-            let lm_head = nn::linear(&vs / "lm_head", config.hidden_size, config.vocab_size, Default::default());
+            let lm_head = nn::linear(
+                &vs / "lm_head",
+                config.hidden_size,
+                config.vocab_size,
+                Default::default(),
+            );
 
             Self {
                 var_store,

@@ -1,26 +1,26 @@
 use crate::{
-    Broadcast, BroadcastType, ClientTUIState, Finished, IntegrationTestLogMarker, NC,
-    RunInitConfig, RunInitConfigAndIO, TeacherLogitsResult, TrainingResult,
     state::{ApplyMessageOutcome, DistroBroadcastAndPayload, FinishedBroadcast, RunManager},
+    Broadcast, BroadcastType, ClientTUIState, Finished, IntegrationTestLogMarker, RunInitConfig,
+    RunInitConfigAndIO, TeacherLogitsResult, TrainingResult, NC,
 };
 use anyhow::anyhow;
-use anyhow::{Error, Result, bail};
+use anyhow::{bail, Error, Result};
 use futures::future::join_all;
 use iroh::protocol::Router;
 use psyche_coordinator::{Commitment, CommitteeSelection, Coordinator, RunState};
 use psyche_core::NodeIdentity;
 use psyche_metrics::{ClientMetrics, ClientRoleInRound, PeerConnection};
 use psyche_network::{
-    AuthenticatableIdentity, BlobTicket, DownloadComplete, DownloadRetryInfo, DownloadType,
-    EndpointId, MAX_DOWNLOAD_RETRIES, ModelRequestType, NetworkEvent, NetworkTUIState,
-    PeerManagerHandle, RetriedDownloadsHandle, SharableModel, TransmittableDownload, allowlist,
-    blob_ticket_param_request_task, raw_p2p_verify,
+    allowlist, blob_ticket_param_request_task, raw_p2p_verify, AuthenticatableIdentity, BlobTicket,
+    DownloadComplete, DownloadRetryInfo, DownloadType, EndpointId, ModelRequestType, NetworkEvent,
+    NetworkTUIState, PeerManagerHandle, RetriedDownloadsHandle, SharableModel,
+    TransmittableDownload, MAX_DOWNLOAD_RETRIES,
 };
 use psyche_watcher::{Backend, BackendWatcher};
 use tokenizers::Tokenizer;
 
 use iroh_blobs::api::Tag;
-use rand::{Rng, RngCore, seq::SliceRandom};
+use rand::{seq::SliceRandom, Rng, RngCore};
 use std::{
     collections::BTreeSet,
     marker::PhantomData,
@@ -29,7 +29,7 @@ use std::{
 };
 use tokio::{
     select,
-    sync::{Notify, mpsc, watch},
+    sync::{mpsc, watch, Notify},
     task::JoinHandle,
     time::interval,
 };
@@ -588,14 +588,21 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static, B: Backend<T> + 'sta
                             run.try_send_opportunistic_witness().await?;
                         }
 
-                        Some((download_ticket, tag)) = rx_request_download.recv() => {
-                            let self_endpoint_id = p2p.endpoint_id();
-                            let other_possible_nodes = run.coordinator_state().map(all_endpoint_ids_shuffled).unwrap_or_default();
-                            let other_possible_nodes = other_possible_nodes.into_iter().filter(|addr| *addr != self_endpoint_id).collect();
-                            let kind = DownloadType::DistroResult(other_possible_nodes);
-                            metrics.record_download_started(download_ticket.hash(), kind.kind());
-                            p2p.start_download(download_ticket, tag, kind);
-                        }
+                            Some((download_ticket, tag)) = rx_request_download.recv() => {
+                                let self_endpoint_id = p2p.endpoint_id();
+                                let other_possible_nodes = run.coordinator_state().map(all_endpoint_ids_shuffled).unwrap_or_default();
+                                let other_possible_nodes = other_possible_nodes.into_iter().filter(|addr| *addr != self_endpoint_id).collect();
+                                // This channel is used for both distro results and teacher logits.
+                                // Select the correct download type for metrics + retry classification.
+                                let kind = match std::str::from_utf8(tag.as_ref()) {
+                                    Ok(tag_str) if tag_str.starts_with("teacher-logits") => {
+                                        DownloadType::TeacherLogits(other_possible_nodes)
+                                    }
+                                    _ => DownloadType::DistroResult(other_possible_nodes),
+                                };
+                                metrics.record_download_started(download_ticket.hash(), kind.kind());
+                                p2p.start_download(download_ticket, tag, kind);
+                            }
                         Some(opportunistic_data) = rx_witness.recv() => {
                             metrics.record_witness_send(opportunistic_data.kind());
                             watcher.backend_mut().send_witness(opportunistic_data).await?;

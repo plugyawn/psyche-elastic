@@ -4,6 +4,7 @@ use std::str::FromStr;
 pub enum IntegrationTestLogMarker {
     StateChange,
     Loss,
+    HeldoutEval,
     LoadedModel,
     HealthCheck,
     UntrainedBatches,
@@ -20,6 +21,7 @@ impl std::fmt::Display for IntegrationTestLogMarker {
             match self {
                 Self::StateChange => "state_change",
                 Self::Loss => "loss",
+                Self::HeldoutEval => "heldout_eval",
                 Self::LoadedModel => "loaded_model",
                 Self::HealthCheck => "health_check",
                 Self::UntrainedBatches => "untrained_batches",
@@ -38,6 +40,7 @@ impl FromStr for IntegrationTestLogMarker {
         Ok(match s {
             "state_change" => Self::StateChange,
             "loss" => Self::Loss,
+            "heldout_eval" => Self::HeldoutEval,
             "loaded_model" => Self::LoadedModel,
             "health_check" => Self::HealthCheck,
             "untrained_batches" => Self::UntrainedBatches,

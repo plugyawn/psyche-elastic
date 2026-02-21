@@ -1,7 +1,7 @@
-use crate::{NetworkConnection, Networkable, P2PEndpointInfo, util::fmt_bytes};
+use crate::{util::fmt_bytes, NetworkConnection, Networkable, P2PEndpointInfo};
 
 use futures_util::StreamExt;
-use iroh::{EndpointId, endpoint::ConnectionType};
+use iroh::{endpoint::ConnectionType, EndpointId};
 use psyche_tui::ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -131,12 +131,10 @@ impl psyche_tui::CustomWidget for NetworkTui {
                         .unwrap_or(0.0)
                         .max(1024.0);
 
-                    Chart::new(vec![
-                        Dataset::default()
-                            .marker(symbols::Marker::Braille)
-                            .graph_type(GraphType::Line)
-                            .data(&bw_history),
-                    ])
+                    Chart::new(vec![Dataset::default()
+                        .marker(symbols::Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .data(&bw_history)])
                     .block(
                         Block::default()
                             .title(format!(

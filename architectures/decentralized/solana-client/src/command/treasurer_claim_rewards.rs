@@ -1,8 +1,8 @@
 use anchor_spl::{associated_token, token};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 
-use crate::{SolanaBackend, instructions};
+use crate::{instructions, SolanaBackend};
 
 #[derive(Debug, Clone, Args)]
 #[command()]

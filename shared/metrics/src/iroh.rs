@@ -29,12 +29,13 @@ use std::{
 };
 
 use opentelemetry::{
-    KeyValue, global,
+    global,
     metrics::{Counter, Gauge, Meter},
+    KeyValue,
 };
 use tokio::time::interval;
 
-use iroh_metrics::{MetricsSource, Registry, parse_prometheus_metrics};
+use iroh_metrics::{parse_prometheus_metrics, MetricsSource, Registry};
 
 #[derive(Clone, Debug)]
 /// Iroh metrics collector that pulls metrics from an iroh-metrics Registry into OpenTelemetry
@@ -212,7 +213,7 @@ mod tests {
     use super::*;
     use iroh_metrics::{Counter, Gauge};
     use std::sync::Arc;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
 
     #[derive(Debug, Default, iroh_metrics::MetricsGroup)]
     #[metrics(name = "test")]

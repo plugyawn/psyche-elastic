@@ -1,11 +1,11 @@
 use anchor_client::solana_sdk::pubkey::Pubkey;
-use anyhow::Result;
 use anyhow::bail;
+use anyhow::Result;
 use clap::Args;
 use psyche_client::TrainArgs;
-use psyche_coordinator::RunState;
 use psyche_coordinator::model::Checkpoint;
 use psyche_coordinator::model::Model;
+use psyche_coordinator::RunState;
 
 use crate::SolanaBackend;
 
@@ -102,7 +102,8 @@ pub async fn command_can_join_execute(
         }
 
         #[allow(irrefutable_let_patterns)]
-        let Model::LLM(model) = coordinator_account_state.model else {
+        let Model::LLM(model) = coordinator_account_state.model
+        else {
             bail!("model is not an LLM, unsure how to predownload.");
         };
 

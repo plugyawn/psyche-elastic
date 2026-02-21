@@ -13,6 +13,7 @@ mod train;
 mod warmup;
 mod witness;
 
+pub use cooldown::HeldoutEvalConfig;
 pub use init::{InitRunError, RunInitConfig, RunInitConfigAndIO};
 pub use round_state::RoundState;
 pub use steps::{ApplyMessageOutcome, RunManager};

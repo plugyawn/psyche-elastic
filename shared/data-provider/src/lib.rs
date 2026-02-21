@@ -15,12 +15,12 @@ pub use dataset::{Dataset, Field, Row, Split};
 pub use dummy::DummyDataProvider;
 pub use file_extensions::{DATA_FILE_EXTENSIONS, PARQUET_EXTENSION};
 pub use hub::{
-    UploadModelError, download_dataset_repo_async, download_dataset_repo_sync,
-    download_model_repo_async, download_model_repo_sync, upload_model_repo_async,
+    download_dataset_repo_async, download_dataset_repo_sync, download_model_repo_async,
+    download_model_repo_sync, upload_model_repo_async, UploadModelError,
 };
-pub use local::{DataFormat, LocalDataProvider};
+pub use local::{DataFormat, LocalDataProvider, LocalDataSplit};
 pub use parquet::record::{ListAccessor, MapAccessor, RowAccessor};
 pub use preprocessed::PreprocessedDataProvider;
 pub use remote::{DataProviderTcpClient, DataProviderTcpServer, DataServerTui};
 pub use traits::{LengthKnownDataProvider, TokenizedData, TokenizedDataProvider};
-pub use weighted::{WeightedDataProvider, http::WeightedHttpProvidersConfig};
+pub use weighted::{http::WeightedHttpProvidersConfig, WeightedDataProvider};

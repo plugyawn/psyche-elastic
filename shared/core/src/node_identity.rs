@@ -5,7 +5,7 @@ use std::{
 
 use anchor_lang::{AnchorDeserialize, AnchorSerialize, Space};
 use bytemuck::Zeroable;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 pub trait NodeIdentity:
