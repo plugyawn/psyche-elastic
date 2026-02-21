@@ -181,6 +181,11 @@ impl App {
 
         async {
             Self::reset_ephemeral(&mut coordinator);
+            info!(
+                run_id = %String::from(&coordinator.run_id),
+                run_state = ?coordinator.run_state,
+                "loaded coordinator state"
+            );
 
             debug!("potentially launching data server...");
 
