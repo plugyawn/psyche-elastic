@@ -5,13 +5,13 @@ use psyche_centralized_shared::{
     ClientCapabilities, ClientId, ClientToServerMessage, ServerToClientMessage, TrainingAssignment,
 };
 use psyche_client::{
-    read_identity_secret_key, Client, ClientTUI, ClientTUIState, RunInitConfig, TrainArgs, NC,
+    Client, ClientTUI, ClientTUIState, NC, RunInitConfig, TrainArgs, read_identity_secret_key,
 };
-use psyche_coordinator::{model, Coordinator, HealthChecks};
+use psyche_coordinator::{Coordinator, HealthChecks, model};
 use psyche_metrics::ClientMetrics;
 use psyche_network::{
-    allowlist, AuthenticatableIdentity, EndpointId, NetworkTUIState, NetworkTui, SecretKey,
-    TcpClient,
+    AuthenticatableIdentity, EndpointId, NetworkTUIState, NetworkTui, SecretKey, TcpClient,
+    allowlist,
 };
 use psyche_tui::logging::LoggerWidget;
 use psyche_tui::{CustomWidget, TabbedWidget};
@@ -168,6 +168,8 @@ pub async fn build_app(
         tensor_parallelism: p.tensor_parallelism,
         micro_batch_size: p.micro_batch_size,
         same_batch_warmup_steps: p.same_batch_warmup_steps,
+        same_batch_anchor_every_steps: p.same_batch_anchor_every_steps,
+        same_batch_anchor_start_step: p.same_batch_anchor_start_step,
         matformer_local_inner_steps: p.matformer_local_inner_steps,
         write_gradients_dir: p.write_gradients_dir,
         eval_tasks,

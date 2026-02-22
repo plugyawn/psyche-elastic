@@ -1,4 +1,4 @@
-use psyche_coordinator::{get_batch_ids_for_node, Coordinator};
+use psyche_coordinator::{Coordinator, get_batch_ids_for_node};
 use psyche_core::{BatchId, NodeIdentity};
 use psyche_data_provider::{DataProvider, TokenizedDataProvider};
 use psyche_modeling::{Batch, BatchData, BatchDataCPU};
@@ -10,11 +10,11 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
     time::sleep,
 };
-use tracing::{debug, error, info, trace, trace_span, warn, Instrument};
+use tracing::{Instrument, debug, error, info, trace, trace_span, warn};
 
 pub type BatchStep = u32;
 pub type BatchIdSet = HashSet<BatchId>;
@@ -27,8 +27,11 @@ pub struct DataFetcher<T: NodeIdentity, A: AuthenticatableIdentity> {
     active_fetch_task: Option<(BatchStep, JoinHandle<()>)>,
     buffer_size: usize,
     same_batch_warmup_steps: u32,
+    same_batch_anchor_every_steps: u32,
+    same_batch_anchor_start_step: u32,
     same_batch_warmup_started_logged: bool,
     same_batch_warmup_ended_logged: bool,
+    same_batch_anchor_logged: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -37,14 +40,19 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
         data_provider: DataProvider<A>,
         buffer_size: usize,
         same_batch_warmup_steps: u32,
+        same_batch_anchor_every_steps: u32,
+        same_batch_anchor_start_step: u32,
     ) -> Self {
         Self {
             data_provider: Arc::new(Mutex::new(data_provider)),
             active_fetch_task: None,
             buffer_size,
             same_batch_warmup_steps,
+            same_batch_anchor_every_steps,
+            same_batch_anchor_start_step,
             same_batch_warmup_started_logged: false,
             same_batch_warmup_ended_logged: false,
+            same_batch_anchor_logged: false,
             _phantom: Default::default(),
         }
     }
@@ -65,6 +73,11 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
         let step = state.progress.step;
         let same_batch_warmup_active =
             self.same_batch_warmup_steps > 0 && step <= self.same_batch_warmup_steps;
+        let anchor_start = self.same_batch_anchor_start_step.max(1);
+        let same_batch_anchor_active = self.same_batch_anchor_every_steps > 0
+            && step >= anchor_start
+            && (step - anchor_start) % self.same_batch_anchor_every_steps == 0;
+        let same_batch_active = same_batch_warmup_active || same_batch_anchor_active;
 
         if self.same_batch_warmup_steps > 0 && !self.same_batch_warmup_started_logged {
             info!(
@@ -83,6 +96,13 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
             );
             self.same_batch_warmup_ended_logged = true;
         }
+        if self.same_batch_anchor_every_steps > 0 && !self.same_batch_anchor_logged {
+            info!(
+                "[data] same-batch anchors enabled: every {} steps starting at step {}",
+                self.same_batch_anchor_every_steps, anchor_start
+            );
+            self.same_batch_anchor_logged = true;
+        }
 
         let mut assigned_batch_ids = get_batch_ids_for_node(data_assignments, identity);
         trace!(
@@ -97,11 +117,18 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> DataFetcher<T, A> {
 
         let (tx_next_sample, next_sample) = mpsc::channel(self.buffer_size);
 
-        let canonical_batch_id = if same_batch_warmup_active {
+        let canonical_batch_id = if same_batch_active {
             data_assignments.keys().next().copied()
         } else {
             None
         };
+        if same_batch_anchor_active {
+            info!(
+                step = step,
+                canonical_batch_id = ?canonical_batch_id,
+                "Applying same-batch alignment anchor for this step"
+            );
+        }
 
         if let Some((last_step, task)) = self.active_fetch_task.take() {
             trace!("Killing previous fetch task from step {last_step}.");

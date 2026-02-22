@@ -25,6 +25,9 @@ IROH_RELAY="${IROH_RELAY:-disabled}"
 HELDOUT_EVAL_BATCHES="${HELDOUT_EVAL_BATCHES:-32}"
 HELDOUT_EVAL_BATCH_SIZE="${HELDOUT_EVAL_BATCH_SIZE:-16}"
 TIER1_INNER_STEPS="${TIER1_INNER_STEPS:-4}"
+SAME_BATCH_WARMUP_STEPS="${SAME_BATCH_WARMUP_STEPS:-0}"
+SAME_BATCH_ANCHOR_EVERY_STEPS="${SAME_BATCH_ANCHOR_EVERY_STEPS:-0}"
+SAME_BATCH_ANCHOR_START_STEP="${SAME_BATCH_ANCHOR_START_STEP:-1}"
 MATFORMER_DISTILLATION_BETA_MAX="${MATFORMER_DISTILLATION_BETA_MAX:-0.0}"
 MATFORMER_DISTILLATION_TOP_K="${MATFORMER_DISTILLATION_TOP_K:-64}"
 MATFORMER_DISTILLATION_TEMPERATURE="${MATFORMER_DISTILLATION_TEMPERATURE:-1.0}"
@@ -122,6 +125,7 @@ echo "[inner] cfg=${CFG_PATH}"
 echo "[inner] run_id=${RUN_ID} total_steps=${TOTAL_STEPS}"
 echo "[inner] log_root=${LOG_ROOT}"
 echo "[inner] tier1_inner_steps=${TIER1_INNER_STEPS}"
+echo "[inner] same_batch_warmup_steps=${SAME_BATCH_WARMUP_STEPS} same_batch_anchor_every_steps=${SAME_BATCH_ANCHOR_EVERY_STEPS} same_batch_anchor_start_step=${SAME_BATCH_ANCHOR_START_STEP}"
 echo "[inner] heldout_eval_batches=${HELDOUT_EVAL_BATCHES} heldout_eval_batch_size=${HELDOUT_EVAL_BATCH_SIZE}"
 echo "[inner] distill_beta_max=${MATFORMER_DISTILLATION_BETA_MAX} distill_top_k=${MATFORMER_DISTILLATION_TOP_K} distill_temp=${MATFORMER_DISTILLATION_TEMPERATURE}"
 echo "[inner] distill_start_step=${MATFORMER_DISTILLATION_START_STEP} distill_warmup_steps=${MATFORMER_DISTILLATION_WARMUP_STEPS} distill_combine=${MATFORMER_DISTILLATION_COMBINE_MODE}"
@@ -245,6 +249,9 @@ for tier in 0 1; do
       --micro-batch-size "${MICRO_BATCH_SIZE}" \
       --matformer-tier "${tier}" \
       --matformer-local-inner-steps "${inner_steps}" \
+      --same-batch-warmup-steps "${SAME_BATCH_WARMUP_STEPS}" \
+      --same-batch-anchor-every-steps "${SAME_BATCH_ANCHOR_EVERY_STEPS}" \
+      --same-batch-anchor-start-step "${SAME_BATCH_ANCHOR_START_STEP}" \
       --matformer-helper-fraction 0 \
       --matformer-helper-rotation-interval 16 \
       "${distill_args[@]}" \

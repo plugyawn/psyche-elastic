@@ -1,6 +1,6 @@
 use crate::{CheckpointConfig, HubUploadInfo, WandBInfo};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use clap::ValueEnum;
 use psyche_eval::tasktype_from_name;
@@ -130,6 +130,22 @@ pub struct TrainArgs {
     /// only for off-chain debugging/ablations.
     #[clap(long, env, default_value_t = 0)]
     pub same_batch_warmup_steps: u32,
+
+    /// Experimental: after warmup, periodically fetch the same canonical batch across trainers.
+    ///
+    /// If set to `N > 0`, then steps satisfying
+    /// `step >= same_batch_anchor_start_step && (step - same_batch_anchor_start_step) % N == 0`
+    /// will use canonical same-batch fetching.
+    ///
+    /// This is a low-overhead "alignment anchor" knob for long runs.
+    #[clap(long, env, default_value_t = 0)]
+    pub same_batch_anchor_every_steps: u32,
+
+    /// First step eligible for periodic same-batch anchors.
+    ///
+    /// Set this to `same_batch_warmup_steps + 1` to run warmup first, then sparse anchors.
+    #[clap(long, env, default_value_t = 1)]
+    pub same_batch_anchor_start_step: u32,
 
     /// Experimental: number of local inner training updates per coordinator step on
     /// smaller MatFormer tiers (`tier > 0`).

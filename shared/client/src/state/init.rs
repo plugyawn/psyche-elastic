@@ -1,25 +1,25 @@
 use crate::cli::MatformerLoadStrategy;
-use crate::{fetch_data::DataFetcher, IntegrationTestLogMarker, WandBInfo};
+use crate::{IntegrationTestLogMarker, WandBInfo, fetch_data::DataFetcher};
 use psyche_coordinator::{
-    model::{self, HttpLLMTrainingDataLocation, LLMTrainingDataLocation},
     Coordinator, HealthChecks,
+    model::{self, HttpLLMTrainingDataLocation, LLMTrainingDataLocation},
 };
 use psyche_core::{
-    sha256, Barrier, CancellableBarrier, NodeIdentity, OptimizerDefinition, Shuffle, TokenSize,
+    Barrier, CancellableBarrier, NodeIdentity, OptimizerDefinition, Shuffle, TokenSize, sha256,
 };
 use psyche_data_provider::{
-    download_dataset_repo_async, download_model_repo_async,
-    http::{FileURLs, HttpDataProvider},
     DataProvider, DataProviderTcpClient, DummyDataProvider, LocalDataProvider, LocalDataSplit,
-    PreprocessedDataProvider, Split, WeightedDataProvider,
+    PreprocessedDataProvider, Split, WeightedDataProvider, download_dataset_repo_async,
+    download_model_repo_async,
+    http::{FileURLs, HttpDataProvider},
 };
 use psyche_metrics::ClientMetrics;
 use psyche_modeling::{
-    auto_tokenizer, AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM,
-    CommunicatorId, DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices,
-    DistroAggregateMode, DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig, DistroValueMode,
-    DummyModel, LlamaConfig, LlamaForCausalLM, LocalTrainer, ModelConfig, ModelLoadError,
-    NanoGPTConfig, NanoGPTForCausalLM, ParallelModels, PretrainedSource, Trainer,
+    AttentionImplementation, AutoConfig, AutoTokenizerError, CausalLM, CommunicatorId,
+    DataParallel, DeepseekConfig, DeepseekForCausalLM, Devices, DistroAggregateMode,
+    DistroApplyMode, DistroDilocoLiteConfig, DistroRawConfig, DistroValueMode, DummyModel,
+    LlamaConfig, LlamaForCausalLM, LocalTrainer, ModelConfig, ModelLoadError, NanoGPTConfig,
+    NanoGPTForCausalLM, ParallelModels, PretrainedSource, Trainer, auto_tokenizer,
 };
 use psyche_network::{AuthenticatableIdentity, BlobTicket};
 use psyche_watcher::{ModelSchemaInfo, OpportunisticData};
@@ -30,7 +30,7 @@ use std::{
 };
 use tch::{Device, Kind, Tensor};
 use thiserror::Error;
-use tokenizers::{models::wordlevel::WordLevel, ModelWrapper, Tokenizer};
+use tokenizers::{ModelWrapper, Tokenizer, models::wordlevel::WordLevel};
 use tokio::{
     io,
     sync::{mpsc::UnboundedSender, oneshot},
@@ -39,6 +39,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::{
+    CheckpointConfig, FinishedBroadcast,
     cooldown::{
         CooldownStepMetadata, HeldoutEvalConfig, HeldoutEvaluator, MatformerCheckpointInfo,
     },
@@ -49,7 +50,6 @@ use super::{
     types::DistroBroadcastAndPayload,
     warmup::WarmupStepMetadata,
     witness::WitnessStepMetadata,
-    CheckpointConfig, FinishedBroadcast,
 };
 use iroh_blobs::api::Tag;
 
@@ -76,6 +76,10 @@ pub struct RunInitConfig<T: NodeIdentity, A: AuthenticatableIdentity> {
     /// Experimental: during the first N training steps, fetch the same canonical batch for every
     /// trainer (client-side data aliasing for early gradient alignment).
     pub same_batch_warmup_steps: u32,
+    /// Experimental: after warmup, inject same-batch "anchor" steps every N steps.
+    pub same_batch_anchor_every_steps: u32,
+    /// First step eligible for periodic same-batch anchors.
+    pub same_batch_anchor_start_step: u32,
     /// Experimental: number of local inner updates per coordinator step on smaller tiers.
     pub matformer_local_inner_steps: u32,
     pub optim_stats_every_n_steps: Option<u32>,
@@ -1671,6 +1675,8 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             data_provider,
             init_config.data_parallelism * 2,
             init_config.same_batch_warmup_steps,
+            init_config.same_batch_anchor_every_steps,
+            init_config.same_batch_anchor_start_step,
         );
 
         let trainers: Vec<Trainer> = match models {
@@ -1755,41 +1761,45 @@ impl<T: NodeIdentity, A: AuthenticatableIdentity + 'static> RunInitConfigAndIO<T
             }
             #[cfg(feature = "python")]
             RawLoadedModelType::Python(model) => {
-                vec![psyche_modeling::LocalTrainer::new(
-                    ParallelModels {
-                        models: vec![Box::new(model) as Box<dyn CausalLM>],
-                        barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
-                        data_parallel: None,
-                    },
-                    llm.lr_schedule,
-                    llm.optimizer,
-                    init_config.distro_apply_mode,
-                    init_config.distro_aggregate_mode,
-                    init_config.distro_value_mode,
-                    init_config.distro_raw_config,
-                    init_config.distro_diloco_lite_config,
-                    init_config.micro_batch_size,
-                    init_config.optim_stats_every_n_steps,
-                    init_config.grad_accum_in_fp32,
-                )
-                .into()]
+                vec![
+                    psyche_modeling::LocalTrainer::new(
+                        ParallelModels {
+                            models: vec![Box::new(model) as Box<dyn CausalLM>],
+                            barrier: Arc::new(psyche_modeling::NopBarrier) as Arc<dyn Barrier>,
+                            data_parallel: None,
+                        },
+                        llm.lr_schedule,
+                        llm.optimizer,
+                        init_config.distro_apply_mode,
+                        init_config.distro_aggregate_mode,
+                        init_config.distro_value_mode,
+                        init_config.distro_raw_config,
+                        init_config.distro_diloco_lite_config,
+                        init_config.micro_batch_size,
+                        init_config.optim_stats_every_n_steps,
+                        init_config.grad_accum_in_fp32,
+                    )
+                    .into(),
+                ]
             }
             #[cfg(feature = "python")]
             RawLoadedModelType::PythonDistributed(model) => {
-                vec![psyche_modeling::PythonDistributedTrainer::new(
-                    model,
-                    llm.lr_schedule,
-                    llm.optimizer,
-                    init_config.distro_apply_mode,
-                    init_config.distro_aggregate_mode,
-                    init_config.distro_value_mode,
-                    init_config.distro_raw_config,
-                    init_config.distro_diloco_lite_config,
-                    init_config.micro_batch_size,
-                    init_config.optim_stats_every_n_steps,
-                    init_config.grad_accum_in_fp32,
-                )?
-                .into()]
+                vec![
+                    psyche_modeling::PythonDistributedTrainer::new(
+                        model,
+                        llm.lr_schedule,
+                        llm.optimizer,
+                        init_config.distro_apply_mode,
+                        init_config.distro_aggregate_mode,
+                        init_config.distro_value_mode,
+                        init_config.distro_raw_config,
+                        init_config.distro_diloco_lite_config,
+                        init_config.micro_batch_size,
+                        init_config.optim_stats_every_n_steps,
+                        init_config.grad_accum_in_fp32,
+                    )?
+                    .into(),
+                ]
             }
         };
 
