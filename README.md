@@ -2,7 +2,7 @@
 ## earlier: psyche-elastic
 
 <p align="center" width="100%">
-<img src="https://github.com/user-attachments/assets/87c70aab-07c0-4df6-ab4f-b7f23776e427" />
+<img src="./psyche-book/src/aftermath_banner.png" />
 </p>
 
 **psyche-elastic** is a fork of [**Psyche**](https://nousresearch.com/nous-psyche/), from Nous Research, focused on elastic, heterogeneous training. 
